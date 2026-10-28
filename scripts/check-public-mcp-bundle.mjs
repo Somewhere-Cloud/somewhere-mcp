@@ -34,7 +34,7 @@ if (Object.keys(mcp).length !== 1 || Object.keys(mcp.mcpServers ?? {}).length !=
   throw new Error('Cursor MCP configuration must expose one canonical server.');
 }
 const somewhere = mcp.mcpServers.somewhere;
-if (JSON.stringify(somewhere) !== JSON.stringify({ url: 'https://mcp.somewhere.tech/mcp' })) {
+if (JSON.stringify(somewhere) !== JSON.stringify({ url: 'https://mcp.somewhere.cloud/mcp' })) {
   throw new Error('Cursor MCP configuration must use the canonical OAuth endpoint without overrides.');
 }
 console.log('Cursor plugin manifest and MCP configuration passed.');

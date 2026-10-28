@@ -10,6 +10,9 @@ interface SurfaceToolSpec {
   surfaces: readonly ToolSurface[];
   /** Deprecated alias of another tool: callable, not advertised. */
   aliasOf?: string;
+  hidden?: boolean;
+  /** One fixed operation of a multi-operation tool: advertised off `full` only. */
+  operationOf?: string;
 }
 
 export const SURFACE_MANIFESTS: Readonly<Record<ToolSurface, SurfaceManifest>>;

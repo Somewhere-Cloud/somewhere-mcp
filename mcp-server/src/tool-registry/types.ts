@@ -46,6 +46,10 @@ export type ToolVisibility = 'authenticated' | 'public' | 'admin';
 export interface ToolUpstreamResult {
   status: number;
   data: unknown;
+  /** Raw correlation headers of a FAILED upstream call (x-request-id / x-trace-id), for the
+   *  repro packet only. Unvalidated here; shared/repro-guidance.ts validates before any use. */
+  requestId?: string;
+  traceId?: string;
 }
 
 export interface ToolExecutionRuntime {
@@ -88,6 +92,16 @@ export interface ToolSpec<
    * surface without unwiring them — see dashboard/HIDDEN-FEATURES.md.
    */
   hidden?: boolean;
+  /**
+   * ONE FIXED OPERATION of a multi-operation tool, named after that tool. It
+   * runs the named tool's handler with the operation pinned, so there is no
+   * second implementation. Advertised on the non-full surfaces it lists; on
+   * `full` it stays callable but unadvertised, because `full` keeps the
+   * original multi-operation tool as its one advertised name and every spec
+   * must list `full`. It adds no authority: the original's handler, backend
+   * checks and name-keyed dispatch policy (policyToolName) all still apply.
+   */
+  operationOf?: string;
   protocol?: ToolProtocolMetadata;
   execute(runtime: TRuntime, args: Record<string, unknown>): Promise<TResult>;
 }

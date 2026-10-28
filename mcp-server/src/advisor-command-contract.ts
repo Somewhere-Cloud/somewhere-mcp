@@ -119,3 +119,23 @@ export function checkAdvisorCommands(answer: string, advertised: readonly Pick<T
   }
   return { ok: true, unvalidated };
 }
+
+/** The CLI's whole-file quick links (`somewhere docs start`), served beside the topic index. */
+const CLI_DOCS_QUICK_LINKS = new Set(['start', 'docs', 'guides', 'security', 'migration', 'llms', 'anon', 'anonymous', 'temporary', 'quickstart', 'help', 'all']);
+
+/** Every docs topic an answer names must resolve: `somewhere docs <topic>`,
+ * `docs({ topic: '<topic>' })` and `somewhere call docs '{"topic":"<topic>"}'`.
+ * An invented topic sends the reader to a page that does not exist. */
+export function checkAdvisorDocsTopics(answer: string, topicExists: (topic: string) => boolean): { ok: true } | { ok: false; reason: 'docs_topic_unknown'; topics: string[] } {
+  const unknown = new Set<string>();
+  const name = (raw: string) => raw.replace(/[.,;:]+$/, '');
+  for (const match of answer.matchAll(/\bsomewhere\s+docs\s+([A-Za-z][\w.-]*)/g)) {
+    const topic = name(match[1]);
+    if (!topicExists(topic) && !CLI_DOCS_QUICK_LINKS.has(topic.toLowerCase())) unknown.add(topic);
+  }
+  for (const match of answer.matchAll(/\bdocs\b\s*(?:\(\s*\{|'\{)\s*\\?["']?topic\\?["']?\s*:\s*\\?["']([^"'\\]+)\\?["']/g)) {
+    const topic = name(match[1]);
+    if (!/^<.*>$/.test(topic) && !topicExists(topic)) unknown.add(topic);
+  }
+  return unknown.size ? { ok: false, reason: 'docs_topic_unknown', topics: [...unknown] } : { ok: true };
+}

@@ -58,16 +58,34 @@ const DEFAULT_TIMEOUT_MS = DEFAULT_EGRESS_TIMEOUT_MS;
 const DEFAULT_MAX_BYTES = 25 * 1024 * 1024;
 
 export interface SafeFetchOptions extends EgressPolicyOptions {
-  /** Default 15s. */
+  /** Total deadline through DNS, redirects and response-body consumption. Default 15s. */
   timeoutMs?: number;
   /** Default 3. Set to 0 to disable redirect following. */
   maxRedirects?: number;
   /** Default 25 MB. */
   maxBytes?: number;
+  /** Caller cancellation (for example a job cancelled while its delivery is in
+   *  flight). Aborts DNS, the request and body reads with SAFE_FETCH_CANCELLED,
+   *  distinct from the deadline's SAFE_FETCH_TIMEOUT. */
+  signal?: AbortSignal;
   /** Headers + method + body forwarded to underlying fetch. */
   method?: string;
   headers?: HeadersInit;
   body?: BodyInit | null;
+  /** The trusted executor's binding to the web worker (F1, pfb_1a470ef5d3af). A hop whose URL is a
+   *  platform-hosted site (isPlatformHostedTarget) is sent through it with the SAME URL and request;
+   *  every other hop, and every hop when this is unset, uses the public fetch. Validation, redirects,
+   *  credential stripping, the deadline and the body cap are identical on both. No fallback: a
+   *  binding failure is the answer. */
+  platformHostFetch?: (input: string, init: RequestInit) => Promise<Response>;
+}
+
+/** A platform-hosted site: exactly https://<one label>.somewhere.site, no port, no userinfo. The apex,
+ *  deeper names, a trailing dot and lookalike suffixes are not (they take the public fetch). */
+const PLATFORM_HOSTED_HOST = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.somewhere\.site$/;
+export function isPlatformHostedTarget(url: URL): boolean {
+  return url.protocol === 'https:' && url.port === '' && url.username === '' && url.password === ''
+    && PLATFORM_HOSTED_HOST.test(url.hostname);
 }
 
 interface DnsJsonResponse {
@@ -82,8 +100,11 @@ interface DnsJsonResponse {
 // target request must stay on this out-of-band transport.
 const SAFE_FETCH_REAL_FETCH: typeof fetch = globalThis.fetch.bind(globalThis);
 
-async function fetchDnsAnswers(host: string, type: 'A' | 'AAAA', timeoutMs: number): Promise<DnsAnswer[]> {
+async function fetchDnsAnswers(host: string, type: 'A' | 'AAAA', timeoutMs: number, signal?: AbortSignal): Promise<DnsAnswer[]> {
   const controller = new AbortController();
+  const abort = () => controller.abort(signal?.reason);
+  if (signal?.aborted) abort();
+  else signal?.addEventListener('abort', abort, { once: true });
   const timer = setTimeout(() => controller.abort(), Math.min(timeoutMs, 3_000));
   try {
     const response = await SAFE_FETCH_REAL_FETCH(dnsQueryUrl(host, type), {
@@ -95,6 +116,7 @@ async function fetchDnsAnswers(host: string, type: 'A' | 'AAAA', timeoutMs: numb
       signal: controller.signal,
     });
     if (!response.ok) {
+      void response.body?.cancel().catch(() => undefined);
       throw new EgressPolicyError('SAFE_FETCH_DNS_FAILED', `Could not resolve host ${host}.`);
     }
     const body = await response.json<DnsJsonResponse>().catch(() => null);
@@ -105,15 +127,16 @@ async function fetchDnsAnswers(host: string, type: 'A' | 'AAAA', timeoutMs: numb
     throw new EgressPolicyError('SAFE_FETCH_DNS_FAILED', `Could not resolve host ${host}.`);
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
   }
 }
 
 /** Resolve A and AAAA through DNS-over-HTTPS. The container tier resolves the
  * same names through the same endpoint (see containers/job-executor). */
-async function resolveDnsAnswers(host: string, timeoutMs: number): Promise<DnsAnswer[]> {
+async function resolveDnsAnswers(host: string, timeoutMs: number, signal?: AbortSignal): Promise<DnsAnswer[]> {
   return (await Promise.all([
-    fetchDnsAnswers(host, 'A', timeoutMs),
-    fetchDnsAnswers(host, 'AAAA', timeoutMs),
+    fetchDnsAnswers(host, 'A', timeoutMs, signal),
+    fetchDnsAnswers(host, 'AAAA', timeoutMs, signal),
   ])).flat();
 }
 
@@ -163,6 +186,21 @@ export async function assertSafeRemoteUrl(rawUrl: string, opts: SafeFetchOptions
  * is what keeps the tsk_baf2d1df dead-handler case failing instead of being
  * laundered into a success.
  */
+/** Where a SAFE_FETCH_TIMEOUT fired (tsk_fad32488). Diagnostic only: durations
+ *  and stage names, never URLs, headers or bodies. */
+export type SafeFetchStage = 'validate' | 'target_fetch' | 'redirect_validate' | 'body';
+export interface SafeFetchTimeoutDetail {
+  stage: SafeFetchStage;
+  /** Redirect hops already followed when the deadline fired. */
+  hop: number;
+  /** Time spent in the current stage, and in validation (DNS) overall. */
+  stageMs: number;
+  validateMs: number;
+  elapsedMs: number;
+  /** Which transport the current hop used: the executor's web binding or the public fetch. */
+  via: 'binding' | 'public';
+}
+
 export async function safeFetch(
   rawUrl: string,
   opts: SafeFetchOptions = {},
@@ -171,87 +209,161 @@ export async function safeFetch(
   const maxRedirects = opts.maxRedirects ?? DEFAULT_MAX_REDIRECTS;
   const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
 
-  let currentUrl = (await assertSafeRemoteUrl(rawUrl, opts)).toString();
-  const originalUrl = currentUrl;
-  const method = opts.method ?? 'GET';
-  let headers = new Headers(opts.headers);
-  let body = opts.body ?? null;
-  // Sticky: set the first time a hop changes origin and never cleared.
-  let leftOriginalOrigin = false;
-  let redirects = 0;
+  const ctrl = new AbortController();
+  const timeoutError = new EgressPolicyError('SAFE_FETCH_TIMEOUT', `Timed out after ${timeoutMs}ms.`);
+  const startedAt = Date.now();
+  let stage: SafeFetchStage = 'validate';
+  let stageAt = startedAt;
+  let hop = 0;
+  let validateMs = 0;
+  let via: 'binding' | 'public' = 'public';
+  const enter = (next: SafeFetchStage) => { stage = next; stageAt = Date.now(); };
+  let failBody: ((error: EgressPolicyError) => void) | undefined;
+  const timer = setTimeout(() => {
+    const now = Date.now();
+    const detail: SafeFetchTimeoutDetail = {
+      stage, hop, via, stageMs: now - stageAt,
+      validateMs: validateMs + (stage === 'validate' || stage === 'redirect_validate' ? now - stageAt : 0),
+      elapsedMs: now - startedAt,
+    };
+    Object.assign(timeoutError, { detail });
+    ctrl.abort(timeoutError);
+    failBody?.(timeoutError);
+  }, timeoutMs);
+  // Set when the caller's signal ends the request, so every abort path below
+  // reports SAFE_FETCH_CANCELLED rather than the timeout.
+  let cancelledError: EgressPolicyError | null = null;
+  const cancelled = () => {
+    const error = new EgressPolicyError('SAFE_FETCH_CANCELLED', 'The request was cancelled.');
+    cancelledError = error;
+    clearTimeout(timer);
+    ctrl.abort(error);
+    failBody?.(error);
+  };
+  if (opts.signal?.aborted) cancelled();
+  else opts.signal?.addEventListener('abort', cancelled, { once: true });
+  const validate = (url: string) => assertSafeRemoteUrlWith(url,
+    (host, budget) => resolveDnsAnswers(host, budget, ctrl.signal), opts);
+  // Discarded redirect/oversize bodies must not retain a connection. Cancellation
+  // itself is best-effort: a remote cleanup cannot extend the caller's deadline.
+  const cancelBody = (response: Response | undefined, reason?: unknown) => {
+    void response?.body?.cancel(reason).catch(() => undefined);
+  };
+  let response: Response | undefined;
 
-  while (true) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-    let resp: Response;
-    try {
-      resp = await SAFE_FETCH_REAL_FETCH(currentUrl, {
-        method,
-        headers,
-        body,
-        redirect: 'manual',
-        signal: ctrl.signal,
-      });
-    } catch (err) {
-      if ((err as Error).name === 'AbortError') {
-        throw new EgressPolicyError('SAFE_FETCH_TIMEOUT', `Timed out after ${timeoutMs}ms.`);
+  try {
+    let currentUrl = (await validate(rawUrl)).toString();
+    validateMs += Date.now() - stageAt;
+    const originalUrl = currentUrl;
+    const method = opts.method ?? 'GET';
+    let headers = new Headers(opts.headers);
+    let body = opts.body ?? null;
+    // Sticky: an origin-crossing chain never regains the original credentials.
+    let leftOriginalOrigin = false;
+    let redirects = 0;
+
+    while (true) {
+      ctrl.signal.throwIfAborted();
+      enter('target_fetch');
+      // Per hop: a validated platform-hosted URL goes through the executor's web binding when it has one.
+      const hosted = opts.platformHostFetch && isPlatformHostedTarget(new URL(currentUrl)) ? opts.platformHostFetch : null;
+      via = hosted ? 'binding' : 'public';
+      try {
+        response = await (hosted ?? SAFE_FETCH_REAL_FETCH)(currentUrl, {
+          method, headers, body, redirect: 'manual', signal: ctrl.signal,
+        });
+      } catch (err) {
+        if (cancelledError) throw cancelledError;
+        if (ctrl.signal.aborted && ctrl.signal.reason instanceof EgressPolicyError) throw ctrl.signal.reason;
+        if (ctrl.signal.aborted || (err as Error).name === 'AbortError') throw timeoutError;
+        throw new EgressPolicyError('SAFE_FETCH_NETWORK', (err as Error).message);
       }
-      throw new EgressPolicyError('SAFE_FETCH_NETWORK', (err as Error).message);
-    } finally {
-      clearTimeout(timer);
-    }
-
-    if (resp.status >= 300 && resp.status < 400 && resp.headers.get('location')) {
-      if (redirects >= maxRedirects) {
-        throw new EgressPolicyError('SAFE_FETCH_TOO_MANY_REDIRECTS', `Exceeded ${maxRedirects} redirects.`);
+      ctrl.signal.throwIfAborted();
+      if (response.status >= 300 && response.status < 400 && response.headers.get('location')) {
+        const location = response.headers.get('location') as string;
+        cancelBody(response);
+        response = undefined;
+        if (redirects >= maxRedirects) {
+          throw new EgressPolicyError('SAFE_FETCH_TOO_MANY_REDIRECTS', `Exceeded ${maxRedirects} redirects.`);
+        }
+        const next = new URL(location, currentUrl);
+        enter('redirect_validate');
+        const validated = (await validate(next.toString())).toString();
+        validateMs += Date.now() - stageAt;
+        if (!isSameOrigin(originalUrl, validated)) leftOriginalOrigin = true;
+        if (leftOriginalOrigin) {
+          headers = new Headers(headersForCrossOriginHop(headers));
+          body = null;
+        }
+        currentUrl = validated;
+        redirects++;
+        hop = redirects;
+        continue;
       }
-      const next = new URL(resp.headers.get('location') as string, currentUrl);
-      const validated = (await assertSafeRemoteUrl(next.toString(), opts)).toString();
-      if (!isSameOrigin(originalUrl, validated)) leftOriginalOrigin = true;
-      if (leftOriginalOrigin) {
-        headers = new Headers(headersForCrossOriginHop(headers));
-        body = null;
+
+      // HEAD/204 responses have no body to bound. Content-Length on HEAD may
+      // describe a large resource without delivering any of those bytes.
+      if (!response.body) {
+        clearTimeout(timer);
+        return response;
       }
-      currentUrl = validated;
-      redirects++;
-      continue;
-    }
+      const contentLength = parseInt(response.headers.get('content-length') || '0', 10);
+      if (contentLength > 0 && contentLength > maxBytes) {
+        throw new EgressPolicyError('SAFE_FETCH_BODY_TOO_LARGE',
+          `Response declared ${contentLength} bytes, cap is ${maxBytes}.`);
+      }
 
-    const contentLength = parseInt(resp.headers.get('content-length') || '0', 10);
-    if (contentLength > 0 && contentLength > maxBytes) {
-      throw new EgressPolicyError(
-        'SAFE_FETCH_BODY_TOO_LARGE',
-        `Response declared ${contentLength} bytes, cap is ${maxBytes}.`,
-      );
-    }
-
-    // Wrap the body in a ReadableStream that aborts once we read past
-    // maxBytes. This is the only enforcement that works when the
-    // server omits Content-Length (chunked transfer).
-    if (resp.body) {
-      const reader = resp.body.getReader();
+      enter('body');
+      const reader = response.body.getReader();
       let received = 0;
-      const stream = new ReadableStream({
-        async pull(controller) {
-          const { done, value } = await reader.read();
-          if (done) { controller.close(); return; }
-          received += value.byteLength;
-          if (received > maxBytes) {
-            controller.error(new EgressPolicyError(
-              'SAFE_FETCH_BODY_TOO_LARGE',
-              `Response exceeded ${maxBytes} bytes.`,
-            ));
-            return;
-          }
-          controller.enqueue(value);
+      let finished = false;
+      const finish = (cancel: boolean, reason?: unknown) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        failBody = undefined;
+        if (cancel) {
+          ctrl.abort(reason);
+          void reader.cancel(reason).catch(() => undefined);
+        }
+        reader.releaseLock();
+      };
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          failBody = (error) => {
+            finish(true, error);
+            controller.error(error);
+          };
         },
+        async pull(controller) {
+          try {
+            const { done, value } = await reader.read();
+            if (finished) return;
+            if (done) { finish(false); controller.close(); return; }
+            received += value.byteLength;
+            if (received > maxBytes) {
+              const error = new EgressPolicyError('SAFE_FETCH_BODY_TOO_LARGE',
+                `Response exceeded ${maxBytes} bytes.`);
+              finish(true, error);
+              controller.error(error);
+              return;
+            }
+            controller.enqueue(value);
+          } catch (error) {
+            if (finished) return;
+            finish(true, error);
+            controller.error(error);
+          }
+        },
+        cancel(reason) { finish(true, reason); },
       });
-      return new Response(stream, {
-        status: resp.status,
-        headers: resp.headers,
-      });
+      return new Response(stream, { status: response.status, headers: response.headers });
     }
-
-    return resp;
+  } catch (error) {
+    const failure = cancelledError ?? (ctrl.signal.aborted ? timeoutError : error);
+    clearTimeout(timer);
+    ctrl.abort(failure);
+    cancelBody(response, failure);
+    throw failure;
   }
 }

@@ -1,5 +1,5 @@
 export interface AdvisorWorkflow {
-  id: 'scheduled-work' | 'database-work' | 'browser-session' | 'email-delivery' | 'public-file';
+  id: 'scheduled-work' | 'database-work' | 'browser-session' | 'email-delivery' | 'public-file' | 'group-data';
   topics: readonly string[];
 }
 
@@ -10,9 +10,12 @@ export function advisorWorkflows(question: string): AdvisorWorkflow[] {
   const cadence = /\b(?:schedul\w*|hourly|daily|nightly|weekly|periodic(?:ally)?|every\s+(?:(?:\d+|one|two|three|four|five|six|twelve)\s+)?(?:minute|hour|day|week)s?)\b/i.test(question);
   const recurring = /\bcron\b/i.test(question) || (cadence && /\b(?:job|task|handlers?|invocations?|cleanup|clean[ -]?up|expir\w*|run|invok(?:e[ds]?|ing)|remind\w*|send|deliver|background|prune|purge)\b/i.test(question));
   if (recurring) workflows.push({ id: 'scheduled-work', topics: ['cron'] });
-  if (/\b(?:database|sw\.db|records?)\b|\bcross-user feed\b|\bownership[ -]only edits\b/i.test(question) || (/\b(?:table|rows?)\b/i.test(question) && !/\b(?:css|html|layout)\b/i.test(question))) workflows.push({ id: 'database-work', topics: ['sw.db'] });
-  if (/\b(?:magic[ -]links?|sign[ -]?in|log[ -]?in|verifyOtp|signInWithOtp|setSessionCookies|cookie[ -]session|auth(?:entication)?\s+callback)\b/i.test(question)) workflows.push({ id: 'browser-session', topics: ['sw.auth'] });
-  if (/\bsw\.email\b|\b(?:remind\w*|send|deliver)\b[^.?!]{0,100}\bemails?\b|\bemails?\b[^.?!]{0,100}\bremind\w*/i.test(question)) workflows.push({ id: 'email-delivery', topics: ['sw.email'] });
+  if (/\b(?:database|sw\.db|records?)\b|\bcross-user feed\b|\bownership[ -]only edits\b/i.test(question) || (/\b(?:table|rows?|columns?)\b/i.test(question) && !/\b(?:css|html|layout)\b/i.test(question))) workflows.push({ id: 'database-work', topics: ['sw.db'] });
+  const lostBrowserSession=/\bsessions?\b[^.?!]{0,40}\b(?:lost|expired|disappeared)\b/i.test(question)
+    && !/\b(?:task|tool|cli|terminal|mcp|advisor|coding|agent|automation)[ -]+sessions?\b/i.test(question);
+  if (lostBrowserSession || /\b(?:magic[ -]links?|sign[ -]?in|log[ -]?in|verifyOtp|signInWithOtp|setSessionCookies|cookie[ -]session|auth(?:entication)?\s+callback)\b/i.test(question)) workflows.push({ id: 'browser-session', topics: ['sw.auth'] });
+  if (/\bsw\.email\b|\b(?:remind\w*|send|deliver)\b[^.?!]{0,100}\bemails?\b|\bemails?\b[^.?!]{0,100}\bremind\w*|\bemail(?:s|ing)? (?:every|each|all)\b/i.test(question)) workflows.push({ id: 'email-delivery', topics: ['sw.email'] });
   if (/\bpublic\b[^.?!]{0,60}\b(?:screenshots?|images?|files?|uploads?)\b|\b(?:screenshots?|images?|files?|uploads?)\b[^.?!]{0,60}\bpublic\b/i.test(question)) workflows.push({ id: 'public-file', topics: ['sw.fs'] });
+  if (/\b(?:clubs?|teams?|organi[sz]ers?|invit(?:e|es|ed|ing|ation|ations)|groups?|memberships?|appRole)\b/i.test(question)) workflows.push({ id: 'group-data', topics: ['sw.groups'] });
   return workflows;
 }

@@ -5,7 +5,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Somewhere-Tech/somewhere-mcp.git"
+    "url": "git+https://github.com/somewhere-cloud/somewhere-mcp.git"
   },
   "engines": {
     "node": ">=22"
@@ -22,9 +22,12 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260405.1",
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "@somewhere-tech/cli": "0.37.85",
+    "@somewhere-tech/sdk": "0.12.10",
+    "@types/react": "19.2.18",
+    "tsx": "4.23.1",
     "typescript": "^6.0.2",
     "wrangler": "^4.80.0",
-    "tsx": "4.23.1",
     "esbuild": "0.27.3"
   }
 }

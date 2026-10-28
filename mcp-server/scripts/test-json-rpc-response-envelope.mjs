@@ -52,7 +52,7 @@ const executionContext = {
 };
 
 const transport = new StreamableHTTPClientTransport(
-  new URL('https://mcp.test/mcp?groups=all'),
+  new URL('https://mcp.somewhere.cloud/mcp?groups=all'),
   {
     requestInit: {
       headers: {

@@ -1,4 +1,4 @@
-export const ADVISOR_DEFAULT_MODEL = 'gpt-6-sol';
+export const ADVISOR_DEFAULT_MODEL = 'gpt-6-luna';
 export const ADVISOR_RESPONSE_BUDGET_MS = 25_000;
 export const ADVISOR_MAX_OUTPUT_TOKENS = 2_000;
 

@@ -1,6 +1,15 @@
-import { advisorModel, advisorModelSupported, advisorTokenCostCents, ADVISOR_RESPONSE_BUDGET_MS, ADVISOR_MAX_OUTPUT_TOKENS } from './advisor-model-profile';
+import {describeMcpFailure,schemaCorrection,type FailureShape} from '../../worker/src/utils/mcp-failure-shape';
+import { cliPairResultForChat } from './cli-pair-output';
+import { DASHBOARD_URL, dashboardDomainCheckoutUrl, githubReturnTo, googleAuthStartUrl, mcpRealm, projectEventsWebSocketUrl, runnerBaseUrl, userEventsWebSocketUrl } from './platform-urls';
+import { signupResultForChat } from './signup-output';
+import { splitPatchFiles } from './patch-files';
+import {MCP_TOOL_SCHEMA_SHAPES} from '../../worker/src/generated/mcp-tool-names';
+import { FS_INDEX_MAX, FS_SCAN_MAX_FILE_BYTES, FS_SEARCH_LIMIT_DEFAULT, FS_SEARCH_LIMIT_MAX, FS_SEARCH_MAX_FILES_DEFAULT, FS_SEARCH_MAX_FILES_MAX, FS_SEARCH_QUERY_MAX_CHARS, BROWSER_SESSION_IDLE_MINUTES, BROWSER_SESSION_HARD_CAP_MINUTES } from './platform-help-derived';
+import { TASK_TYPE_GUIDANCE } from './task-types';
+import {AsyncAdvisorController,AsyncAdvisorError,publicAsyncAdvisorRun} from './advisor-async';
+import { handleAsyncAdvisorHttp,handleLegacyAsyncAdvisorHttp } from './advisor-async-http';
+import { advisorModel, advisorModelSupported, advisorTokenCostCents, ADVISOR_RESPONSE_BUDGET_MS } from './advisor-model-profile';
 import { ADVISOR_SYSTEM_POLICY } from './advisor-system-policy';
-import { formatAdvisorProjectFacts, type AdvisorFactRead } from './advisor-project-facts';
 /**
  * somewhere.tech MCP Server
  * Translates MCP JSON-RPC protocol → REST calls to api.somewhere.tech/v1/*
@@ -22,22 +31,28 @@ import {
   scanLostPrecisionIntegers,
 } from '../../worker/src/utils/json-exact-integers';
 import { DATABASE_QUERY_RESULT_SCHEMA } from '../../shared/database-query-contract';
+import { buildPacket, buildRecordFromFields } from '../../shared/repro-guidance';
+import { mcpIdentityForIssuer, mcpIdentityForResource, runCodeExecutionPolicyForSurface, surfaceForResource, type McpSurface } from '../../shared/mcp-oauth-audience';
+import { InternalApiPathError, internalApiUrl, internalFsUrl } from './internal-api-url';
 import { databaseDumpResult } from './database-dump-result';
 import { bulkDocsGuidance } from './docs-request';
+import { checkDocsToolArgs } from './docs-view';
 import {
   CONNECTOR_GETTING_STARTED_HELP, CLAUDE_CONNECTOR_GETTING_STARTED_HELP,
   platformHelp,
   platformHelpTopicExists,
+  platformHelpTopicNamed,
   PLATFORM_HELP_TOPICS,
   stripDocLayerMarkers,
 } from './platform-help';
-import { ADVISOR_CONTEXT_SECURITY_POLICY, buildAdvisorInput } from './advisor-boundary';
+import { ADVISOR_CONTEXT_SECURITY_POLICY } from './advisor-boundary';
+import { buildAdvisorRequestBody, selectAdvisorRequestKnowledge } from './advisor-request';
 import { formatAdvisorContext, sanitizeAdvisorContext } from './advisor-context';
 import { advisorContractAnswer, advisorWebhookContractAnswer } from './advisor-contracts';
-import { ADVISOR_COMPOSITION_PROMPT, ADVISOR_COMPOSITION_FORMAT, parseAdvisorComposition, renderAdvisorComposition, advisorAuthorizedProjectId } from './advisor-composition';
-import { checkAdvisorCommands } from './advisor-command-contract';
-import { advisorFallbackText, advisorIntegrationContext, selectAdvisorKnowledge } from './advisor-knowledge';
-import { advisorContextFetcher, type AdvisorDiagnostics } from './advisor-diagnostics';
+import { ADVISOR_COMPOSITION_PROMPT, parseAdvisorComposition, renderAdvisorComposition } from './advisor-composition';
+import { checkAdvisorCommands, checkAdvisorDocsTopics } from './advisor-command-contract';
+import { advisorFallbackText, advisorIntegrationContext } from './advisor-knowledge';
+import { type AdvisorDiagnostics } from './advisor-diagnostics';
 import { buildSupportTicketRestRequest } from './support-ticket';
 import { constrainTextToSurface } from './surface-manifest.mjs';
 import { catalogToolAvailability, searchCatalogEntries } from './catalog-search';
@@ -47,9 +62,12 @@ import { anonymousClaimPrompt, isAnonymousClaimPromptCandidate } from './anonymo
 import { projectAccountIdentity } from './account-identity';
 import {
   FileUploadError,
+  MULTIPART_UPLOAD_GUIDANCE,
+  SINGLE_REQUEST_MAX_BYTES,
   parseConnectorFileReference,
   parseConnectorFileReferences,
   resolveUploadContentType,
+  startMultipartUpload,
   streamConnectorFileToUpload,
   taskAttachmentPaths,
 } from './file-upload';
@@ -84,15 +102,23 @@ import {
 } from './tool-list-pagination';
 import { connectorApiToolSpecs } from './tool-registry/domains/connector-api';
 import { ACCOUNT_TOOL_SPECS } from './tool-registry/domains/account';
+import { ADMIN_PROJECT_TOOL_SPECS } from './tool-registry/domains/admin-project';
 import { TASK_READ_TOOL_SPECS } from './tool-registry/domains/task-reads';
 import { GROUP_TOOL_SPECS } from './tool-registry/domains/groups';
+import { POSTGRES_TOOL_SPECS } from './tool-registry/domains/postgres';
+import { PROJECT_HANDOFF_TOOL_SPECS } from './tool-registry/domains/project-handoff';
+import { attachProjectContext, projectContextFromResult } from './project-context-delivery';
+import { DEFAULT_STARTER_FEATURES, DEFAULT_STARTER_UI, STARTER_DEPLOY_WAIT_MS, awaitStarterDeploy, prepareProjectStarter, resolveProjectStarter, starterOutcome } from './project-starter';
 import {
   publicToolDefinitions,
   type ToolExecutionRuntime,
   type ToolSpec,
   type ToolUpstreamResult,
 } from './tool-registry/types';
+import { createDeployIntentSignal } from './deploy-intent';
 
+/** The MCP server version reported in serverInfo and in tool-error repro packets. */
+const MCP_SERVER_VERSION = '1.0.0';
 const CANONICAL_DOCS_TOPICS = Object.keys(PLATFORM_HELP_TOPICS).sort();
 const CANONICAL_DOCS_TOPICS_INLINE = CANONICAL_DOCS_TOPICS.join(', ');
 
@@ -131,9 +157,10 @@ interface Env {
   //   printf '%s' "sk-..." | npx wrangler secret put OPENAI_API_KEY
   // Without this the advisor tool returns a setup-required error.
   OPENAI_API_KEY?: string;
-  // Advisor model flip. Defaults to gpt-6-sol; changing the secret/var
+  // Advisor model flip. Defaults to gpt-6-luna; changing the secret/var
   // repoints both anonymous and authenticated advisor traffic together.
   ADVISOR_MODEL?: string;
+  ADVISOR_ASYNC_ENABLED?: string;
   // Legacy Sonnet fallback. Kept bound so a future switch back is one
   // env-flag flip away.
   ANTHROPIC_API_KEY?: string;
@@ -145,7 +172,8 @@ interface Env {
 }
 
 const MCP_INITIALIZE_INSTRUCTION_LINES = [
-  'somewhere.tech MCP exposes platform primitives; `docs({ topic })` provides the exact auth, database, payments, files, and runtime contracts.',
+  'Somewhere is in public beta.',
+  'somewhere.cloud MCP exposes platform primitives; `docs({ topic })` provides the exact auth, database, payments, files, and runtime contracts.',
   'Functions are `export default async function (req, sw)`; `sw.*` are runtime bindings, not HTTP calls.',
   'Runtime functions access database, auth, files, email, AI, and payments through `sw.*`; developer keys authorize management surfaces and are not function-runtime HTTP credentials.',
   'Database/query row results are exposed in `data`; `.rows` and `.results` are not result fields.',
@@ -153,7 +181,7 @@ const MCP_INITIALIZE_INSTRUCTION_LINES = [
   'Deployments accept raw source (`src/`, `index.html`, `package.json`, `api/`), which the platform compiles.',
   'Bundled `dist/` / `build/` output and local build steps are outside the standard deployment contract; only an explicit bundled-output escape hatch accepts them.',
   '`catalog` is the caller-visible tool index.',
-  '`advisor({ question })` can inspect an authorized live project and answer architecture questions.',
+  '`advisor({ question })` answers how to build or diagnose from the public platform contracts and the facts you supply; it cannot read your projects, account or files, or call tools.',
   '`docs({ topic: \'migration-supabase\' })` documents Supabase migration; bcrypt password hashes import directly.',
 ];
 
@@ -210,6 +238,27 @@ function isAdminCaller(env: Env, authHeader: string): boolean {
   return allowlist.split(',').map((k) => k.trim()).includes(token);
 }
 
+async function verifyMcpAdminCaller(
+  env: Env,
+  authHeader: string,
+): Promise<'valid' | 'rejected' | 'forbidden' | 'unavailable'> {
+  if (!isAdminCaller(env, authHeader)) return 'forbidden';
+  if (!env.SOMEWHERE_TECH_ADMIN_KEY) return 'unavailable';
+  try {
+    const response = await env.API_SERVICE.fetch(new Request('https://api-internal/v1/sys/mcp-admin-authority', {
+      headers: { Authorization: authHeader, 'X-Admin-Key': env.SOMEWHERE_TECH_ADMIN_KEY },
+      signal: AbortSignal.timeout(5_000),
+    }));
+    if (response.status === 401) return 'rejected';
+    if (response.status === 403) return 'forbidden';
+    if (response.status !== 200) return 'unavailable';
+    const body = await response.json() as { ok?: boolean; data?: { authorized?: boolean } };
+    return body?.ok === true && body.data?.authorized === true ? 'valid' : 'unavailable';
+  } catch {
+    return 'unavailable';
+  }
+}
+
 const SOMEWHERE_SITE_API_BASE = 'https://api.somewhere.site';
 
 // --- MCP Tool Definitions ---
@@ -241,6 +290,7 @@ interface MCPTool {
     type: 'object';
     properties: Record<string, JSONSchemaProp>;
     required: string[];
+    additionalProperties?: boolean;
   };
   outputSchema?: {
     type: 'object';
@@ -291,6 +341,46 @@ type CanonicalToolSpec = ToolSpec<McpToolExecutionRuntime, ToolHandlerOutcome>;
 function defineCanonicalToolSpecs<const T extends readonly CanonicalToolSpec[]>(specs: T): T {
   return specs;
 }
+
+/** Run a multi-operation tool's own handler for one fixed operation
+ *  (spec.operationOf). Only the arguments the fixed operation declares pass
+ *  through, then the pinned operation arguments, so an extra argument cannot
+ *  steer it into a sibling operation. */
+function runToolOperation(
+  baseTool: string,
+  runtime: McpToolExecutionRuntime,
+  args: Record<string, unknown>,
+  pinned: Record<string, unknown> = {},
+): Promise<ToolHandlerOutcome> {
+  const base = TOOL_SPEC_BY_NAME.get(baseTool);
+  const schema = TOOL_SPEC_BY_NAME.get(runtime.toolName)?.definition.inputSchema;
+  if (!base || !schema) throw new Error(`Unknown fixed operation ${runtime.toolName} of ${baseTool}`);
+  const missing = schema.required.filter((key) => args[key] === undefined || args[key] === null || args[key] === '');
+  if (missing.length > 0) {
+    return Promise.resolve({
+      content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'VALIDATION_ERROR', message: `${runtime.toolName} requires ${missing.join(', ')}.` }, null, 2) }],
+      isError: true,
+    });
+  }
+  const passed = Object.fromEntries(Object.keys(schema.properties).filter((key) => args[key] !== undefined).map((key) => [key, args[key]]));
+  return base.execute({ ...runtime, toolName: baseTool }, { ...passed, ...pinned });
+}
+
+/** The tool whose dispatch policy applies: a fixed operation inherits the
+ *  name-keyed policy of the tool it runs (sentinels, Advisor rate limits). */
+function policyToolName(toolName: string): string {
+  return TOOL_SPEC_BY_NAME.get(toolName)?.operationOf ?? toolName;
+}
+
+/** Inputs a surface refuses on a tool whose other operations that surface
+ *  exposes as separate tools or not at all. tools/list drops them from the
+ *  schema and tools/call refuses them, so the advertised schema is enforced. */
+const SURFACE_REFUSED_INPUTS: Partial<Record<ToolSurface, Readonly<Record<string, readonly string[]>>>> = {
+  chatgpt: {
+    project_logs: ['message', 'data'],
+    tasks_update: ['comment', 'author', 'upload_attachments', 'relationship', 'remove_relationship_id'],
+  },
+};
 
 /* ─── ONE capture surface ──────────────────────────────────────────────
  *
@@ -422,7 +512,9 @@ async function fetchCaptureArtifact(
   // base64-encoded for the MCP transport.
   if (body.storage) return callAPI(fetcher, 'POST', endpoint, authHeader, body);
 
-  const resp = await fetcher.fetch(`https://api-internal${endpoint}`, {
+  let url: string;
+  try { url = internalApiUrl(endpoint); } catch (err) { return invalidInternalPath(err); }
+  const resp = await fetcher.fetch(url, {
     method: 'POST',
     headers: { 'Authorization': authHeader, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -637,6 +729,9 @@ async function runCapture(
   if (args.include !== undefined) body.include = parseMaybeJson(args.include);
   if (args.extract !== undefined) body.extract = args.extract;
   if (args.session_id !== undefined) body.session_id = args.session_id;
+  if (args.require_existing_session !== undefined) body.require_existing_session = args.require_existing_session;
+  if (args.close !== undefined) body.close = args.close;
+  if (args.budget_ms !== undefined) body.budget_ms = args.budget_ms;
   if (args.steps !== undefined) body.steps = parseMaybeJson(args.steps);
   if (args.actions !== undefined) body.actions = parseMaybeJson(args.actions);
   if (args.expect_requests !== undefined) body.expect_requests = parseMaybeJson(args.expect_requests);
@@ -797,17 +892,34 @@ function shapeSiteVerifyReport(args: Record<string, unknown>, runs: SiteVerifyRu
   const failedRequests: Array<Record<string, unknown>> = [];
   const expectations: Array<Record<string, unknown>> = [];
   const screenshots: Array<Record<string, unknown>> = [];
+  // A run stopped at its execution cap before starting its next action. Its
+  // unrun actions are reported as not run — never passed, never failed.
+  const incomplete: Array<Record<string, unknown>> = [];
+  const lifecycle: Array<Record<string, unknown>> = [];
 
   for (const { viewport, report } of runs) {
+    if (isRecord(report.lifecycle) && report.lifecycle.outcome_unknown === true
+      && ['execution_timeout', 'evidence_timeout', 'cleanup_unknown'].includes(String(report.lifecycle.status))) {
+      lifecycle.push({ viewport: viewport.label, ...report.lifecycle });
+    }
+    if (isRecord(report.incomplete) && report.incomplete.reason === 'execution_cap') {
+      incomplete.push({ viewport: viewport.label, ...report.incomplete });
+    }
     const reportSteps = Array.isArray(report.steps) ? report.steps : [];
     for (let index = 0; index < reportSteps.length; index++) {
       const step = isRecord(reportSteps[index]) ? reportSteps[index] as Record<string, unknown> : {};
       const sourceIndex = typeof step.step === 'number' ? step.step : index;
+      const name = siteVerifyActionName(actions[sourceIndex], typeof step.action === 'string' ? step.action : 'page load');
+      if (step.ran === false) {
+        steps.push({ viewport: viewport.label, step: sourceIndex + 1, name, ran: false, not_run: true });
+        continue;
+      }
       steps.push({
         viewport: viewport.label,
         step: sourceIndex + 1,
-        name: siteVerifyActionName(actions[sourceIndex], typeof step.action === 'string' ? step.action : 'page load'),
+        name,
         passed: step.ok !== false && step.passed !== false,
+        ...(typeof step.code === 'string' ? { code: step.code } : {}),
         ...(typeof step.error === 'string' ? { error: step.error } : {}),
         ...(typeof step.duration_ms === 'number' ? { duration_ms: step.duration_ms } : {}),
         ...(step.value !== undefined ? { value: step.value } : {}),
@@ -824,8 +936,9 @@ function shapeSiteVerifyReport(args: Record<string, unknown>, runs: SiteVerifyRu
   }
 
   const failingStep = steps.find((step) => step.passed === false);
-  const failedExpectation = expectations.find((entry) => isRecord(entry.detail) && entry.detail.ok === false);
-  const failedScreenshot = runs.find(({ report }) => !browserReportPassed({
+  const unfinishedViewports = new Set([...incomplete, ...lifecycle].map(entry => entry.viewport));
+  const failedExpectation = expectations.find((entry) => !unfinishedViewports.has(entry.viewport) && isRecord(entry.detail) && entry.detail.ok === false);
+  const failedScreenshot = runs.find(({ viewport, report }) => !unfinishedViewports.has(viewport.label) && !browserReportPassed({
     passed: true,
     screenshots: report.screenshots,
   }));
@@ -840,15 +953,29 @@ function shapeSiteVerifyReport(args: Record<string, unknown>, runs: SiteVerifyRu
     verdict = `FAIL — expected request ${String(failedExpectation.detail.path)}:${String(failedExpectation.detail.status)} was not observed at ${String(failedExpectation.viewport)}.`;
   } else if (failedScreenshot) {
     verdict = `FAIL — screenshot capture failed at ${failedScreenshot.viewport.label}.`;
+  } else if (lifecycle.length) {
+    verdict = `INCOMPLETE — ${String(lifecycle[0].status).replaceAll('_', ' ')} at ${String(lifecycle[0].viewport)}. In-flight effects or cleanup may still be pending. Nothing was retried; do not replay actions automatically.`;
+  } else if (incomplete.length) {
+    const first = incomplete[0];
+    const next = typeof first.next_step === 'number' ? first.next_step : null;
+    const completed = typeof first.completed === 'number' ? first.completed : null;
+    verdict = `INCOMPLETE — stopped at the execution cap at ${String(first.viewport)}`
+      + (completed !== null ? `: ${completed} of ${actions.length} action${actions.length === 1 ? '' : 's'} ran` : '')
+      + (next !== null ? `; step ${next + 1} (${siteVerifyActionName(actions[next], 'action')}) and later were not run.` : '.')
+      + ' Nothing was retried; this is not a pass.';
   } else {
     verdict = actions.length
       ? `PASS — ${actions.length} step${actions.length === 1 ? '' : 's'} passed at ${runs.map((run) => run.viewport.label).join(' and ')}; page, console, and network healthy.`
       : `PASS — default page check passed at ${runs.map((run) => run.viewport.label).join(' and ')}; page, console, and network healthy.`;
   }
 
+  if (lifecycle.length && verdict.startsWith('FAIL')) verdict += ' Cleanup or in-flight effects remain unconfirmed. Nothing was retried; do not replay actions automatically.';
+
   return {
-    passed,
+    passed: incomplete.length || lifecycle.length ? false : passed,
     verdict,
+    ...(incomplete.length ? { incomplete } : {}),
+    ...(lifecycle.length ? { lifecycle } : {}),
     target: typeof args.url === 'string' ? args.url : args.project_id,
     viewports: runs.map(({ viewport, report }) => ({
       label: viewport.label,
@@ -909,6 +1036,7 @@ async function runSiteVerify(runtime: McpToolExecutionRuntime, args: Record<stri
       ...(typeof args.project_id === 'string' ? { project_id: args.project_id } : {}),
       ...(typeof args.url === 'string' ? { url: args.url } : {}),
       actions: Array.isArray(args.actions) ? args.actions : [],
+      budget_ms: args.budget_ms ?? 180_000,
       expect_requests: Array.isArray(args.expect_requests) ? args.expect_requests : [],
       visible_only: args.visible_only === true,
       ...(args.auth !== undefined ? { auth: args.auth } : {}),
@@ -947,8 +1075,10 @@ function captureHelpResult(): ToolUpstreamResult {
       actions: [
         { action: 'goto', fields: { path: '/login' }, note: 'navigate (relative path or same-origin url)' },
         { action: 'click', fields: { selector: 'button[type=submit]' } },
-        { action: 'fill', fields: { selector: '#email', value: 'a@b.co' } },
+        { action: 'fill', fields: { selector: '#email', value: 'a@b.co' }, note: 'replaces the value in one step (the page gets real input events; React controlled inputs see it); steps[].value.readback gives only the length and whether it matches, never the value' },
+        { action: 'type', fields: { selector: '#search', value: 'pir' }, note: 'key by key (keydown/keyup per character, in order) — only when the page reacts to individual keys; slower than fill' },
         { action: 'upload', fields: { selector: '#avatar', file: 'data:image/png;base64,...', name: 'avatar.png (optional)' }, note: 'CLI accepts a local path; hosted calls send base64/data URL bytes' },
+        { action: 'upload', fields: { selector: '#video', fs_path: '/uploads/big.mp4', name: 'clip.mp4 (optional)', type: 'video/mp4 (optional)' }, note: 'a file already in project files, up to 50 MB per call, streamed into the page; send file OR fs_path, not both' },
         { action: 'press', fields: { key: 'Enter', selector: '#email (optional)' } },
         { action: 'select', fields: { selector: '#plan', value: 'pro' } },
         { action: 'hover', fields: { selector: '.menu' } },
@@ -965,8 +1095,8 @@ function captureHelpResult(): ToolUpstreamResult {
         { action: 'snapshot', fields: { frame: 'preview (optional)' }, note: 'structured page-as-text (a11y roles + names) in steps[].value — the cheap default read vs a screenshot' },
         { action: 'screenshot', fields: { label: 'after', full_page: false }, note: 'stored as a file path under /_browser_tests/' },
         { action: 'assert_visible', fields: { selector: '.welcome' } },
-        { action: 'assert_text', fields: { selector: '.welcome', contains: 'Hi' } },
-        { action: 'assert_url', fields: { contains: '/dashboard' } },
+        { action: 'assert_text', fields: { selector: '.welcome', contains: 'Hi', timeout: 15000 }, note: 'checked until it holds or the timeout passes (ms, default 15000, max 45000, never past the run budget; 0 = check once); waited_ms reports any wait' },
+        { action: 'assert_url', fields: { contains: '/dashboard', timeout: 15000 }, note: 'checked until it holds, like assert_text' },
         { action: 'assert_request', fields: { url_contains: '/api/login', status: 200 } },
         { action: 'click_at', fields: { x: 100, y: 200 }, note: 'coordinate fallback ONLY' },
       ],
@@ -977,6 +1107,8 @@ function captureHelpResult(): ToolUpstreamResult {
         { click: 'button[type=submit]' },
         { wait: '.dashboard' },
         { expect: { selector: '.welcome', text: 'Hi', visible: true, count: 1 } },
+        { expect: { selector: '#status', text: 'Saved', timeout: 5000 } },
+        { type: '#search', value: 'pir' },
         { screenshot: 'after' },
         { eval: 'document.title' },
       ],
@@ -985,10 +1117,10 @@ function captureHelpResult(): ToolUpstreamResult {
       frame: 'Add "frame":"name | url-substring | child-index | css-selector" to ANY step to run it inside an iframe (the wait/assert/eval/screenshot/snapshot then observes the FRAME). Unknown frame ERRORS.',
       include: 'No-steps inspect includes console_errors / page_errors / failed_requests / rendered_text, a screenshot, and the bounded dom_outline + testid map. An explicit include list selects sections: "dom" retains the interactive-element map, "network" adds the full request table + redirect chain, and "markdown" adds clean page markdown. include:[] omits these optional sections. Steps runs need include:["dom"] to request the map.',
       extract: 'READ a page as clean markdown instead of vision-parsing the screenshot: extract:"markdown" (same as include:["markdown"]) returns the page content — headings, links, lists, main body — in the `markdown` field. The plain rendered text is always in `rendered_text`.',
-      session_id: 'PERSISTENT SESSION: pass the same session_id across calls to keep ONE live browser page alive between them (navigate in call 1, wait for a stream + screenshot in call 2 — same page, cookies + current URL + in-flight stream preserved). Returns session_id + session_expires_at; a reconnect skips the initial navigation (use a goto step to move). Yours only, capped per developer, idles out ~3 min (~10 min hard cap); an expired session transparently restarts (session_note). Omit for the default fresh-per-call browser.',
+      session_id: `PERSISTENT SESSION: pass the same session_id across calls to keep ONE live browser page alive between them (navigate in call 1, wait for a stream + screenshot in call 2 — same page, cookies + current URL + in-flight stream preserved). Returns session_id + session_expires_at; a reconnect skips the initial navigation (use a goto step to move). Yours, and bound to the project it was opened for (the same name in another project is a different session); live sessions share one limit across the account's projects; close with { project_id, session_id, close: true }; idles out after ${BROWSER_SESSION_IDLE_MINUTES} min (${BROWSER_SESSION_HARD_CAP_MINUTES} min hard cap); a failed step keeps it; an expired session restarts signed out and says so (session_note). Omit for the default fresh-per-call browser.`,
       signals: 'Response leads with console_errors / page_errors / failed_requests / request_expectations, THEN steps (each with ok + optional value/error), THEN screenshots, plus rendered_text when you omit actions/steps. An expected path+status is excluded from failed resource signals; a missing expectation, unexpected 4xx/5xx, or failed requested capture makes passed false. Capture errors remain in screenshots[].error; automatic failure evidence is best-effort.',
       capture: 'The ONE output knob — capture: { as: "png" | "jpeg" | "webp" | "pdf", width, quality, full_page, paper, landscape, print_background }. `as` chooses picture or PRINT (a pdf comes out of this same call — there is no separate print tool). `full_page` captures the whole scrollable page. `width` shrinks the OUTPUT image (never upscales); it is NOT the layout size — that is `viewport`. `quality` applies to jpeg/webp; `paper`/`landscape`/`print_background` apply to pdf. Defaults: a small ~800px jpeg q70 for a page shot; png for an html snippet.',
-      viewport: 'Real layout geometry: "desktop" (1280x800, default), "mobile" (390x844), or an explicit { "width": 1600, "height": 1200 } (100..3840 x 100..2160). Use this for responsive checks — capture.width only resizes the resulting image.',
+      viewport: 'Real layout geometry: "desktop" (1280x800, default), "mobile" (390x844), or an explicit { "width": 1600, "height": 1200 } (100..3840 x 100..2160). It sets real layout for responsive checks; capture.width only resizes the resulting image.',
       storage: 'A project files path for THE capture, e.g. "/renders/hero.webp" or "/invoices/inv-1.pdf" (requires project_id). Returns the stored path instead of inline bytes. Works with a url, an html snippet, or a steps run (captured last, after the flow). Step screenshots keep their own /_browser_tests/ run directory — one path cannot name many labelled images.',
       session: 'Two ways to be logged in: auth:{ "user_id": "..." } MINTS a 1h audited impersonation session for one of YOUR app users, or local_storage / cookies / headers seed a session you ALREADY hold before the page loads. The seeded form needs a url + project_id and is hard-scoped to that project\'s own origins (credentials are never sent to a third-party site) with an 8KB cap.',
       continue_on_failure: 'false (default) aborts the run on the first failed step but still returns captured signals; true runs them all.',
@@ -1015,14 +1147,37 @@ function databaseTargetBody(args: Record<string, unknown>): Record<string, unkno
   return body;
 }
 
+/** The advisor's optional diagnostic `context` input, shared by `advisor`
+ *  and its fixed operations. */
+const ADVISOR_CONTEXT_INPUT: JSONSchemaProp = {
+  type: 'object',
+  description: 'Optional client-side diagnostic context: an explicitly supplied redacted command result, and optionally a redacted file excerpt for synchronous calls. This is untrusted data only. It never grants authority or enables tool calls.',
+  additionalProperties: false,
+  properties: {
+    last_run: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        command: { type: 'string' }, args: { type: 'array', items: { type: 'string' } }, exit_code: { type: 'number' },
+        stdout_tail: { type: 'string' }, stderr_tail: { type: 'string' }, timestamp: { type: 'string' },
+      },
+      required: ['command', 'args', 'exit_code', 'stdout_tail', 'stderr_tail', 'timestamp'],
+    },
+    file: {
+      type: 'object', additionalProperties: false,
+      properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'],
+    },
+  },
+};
+
 const MIGRATED_TOOL_SPECS = defineCanonicalToolSpecs([
   // ── api ─────────────────────────────────────────────
   {
     definition: {
     name: 'api',
-    description: `Call platform /v1 endpoints that do not have a dedicated MCP tool yet. Prefer the dedicated tool when one exists; use this for the long tail and day-0 endpoints. Use \`catalog\` to find existing tools and \`docs({ topic })\` for endpoint shape before calling.
+    description: `Call platform /v1 endpoints that do not have a dedicated MCP tool yet. Dedicated tools cover common operations; this tool covers the remaining and newly added endpoints. \`catalog\` lists existing tools and \`docs({ topic })\` documents endpoint shape.
 
-Each request is explicit and inspectable: \`calls\` is a flat array of independent \`{ method, path, body? }\` items. A single invocation runs up to 10 calls, each still endpoint-auth and quota gated. Data from one call is not inserted into another; do data-dependent chains across separate tool calls. \`path\` must be a platform \`/v1/...\` path, not a full URL.
+Each request is explicit and inspectable: \`calls\` is a flat array of independent \`{ method, path, body? }\` items. A single invocation runs up to 10 calls, each still endpoint-auth and quota gated. Data from one call is not inserted into another; data-dependent chains run across separate tool calls. \`path\` must be a platform \`/v1/...\` path, not a full URL.
 
 Write calls require \`confirm:true\` by default. \`GET\` and \`HEAD\` run without confirm; \`POST /v1/ai/complete\` and \`POST /v1/ai/embed\` are the only read-shaped write routes currently allowlisted. Without confirmation the tool returns the exact calls it would run and asks you to re-call with \`confirm:true\`. Calls run with the caller's own auth and the same permission checks as dedicated tools.`,
     inputSchema: {
@@ -1076,7 +1231,12 @@ Write calls require \`confirm:true\` by default. \`GET\` and \`HEAD\` run withou
         const results: ApiToolCallResult[] = [];
         for (const call of validation.calls) {
           try {
-            const res = await callAPI(fetcher, call.method, call.path, authHeader, call.body);
+            const upstream = await callAPI(fetcher, call.method, call.path, authHeader, call.body);
+            let pathname = new URL(call.path, API_TOOL_INTERNAL_ORIGIN).pathname;
+            try { pathname = decodeURIComponent(pathname); } catch { /* Keep a malformed path's original upstream response. */ }
+            const route = pathname.replace(/\/+$/, '');
+            const res = route === '/v1/keys/cli-pair' ? cliPairResultForChat(upstream)
+              : route === '/v1/auth/signup' ? signupResultForChat(upstream) : upstream;
             results.push({ status: res.status, ok: res.status >= 200 && res.status < 300, data: res.data });
           } catch (err) {
             if (err instanceof UpstreamOAuthRejectedError || err instanceof UpstreamApiKeyRejectedError) throw err;
@@ -1106,13 +1266,13 @@ Write calls require \`confirm:true\` by default. \`GET\` and \`HEAD\` run withou
     name: 'catalog',
     description: `The caller-visible index of available tools. Three reference surfaces have distinct effects: **catalog** lists which tools exist; **docs({ topic })** returns the static contract for one surface; **advisor({ question })** can answer open-ended questions from an authorized live project's state.
 
-catalog returns the directory / table of contents / manifest for every tool available to this caller on the active surface, grouped by category with a one-line summary per group: \`{ categories: { project: { summary, tools: [...] }, db: { summary, tools: [...] }, ... } }\`. Categories cover projects, deploys, database, files, env vars, end-user auth, email (out + inbox), AI (chat + media), jobs, cron, queue, logs, errors, usage, feedback, domains, search, web scraping, push, rate limiting, telegram, analytics, captcha, payments, live updates, video, calls, render, stock photos, and platform help.
+catalog returns the directory / table of contents / manifest for every tool available to this caller on the active surface, grouped by category with a one-line summary per group: \`{ categories: { project: { summary, tools: [...] }, db: { summary, tools: [...] }, ... } }\`. Categories cover projects, deploys, database, files, env vars, end-user auth, email (out + inbox), AI (chat + media), jobs, cron, queue, logs, errors, usage, feedback, domains, search, web scraping, push, rate limiting, telegram, analytics, captcha, payments, live updates, render, stock photos, and platform help.
 
 For admin/operator callers the same response also includes every registered plain-English platform census question, symptom, and authority declaration. That is the discovery call before \`somewhere_tech_stats({ metric_id })\` or \`debug_project({ identifier, symptom })\`; no table name or SQL knowledge is required.
 
-**Search:** pass \`search\` to find a tool by keyword or exact name — e.g. \`catalog({ search: "auth_signup" })\`, \`catalog({ search: "upload url" })\`. Returns matching tools + their group + how to load each. Most tools are not in the default surface, so an empty default tool-search is not evidence that a tool is unavailable.
+**Search:** \`search\` finds a tool by keyword or exact name — e.g. \`catalog({ search: "auth_signup" })\`, \`catalog({ search: "upload url" })\`. Returns matching tools + their group + how to load each. Most tools are not in the default surface, so an empty default tool-search is not evidence that a tool is unavailable.
 
-**Lazy-load:** pass \`load\` to get FULL tool definitions for one or more groups instead of the index — \`catalog({ load: "auth" })\`, \`catalog({ load: "db,fs" })\`, or \`load: "all"\`. Pair with a group-scoped connection (\`?groups=db,fs\` on the MCP URL, or the \`Mcp-Tool-Groups\` header) so a session only carries the tools it needs.`,
+**Lazy-load:** \`load\` returns FULL tool definitions for one or more groups instead of the index — \`catalog({ load: "auth" })\`, \`catalog({ load: "db,fs" })\`, or \`load: "all"\`. A group-scoped connection (\`?groups=db,fs\` on the MCP URL, or the \`Mcp-Tool-Groups\` header) limits a session to the tools it needs.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -1130,11 +1290,11 @@ For admin/operator callers the same response also includes every registered plai
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","connector","chatgpt"],
-    protocol: { surfaceDescriptions: { connector: "List or search the tools available on this Somewhere connector. Returns tool names and summaries; load returns their schemas. It does not activate additional tools." }, oauthScopes: ['mcp'] },
+    protocol: { surfaceAnnotations: { chatgpt: { destructiveHint: false, openWorldHint: false } }, surfaceDescriptions: { connector: "List or search the tools available on this Somewhere connector. Returns tool names and summaries; load returns their schemas. It does not activate additional tools." }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { env, authHeader, ctx, emitMode, surface } = runtime;
       {
-        const includeAdmin = isAdminCaller(env, authHeader);
+        const includeAdmin = await verifyMcpAdminCaller(env, authHeader) === 'valid';
         const operatorRegistryResponse = includeAdmin
           ? await callSomewhereTechAdmin(env, '/v1/sys/stats?catalog=1')
           : null;
@@ -1336,19 +1496,31 @@ For admin/operator callers the same response also includes every registered plai
     name: 'docs',
     description: `The static manual for one platform surface at a time. Returns signatures, examples, common patterns, failure modes, and exact behavior for deploy, sw.db, sw.auth, files, payments, and other primitives. The tool list names verbs; docs defines their contracts.
 
-This is the static manual; for tailored advice on YOUR live project use \`advisor({ question })\` instead, and to find which tool exists at all use \`catalog\`.
+This is the static manual; \`advisor({ question })\` provides tailored advice from supplied facts, and \`catalog\` lists available tools.
 
-Topics: ${CANONICAL_DOCS_TOPICS_INLINE}. Aliases such as fetch/http/outbound and legacy ctx.* names also resolve. Unknown topics return this canonical list. Example: \`{ "topic": "sw.fetch" }\`.`,
+Returns a bounded summary by default: the read-first sections plus an id index of every section. The first line reports \`view\` and \`complete=true|false\`. \`section\` returns one section, and \`detail: "full"\` the complete topic.
+
+Topics: ${CANONICAL_DOCS_TOPICS_INLINE}. Aliases such as fetch/http/outbound and legacy ctx.* names also resolve. Unknown topics return this canonical list. Example: \`{ "topic": "sw.fetch" }\`, then \`{ "topic": "sw.fetch", "section": "<id>" }\`.`,
     inputSchema: {
       type: 'object',
       properties: {
         topic: {
           type: 'string',
-          description: `One of: ${CANONICAL_DOCS_TOPICS_INLINE}. Aliases such as fetch, http, outbound, and legacy ctx.* names also resolve.`,
+          description: `One of: ${CANONICAL_DOCS_TOPICS_INLINE}. Canonical documentation topic identifier or alias (for example, sw.auth or auth-client). Unknown topics return the canonical topic list.`,
+        },
+        detail: {
+          type: 'string',
+          enum: ['summary', 'full'],
+          description: "Default 'summary': a bounded view with the topic's read-first sections and an index of every section. 'full' returns the complete topic. The first response line reports view and complete=true|false.",
+        },
+        section: {
+          type: 'string',
+          description: 'One section by the id listed in the summary index (or its exact heading text). Returns that section with its subsections.',
         },
         project_id: { type: 'string', description: "Optional project UUID, subdomain, slug, or 'default'. When supplied, the response also lists active runtime-fix notices for that project." },
       },
       required: ['topic'],
+      additionalProperties: false,
     },
   },
     annotations: { title: 'Read platform docs', readOnlyHint: true, idempotentHint: true },
@@ -1358,7 +1530,7 @@ Topics: ${CANONICAL_DOCS_TOPICS_INLINE}. Aliases such as fetch/http/outbound and
     visibility: 'public',
     paid: false,
     surfaces: ["full","connector","chatgpt"],
-    protocol: { surfaceDescriptions: { connector: "Read Somewhere platform documentation for a topic, including raw-source deployment, server functions, authentication, database access, and file storage. Returns the requested API contract and examples." }, oauthScopes: ['mcp'] },
+    protocol: { surfaceAnnotations: { chatgpt: { destructiveHint: false, openWorldHint: false } }, surfaceDescriptions: { connector: "Read Somewhere platform documentation for a topic, including raw-source deployment, server functions, authentication, database access, and file storage. Returns the requested API contract and examples." }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { env, authHeader, ctx, caller, surface, helpSessionId } = runtime;
       {
@@ -1369,6 +1541,8 @@ Topics: ${CANONICAL_DOCS_TOPICS_INLINE}. Aliases such as fetch/http/outbound and
         // tool-first for shell-less connectors, both for unknown. Shell-less
         // getting-started also gets a tool-only body so the banner cannot be
         // followed by commands the caller has no terminal to run.
+        const argsCheck = checkDocsToolArgs(args);
+        if (!argsCheck.ok) return apiToolError(argsCheck.error, argsCheck.message, argsCheck.details);
         const startedAt = Date.now();
         const topic = (args.topic as string) || '';
         const record = (text: string): void => {
@@ -1401,12 +1575,21 @@ Topics: ${CANONICAL_DOCS_TOPICS_INLINE}. Aliases such as fetch/http/outbound and
         const banner = callerHelpBanner(topic, caller);
         const normalizedTopic = topic.trim().toLowerCase().replace(/^(?:sw|ctx)\./, '');
         const advisorHint = caller === 'cli'
-          ? '\n\nNeed help applying this contract? Ask `somewhere advisor "your question"`; include the project and exact error when diagnosing a failure.\n'
-          : '\n\nNeed help applying this contract? Ask `advisor` with your question and, for project diagnosis, `project_id`.\n';
-        const body = caller === 'connector' && normalizedTopic === 'getting-started'
-          ? (surface === 'connector' ? CLAUDE_CONNECTOR_GETTING_STARTED_HELP : CONNECTOR_GETTING_STARTED_HELP)
-          : platformHelp(topic);
-        const text = constrainCanonicalText(banner + body + advisorHint, surface);
+          ? '\n\nNeed help applying this contract? Ask `somewhere advisor "your question"`; include the relevant facts and exact error.\n'
+          : '\n\nNeed help applying this contract? Ask `advisor` with your question and the relevant facts; it cannot read your project.\n';
+        const view = {
+          detail: args.detail,
+          section: args.section,
+          cli: caller === 'cli',
+          ...(caller === 'connector' && normalizedTopic === 'getting-started'
+            ? { body: surface === 'connector' ? CLAUDE_CONNECTOR_GETTING_STARTED_HELP : CONNECTOR_GETTING_STARTED_HELP }
+            : {}),
+        };
+        const body = platformHelp(topic, view);
+        // A resolved topic starts with the `[docs] …` status line; it stays the
+        // first line, ahead of the caller banner.
+        const status = /^\[docs\] [^\n]*\n/.exec(body)?.[0] ?? '';
+        const text = constrainCanonicalText(status + banner + body.slice(status.length) + advisorHint, surface);
         record(text);
         return { content: [{ type: 'text', text }] };
 
@@ -1416,66 +1599,25 @@ Topics: ${CANONICAL_DOCS_TOPICS_INLINE}. Aliases such as fetch/http/outbound and
   {
     definition: {
     name: 'advisor',
-    description: `Project-aware platform guidance. Unlike \`docs\` (the static manual for one surface), the advisor is loaded with the full platform reference AND — when \`project_id\` is supplied with sufficient authority — a live snapshot of that project (subdomain, attached custom domains + claim status, plan, env var names, deploy state). Without project authority it has no live snapshot.
+    description: `Ask how to build or diagnose a problem using the current public platform contracts. It takes the question and the facts for the Advisor to use. It cannot read your projects, account, files or earlier conversations, fetch URLs, or call tools.
 
-Questions can span surfaces such as auth + payments + domains, or diagnose an integration error from the available evidence.
+Questions can span auth, payments, data and other platform features. If facts are missing, the Advisor names the context it needs; your agent reads that context with its own credential and asks a new question. Plan prices and limits come from the public catalogue; your account's usage or pricing version must be supplied explicitly.
 
-**project_id effect:** for project-specific questions about auth, custom domains, deploy state, payments, env-vars, billing, or broken redirect URIs, the advisor reads the authorized project's real configuration instead of relying on a generic example.
+For example: { "question": "How do I combine owner() notes with one public intake handler?" }
 
-**Without project_id:** pure design questions ("how should I structure a multi-tenant SaaS?", "should I use jobs or queue for this?") receive general guidance without live project evidence.
-
-**Examples:**
-
-\`\`\`json
-{
-  "question": "I bought railtime.co.uk via domain_buy and OAuth keeps rejecting redirect_uri=https://railtime.co.uk/api/auth/google-callback. What's the actual fix?",
-  "project_id": "railme"
-}
-\`\`\`
-
-\`\`\`json
-{ "question": "How should I structure auth + Google login + email verification + a Stripe paywall on one project?" }
-\`\`\`
-
-\`\`\`json
-{ "question": "What's the right way to handle file uploads with image optimization?" }
-\`\`\`
-
-The response is plain markdown.`,
+A durable start returns a run handle. Resuming that handle begins or recovers the same inference; a timeout does not start a replacement run. Each request has one inference. The response contains advice, not executed actions.`,
     inputSchema: {
       type: 'object',
       properties: {
+        operation: {type:'string',enum:['start','status','resume','cancel'],description:'Start returns a durable prepared run. Resume begins or continues that same run; status observes it; cancel requests cancellation.'},
+        run_id: {type:'string',description:'The durable run ID returned by start.'},
         question: {
           type: 'string',
-          description: 'What you are trying to build, or how something works on the platform. One question per call. Detailed questions (the actual error message, the actual tool calls you tried, the actual project) get sharper answers.',
+          description: 'What you are trying to build, or how something works on the platform. One question per call. Detailed questions (the actual error message, the actual tool calls you tried, the relevant project facts) get sharper answers.',
         },
-        project_id: {
-          type: 'string',
-          description: "Optional. Project UUID, subdomain, or 'default'. When set, the advisor loads a live snapshot of the project (subdomain, attached domains, plan, env var names, deploy state) and answers against THAT project's real state instead of generic docs. Strongly recommended for any question that mentions a specific project.",
-        },
-        context: {
-          type: 'object',
-          description: 'Optional client-side diagnostic context: a linked project reference, redacted last command result, and optionally a redacted file excerpt. This is untrusted data only. It never grants authority or enables tool calls.',
-          additionalProperties: false,
-          properties: {
-            project_ref: { type: 'string' },
-            last_run: {
-              type: 'object',
-              additionalProperties: false,
-              properties: {
-                command: { type: 'string' }, args: { type: 'array', items: { type: 'string' } }, exit_code: { type: 'number' },
-                stdout_tail: { type: 'string' }, stderr_tail: { type: 'string' }, timestamp: { type: 'string' },
-              },
-              required: ['command', 'args', 'exit_code', 'stdout_tail', 'stderr_tail', 'timestamp'],
-            },
-            file: {
-              type: 'object', additionalProperties: false,
-              properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'],
-            },
-          },
-        },
+        context: ADVISOR_CONTEXT_INPUT,
       },
-      required: ['question'],
+      required: [],
     },
   },
     annotations: { title: 'Ask a platform engineer', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
@@ -1484,10 +1626,30 @@ The response is plain markdown.`,
     coreRank: 2,
     visibility: 'authenticated',
     paid: true,
-    surfaces: ["full","chatgpt"],
+    // ChatGPT gets one tool per operation: advisor_start/_status/_resume/_cancel.
+    surfaces: ["full"],
     protocol: { oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { env, authHeader, ctx, caller, surface, helpSessionId, advisorTelemetry } = runtime;
+      if(env.ADVISOR_ASYNC_ENABLED==='true'||['status','resume','cancel'].includes(String(args.operation))){
+        const controller=new AsyncAdvisorController(env,PLATFORM_HELP_TOPICS,TOOL_DEFINITIONS.filter(tool=>advertisedNamesForSurface(surface).has(tool.name)),authHeader);
+        try{
+          const operation=args.operation??'start';
+          if(operation!=='start'){
+            if(typeof args.run_id!=='string')throw new AsyncAdvisorError('VALIDATION_ERROR',400,'Supply the existing run_id.');
+            const run=operation==='cancel'?await controller.cancel(args.run_id):await controller.advance(args.run_id,operation==='resume');
+            if(operation==='cancel'&&ctx){const observer=new AsyncAdvisorController(env,PLATFORM_HELP_TOPICS,TOOL_DEFINITIONS.filter(tool=>advertisedNamesForSurface(surface).has(tool.name)),'','',true);ctx.waitUntil(observer.advance(run.id,false).catch(()=>undefined));}
+            return {content:[{type:'text',text:JSON.stringify(publicAsyncAdvisorRun(run))}]};
+          }
+          const question=typeof args.question==='string'?args.question.trim():'';if(!question)throw new AsyncAdvisorError('VALIDATION_ERROR',400,'Supply a question.');
+          const context=sanitizeAdvisorContext(args.context);if(context?.file)throw new AsyncAdvisorError('ADVISOR_CONTEXT_UNSUPPORTED',400,'Durable Advisor does not accept file excerpts. Put the relevant diagnostic or question in the request instead.');
+          const inputError=advisorProjectInputError(args);if(inputError)throw new AsyncAdvisorError('ADVISOR_PROJECT_CONTEXT_UNSUPPORTED',400,inputError);
+          const staticAnswer=advisorWebhookContractAnswer(question)??(!context?advisorContractAnswer(question):null);if(staticAnswer)return {content:[{type:'text',text:constrainCanonicalText(staticAnswer,surface)}]};
+          const run=await controller.start({request_id:crypto.randomUUID(),request_created_at:Date.now(),question,project_id:null,snapshot:null,diagnostic:formatAdvisorContext(context),caller,surface,service_tier:'default'});
+          // No inference is dispatched until the caller acknowledges this handle by resuming it.
+          return {content:[{type:'text',text:JSON.stringify(publicAsyncAdvisorRun(run))}]};
+        }catch(error){return {content:[{type:'text',text:JSON.stringify({ok:false,error:error instanceof AsyncAdvisorError?error.code:'ADVISOR_OPERATION_UNCONFIRMED',message:error instanceof Error?error.message:'Resume the same run.'})}],isError:true};}
+      }
       {
         const startedAt = Date.now();
         const question = typeof args.question === 'string' ? args.question.trim() : '';
@@ -1497,16 +1659,12 @@ The response is plain markdown.`,
             isError: true,
           };
         }
-        // project_id is resolved upstream of this switch when it's a
-        // non-empty string, so by the time we get here it's either a
-        // resolved UUID or absent. The advisor uses it to load a live
-        // project snapshot as untrusted context.
+        const inputError = advisorProjectInputError(args);
+        if (inputError) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'ADVISOR_PROJECT_CONTEXT_UNSUPPORTED', message: inputError }) }], isError: true };
         const clientContext = sanitizeAdvisorContext(args.context);
-        const projectIdArg = typeof args.project_id === 'string' && args.project_id.length > 0
-          ? args.project_id
-          : clientContext?.project_ref ?? null;
+        const projectIdArg = null;
         const contextText = formatAdvisorContext(clientContext);
-        const answer = await callPlatformAdvisor(env, authHeader, question, projectIdArg, surface, caller, 'authenticated', 'default', contextText);
+        const answer = await callPlatformAdvisor(env, question, projectIdArg, surface, caller, 'authenticated', 'default', contextText);
         const constrainedAnswer = {
           ...answer,
           text: constrainCanonicalText(answer.text, surface),
@@ -1532,20 +1690,112 @@ The response is plain markdown.`,
       }
     },
   },
+  // ── advisor, one operation per tool (ChatGPT) ────────────────────────
+  {
+    definition: {
+    name: 'advisor_start',
+    description: `Ask how to build or diagnose something using the current public platform contracts. It takes the question and the facts for the Advisor to use. It cannot read your projects, account, files or earlier conversations, fetch URLs, or call tools, and its answer is advice, not executed actions.
+
+The question is recorded with your account. Depending on platform configuration the call either sends the question to the model provider and returns the advice, or saves a durable run and returns its run_id without starting inference; in that case call advisor_resume with the run_id.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        question: { type: 'string', description: 'What you are trying to build, or how something works on the platform. One question per call; the actual error and the calls tried are the useful facts.' },
+        context: ADVISOR_CONTEXT_INPUT,
+      },
+      required: ['question'],
+    },
+  },
+    annotations: { title: 'Ask a platform engineer', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    group: 'help',
+    core: false,
+    visibility: 'authenticated',
+    paid: true,
+    surfaces: ["full","chatgpt"],
+    operationOf: 'advisor',
+    protocol: { oauthScopes: ['mcp'] },
+    execute: async (runtime, args) => runToolOperation('advisor', runtime, args),
+  },
+  {
+    definition: {
+    name: 'advisor_status',
+    description: 'Check a durable Advisor run by the run_id advisor_start returned: its state and, once finished, the advice. Checking asks the model provider for the run\'s progress and saves that progress and the run\'s final usage on the run. It never starts or restarts inference.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        run_id: { type: 'string', description: 'The durable run ID returned by advisor_start.' },
+      },
+      required: ['run_id'],
+    },
+  },
+    annotations: { title: 'Check an Advisor run', readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    group: 'help',
+    core: false,
+    visibility: 'authenticated',
+    paid: true,
+    surfaces: ["full","chatgpt"],
+    operationOf: 'advisor',
+    protocol: { oauthScopes: ['mcp'] },
+    execute: async (runtime, args) => runToolOperation('advisor', runtime, args, { operation: 'status' }),
+  },
+  {
+    definition: {
+    name: 'advisor_resume',
+    description: 'Begin or continue the inference for a durable Advisor run returned by advisor_start, sending its saved question to the model provider. After a timeout, resume the same run_id rather than asking again; this never starts a replacement run.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        run_id: { type: 'string', description: 'The durable run ID returned by advisor_start.' },
+      },
+      required: ['run_id'],
+    },
+  },
+    annotations: { title: 'Resume an Advisor run', readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    group: 'help',
+    core: false,
+    visibility: 'authenticated',
+    paid: true,
+    surfaces: ["full","chatgpt"],
+    operationOf: 'advisor',
+    protocol: { oauthScopes: ['mcp'] },
+    execute: async (runtime, args) => runToolOperation('advisor', runtime, args, { operation: 'resume' }),
+  },
+  {
+    definition: {
+    name: 'advisor_cancel',
+    description: 'Cancel a durable Advisor run by run_id. The saved run is marked as cancel-requested and any inference in progress at the model provider is asked to stop. This cannot be undone.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        run_id: { type: 'string', description: 'The durable run ID returned by advisor_start.' },
+      },
+      required: ['run_id'],
+    },
+  },
+    annotations: { title: 'Cancel an Advisor run', readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    group: 'help',
+    core: false,
+    visibility: 'authenticated',
+    paid: true,
+    surfaces: ["full","chatgpt"],
+    operationOf: 'advisor',
+    protocol: { oauthScopes: ['mcp'] },
+    execute: async (runtime, args) => runToolOperation('advisor', runtime, args, { operation: 'cancel' }),
+  },
   // ── project ─────────────────────────────────────────────
   {
     definition: {
     name: 'project_list',
     description: `My projects, my apps, my sites, my deployments, account inventory, dashboard overview — show every project I own or collaborate on. Each row includes \`is_owner\` so you can tell which is which.
 
-**Compact + paginated by default** to keep the payload small: returns up to **50** projects with the core fields (id, name, subdomain, status, tags, created_at, last_deployed_at, latest_screenshot_url, favicon_url, is_owner). The render fields are included in this one response; screenshot/favicon URLs are null until their live-release asset exists. When more exist, the response ends with a note telling you the total and how to page. To narrow or expand: pass \`q\` (substring filter on name/subdomain), \`tag\` (organization label filter; pass multiple for AND semantics), \`limit\`/\`offset\` (paging), or \`fields:"full"\` for the complete record per row.
+**Compact + paginated by default** to keep the payload small: returns up to **50** projects with the core fields (id, name, subdomain, status, tags, created_at, last_deployed_at, latest_screenshot_url, favicon_url, is_owner). The render fields are included in this one response; screenshot/favicon URLs are null until their live-release asset exists. When more exist, the response ends with a note telling you the total and how to page. To narrow or expand: pass \`q\` (substring filter on name/subdomain), \`tag\` (organization label filter; multiple values combine with AND), \`limit\`/\`offset\` (paging), or \`fields:"full"\` for the complete record per row.
 
 **Example:**
 
 \`\`\`json
 // project_list({ q: "saas", limit: 50 }) returns:
 [
-  { "id": "p_abc123", "name": "My SaaS", "subdomain": "my-saas", "status": "deployed", "last_deployed_at": "2026-04-01T...", "latest_screenshot_url": "https://api.somewhere.tech/v1/deploy-screenshots/p_abc123/v7-desktop.png?exp=...&sig=...", "favicon_url": "https://my-saas.somewhere.site/favicon.ico", "tags": ["marketing"], "is_owner": true },
+  { "id": "p_abc123", "name": "My SaaS", "subdomain": "my-saas", "status": "deployed", "last_deployed_at": "2026-04-01T...", "latest_screenshot_url": "https://api.somewhere.cloud/v1/deploy-screenshots/p_abc123/v7-desktop.png?exp=...&sig=...", "favicon_url": "https://my-saas.somewhere.site/favicon.ico", "tags": ["marketing"], "is_owner": true },
   { "id": "p_xyz789", "name": "Jen's App", "subdomain": "jen-app", "status": "draft", "last_deployed_at": null, "latest_screenshot_url": null, "favicon_url": null, "tags": [], "is_owner": false }
 ]
 \`\`\`
@@ -1599,7 +1849,7 @@ Shared projects: you can deploy, edit files, run db migrations, send email, and 
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","connector","chatgpt"],
-    protocol: { surfaceDescriptions: { connector: "List a paginated set of projects owned by or shared with the connected Somewhere account. Returns identifiers, subdomains, and project status; optional filters narrow the list." }, oauthScopes: ['mcp'] },
+    protocol: { surfaceAnnotations: { chatgpt: { destructiveHint: false, openWorldHint: false } }, surfaceDescriptions: { connector: "List a paginated set of projects owned by or shared with the connected Somewhere account. Returns identifiers, subdomains, and project status; optional filters narrow the list." }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, authHeader } = runtime;
       let result: ToolUpstreamResult;
@@ -1688,7 +1938,7 @@ Shared projects: you can deploy, edit files, run db migrations, send email, and 
     name: 'project_notice_acknowledge',
     description: `Mark a somewhere platform notice read or snooze its reminders for this maintainer. This only changes personal notice delivery; it never resolves the underlying project issue or grants any capability.
 
-Use the project_id and notice_id supplied with the notice. A snooze defaults to 24 hours and accepts 1–720 whole hours.`,
+It takes the project_id and notice_id supplied with the notice. A snooze defaults to 24 hours and accepts 1–720 whole hours.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -1706,8 +1956,9 @@ Use the project_id and notice_id supplied with the notice. A snooze defaults to 
     coreRank: 108,
     visibility: 'authenticated',
     paid: false,
-    surfaces: ["full","connector","chatgpt"],
-    protocol: { surfaceAnnotations: { chatgpt: { destructiveHint: true }, connector: { destructiveHint: true } }, surfaceDescriptions: { connector: "Mark a project notice read or snooze its reminders for the connected user. This changes personal notice delivery; it does not resolve the underlying issue or change application code." }, oauthScopes: ['mcp'] },
+    // ChatGPT gets one tool per action: project_notice_mark_read/_snooze.
+    surfaces: ["full","connector"],
+    protocol: { surfaceAnnotations: { connector: { destructiveHint: true } }, surfaceDescriptions: { connector: "Mark a project notice read or snooze its reminders for the connected user. This changes personal notice delivery; it does not resolve the underlying issue or change application code." }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, authHeader } = runtime;
       const body: Record<string, unknown> = { action: args.action };
@@ -1721,10 +1972,58 @@ Use the project_id and notice_id supplied with the notice. A snooze defaults to 
       );
     },
   },
+  // ── project_notice_acknowledge, one action per tool (ChatGPT) ────────
+  {
+    definition: {
+    name: 'project_notice_mark_read',
+    description: 'Mark a somewhere platform notice read for you, so its reminders stop. This replaces any earlier read or snooze record you set for the notice. It changes only your notice delivery; it never resolves the underlying project issue or grants any capability. It takes the project_id and notice_id supplied with the notice.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string', description: 'Project UUID, subdomain, or slug supplied with the notice.' },
+        notice_id: { type: 'string', description: 'Notice identifier supplied in the notice delivery context.' },
+      },
+      required: ['project_id', 'notice_id'],
+    },
+  },
+    annotations: { title: 'Mark a platform notice read', readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    group: 'project',
+    core: false,
+    visibility: 'authenticated',
+    paid: false,
+    surfaces: ["full","chatgpt"],
+    operationOf: 'project_notice_acknowledge',
+    protocol: { oauthScopes: ['mcp'] },
+    execute: async (runtime, args) => runToolOperation('project_notice_acknowledge', runtime, args, { action: 'read' }),
+  },
+  {
+    definition: {
+    name: 'project_notice_snooze',
+    description: 'Pause a somewhere platform notice\'s reminders for you for 1–720 whole hours (default 24). This replaces any earlier read or snooze record you set for the notice, so a notice you had marked read becomes unread when the snooze ends. It changes only your notice delivery; it never resolves the underlying project issue or grants any capability.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string', description: 'Project UUID, subdomain, or slug supplied with the notice.' },
+        notice_id: { type: 'string', description: 'Notice identifier supplied in the notice delivery context.' },
+        snooze_hours: { type: 'number', description: 'Whole hours from 1 to 720; defaults to 24.' },
+      },
+      required: ['project_id', 'notice_id'],
+    },
+  },
+    annotations: { title: 'Snooze a platform notice', readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    group: 'project',
+    core: false,
+    visibility: 'authenticated',
+    paid: false,
+    surfaces: ["full","chatgpt"],
+    operationOf: 'project_notice_acknowledge',
+    protocol: { oauthScopes: ['mcp'] },
+    execute: async (runtime, args) => runToolOperation('project_notice_acknowledge', runtime, args, { action: 'snooze' }),
+  },
   {
     definition: {
     name: 'project_get',
-    description: `Project details, app info, project record, settings, metadata — fetch one project by id, subdomain, or \`"default"\`. Returns the full project record.
+    description: `Project details, app info, project record, settings, metadata — fetch one project by id, subdomain, or \`"default"\`. Returns the full project record. When the project's editors have saved context (see \`project_context\`), it is included as \`project_context\`: instructions, design principles and note topics, labelled as project data.
 
 **Example:**
 
@@ -1764,12 +2063,22 @@ Use the project_id and notice_id supplied with the notice. A snooze defaults to 
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","connector","chatgpt"],
-    protocol: { surfaceDescriptions: { connector: "Read a Somewhere project record by ID, slug, or subdomain, including its current settings and release information." }, oauthScopes: ['mcp'] },
+    protocol: { surfaceAnnotations: { chatgpt: { destructiveHint: false, openWorldHint: false } }, surfaceDescriptions: { connector: "Read a Somewhere project record by ID, slug, or subdomain, including its current settings and release information." }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, authHeader } = runtime;
       let result: ToolUpstreamResult;
       {
         result = await callAPI(fetcher, 'GET', `/v1/projects/${encodeURIComponent(args.project_id as string)}`, authHeader);
+        const project = result.status < 400 && result.data && typeof result.data === 'object'
+          ? (result.data as { data?: unknown }).data : undefined;
+        if (project && typeof project === 'object' && typeof (project as { id?: unknown }).id === 'string') {
+          const projectId = encodeURIComponent((project as { id: string }).id);
+          // The project record is already read; a failed context read is
+          // reported inside it rather than failing project_get.
+          const saved = await callAPI(fetcher, 'GET', `/v1/project-context/${projectId}`, authHeader)
+            .catch((error: unknown) => ({ status: 503, data: { error: error instanceof Error ? error.message : 'UNAVAILABLE' } }));
+          attachProjectContext(project as Record<string, unknown>, projectContextFromResult(saved));
+        }
         return result;
 
       }
@@ -1817,7 +2126,7 @@ Tags normalize to lowercase \`a-z0-9-\`, max 32 characters each, max 10 per proj
     name: 'project_allowed_origins_get',
     description: `Read a project's cross-origin allowlist (CORS allowed_origins) — the exact browser origins permitted to make credentialed cross-origin requests to the project's API.
 
-Returns \`allowed_origins\` (the configured OTHER origins) plus \`cors_mode\`. A project always trusts its own origins (its \`.somewhere.site\` subdomain and verified custom domains); those are automatic and are NOT listed here. Use this to inspect the allowlist before changing it with \`project_allowed_origins_set\`.`,
+Returns \`allowed_origins\` (the configured OTHER origins). Every project uses the same origin policy; a project always trusts its own origins (its \`.somewhere.site\` subdomain and verified custom domains), which are automatic and NOT listed here. Shows the allowlist for review before a change with \`project_allowed_origins_set\`.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -1847,7 +2156,7 @@ Returns \`allowed_origins\` (the configured OTHER origins) plus \`cors_mode\`. A
     name: 'project_allowed_origins_set',
     description: `Set a project's cross-origin allowlist (CORS allowed_origins) — the exact browser origins permitted to make credentialed cross-origin requests to the project's API. This is the first-class way to fix a "cross-origin request blocked" / CORS error for a separate frontend origin from the CLI/MCP instead of the dashboard.
 
-Owner-or-platform-admin only, and every change is audited. Replaces the FULL allowlist with the list you pass; send [] to clear it. Each entry must be an exact origin — scheme + host + optional port, no path/query/fragment and no wildcards (e.g. \`https://app.example.com\`, or \`http://localhost:5173\` for local development). Matching is byte-exact: a subdomain or a different port is a different origin and must be listed explicitly. You never need to list the project's own \`.somewhere.site\` origin or its verified custom domains — those are always trusted.
+Owner-or-platform-admin only, and every change is audited. Replaces the FULL allowlist with the list you pass; [] clears it. Each entry must be an exact origin — scheme + host + optional port, no path/query/fragment and no wildcards (e.g. \`https://app.example.com\`, or \`http://localhost:5173\` for local development). Matching is byte-exact: a subdomain or a different port is a different origin and must be listed explicitly. You never need to list the project's own \`.somewhere.site\` origin or its verified custom domains — those are always trusted.
 
 **Example:**
 
@@ -1861,7 +2170,7 @@ Owner-or-platform-admin only, and every change is audited. Replaces the FULL all
         allowed_origins: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Full replacement set of exact origins (scheme + host + optional port, no path or wildcards). Pass [] to clear the allowlist.',
+          description: 'Full replacement set of exact origins (scheme + host + optional port, no path or wildcards). [] clears the allowlist.',
         },
       },
       required: ['project_id', 'allowed_origins'],
@@ -1888,13 +2197,19 @@ Owner-or-platform-admin only, and every change is audited. Replaces the FULL all
   {
     definition: {
     name: 'project_create',
-    description: `Create a new project / app / website / site — initialize a project with a subdomain to start building and hosting it. This is the first step for any new app: a web app, API, backend, landing page, SaaS, or full-stack site. Start here, then deploy source to it. The subdomain must be unique platform-wide and cannot use reserved names (api, admin, www, etc.). Projects and deploys are unlimited on all tiers. Returns the new project_id.
+    description: `Create a new project / app / website / site — initialize a project with a subdomain to start building and hosting it. This is the first step for any new app: a web app, API, backend, landing page, SaaS, or full-stack site.
+
+The project starts with the same starter \`somewhere init\` writes — a React + TypeScript app with sign-up, sign-in and sign-out, styled views and design tokens (\`src/styles/tokens.css\`) — deployed as its first release; when \`data.starter.status\` is \`deployed\` it is live at \`https://{subdomain}.somewhere.site\`. The call waits up to ${STARTER_DEPLOY_WAIT_MS / 1000} seconds for that deploy. \`starter.status\` is \`deployed\`, \`preview\`, \`failed\` (the deploy was refused; \`starter.error\` says why) or \`unknown\` (no answer in time, or an answer without a release). For \`failed\` and \`unknown\`, \`starter.recovery\` lists the checks to run and the exact \`project_deploy\` call (or the equivalent \`somewhere init\` command) that ships the same starter.
+
+If a project_create response is lost, the project may exist: look for it with \`project_get\` or \`project_list\` (by subdomain) before creating again. Repeating the call returns \`SUBDOMAIN_TAKEN\`, and a new name makes a second project. \`data.starter\` lists the deployed files and returns the starter's \`agent_contract\` (its AGENTS.md), \`readme\` (the file map) and \`skills\` index; deploys do not publish those files, so they arrive here. \`project_patch\` edits the starter. \`starter: "auth,private-data"\` adds per-user notes backed by \`db/schema.ts\`; \`starter: "none"\` creates an empty project.
+
+New projects use declared data: tables and access rules live in \`db/schema.ts\`, deployed as raw source. Pages use the generated \`somewhere:data\` client for normal data, and a function only for a write the grant cannot express: docs({ topic: 'declared-data', section: 'declare-a-table-and-use-it' }), then docs({ topic: 'recipe-signed-in-app' }) for a public form that files a row for an owner. The subdomain must be unique platform-wide and cannot use reserved names (api, admin, www, etc.). Projects and deploys are unlimited on all tiers.
 
 **Example:**
 
 \`\`\`json
 { "name": "Acme Dashboard", "subdomain": "acme-dash", "description": "Internal team dashboard" }
-// Returns: { "project_id": "p_xyz789" }
+// Returns: { "data": { "id": "…", "url": "https://acme-dash.somewhere.site", "starter": { "status": "deployed", … } } }
 \`\`\``,
     inputSchema: {
       type: 'object',
@@ -1902,6 +2217,8 @@ Owner-or-platform-admin only, and every change is audited. Replaces the FULL all
         name: { type: 'string', description: 'Display name for the project' },
         subdomain: { type: 'string', description: 'Optional subdomain — defaults to slugified name. Must be lowercase letters, digits, and hyphens.' },
         description: { type: 'string', description: 'Optional human-readable description' },
+        starter: { type: 'string', description: 'Starter modules, as for `somewhere init --features`: "auth" (default), "auth,private-data", "auth,agent", or "none" for an empty project.' },
+        starter_ui: { type: 'string', enum: ['styled', 'headless'], description: 'Starter UI: "styled" (default; views plus design tokens) or "headless" (the same pages without CSS).' },
       },
       required: ['name'],
     },
@@ -1913,7 +2230,7 @@ Owner-or-platform-admin only, and every change is audited. Replaces the FULL all
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","connector","chatgpt"],
-    protocol: { surfaceAnnotations: { connector: { destructiveHint: true } }, surfaceDescriptions: { connector: "Create a Somewhere project with a name and optional subdomain. Returns its identifier for deploying an app. This creates a project in the connected account." }, oauthScopes: ['mcp'] },
+    protocol: { surfaceAnnotations: { chatgpt: { openWorldHint: true }, connector: { destructiveHint: true } }, surfaceDescriptions: { connector: "Create a Somewhere project with a name and optional subdomain in the connected account. It starts with the same starter somewhere init writes (React + TypeScript, sign-in, styled views and design tokens), deployed as its first release; the response reports the deploy and returns the starter's AGENTS.md contract, README file map and skills index. starter: \"none\" creates an empty project. starter.status is deployed, preview, failed or unknown, with recovery steps for the last two. If the response is lost, find the project with project_get or project_list before creating again. Tables are defined in db/schema.ts and deployed as raw source." }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, env, authHeader, ctx, toolName } = runtime;
       let result: ToolUpstreamResult;
@@ -1923,6 +2240,18 @@ Owner-or-platform-admin only, and every change is audited. Replaces the FULL all
             env, authHeader, ctx, toolName, args,
             'project_create requires name.\nExample:\nproject_create({ "name": "Acme Dashboard", "subdomain": "acme-dashboard", "description": "Optional short description" })\nSubdomain is optional; omit it to let the platform generate one.',
           );
+        }
+        if (args.starter !== undefined && typeof args.starter !== 'string') {
+          return badArgsToolResult(env, authHeader, ctx, toolName, args, 'starter must be a string such as "auth", "auth,private-data" or "none".');
+        }
+        if (args.starter_ui !== undefined && args.starter_ui !== 'styled' && args.starter_ui !== 'headless') {
+          return badArgsToolResult(env, authHeader, ctx, toolName, args, 'starter_ui must be "styled" or "headless".');
+        }
+        const starterFeatures = typeof args.starter === 'string' ? args.starter.trim() : DEFAULT_STARTER_FEATURES;
+        const starterUi = typeof args.starter_ui === 'string' ? args.starter_ui : DEFAULT_STARTER_UI;
+        if (starterFeatures !== 'none') {
+          const checked = resolveProjectStarter(starterFeatures, starterUi, args.name.trim());
+          if (!checked.ok) return badArgsToolResult(env, authHeader, ctx, toolName, args, checked.message);
         }
         if (args.subdomain !== undefined && typeof args.subdomain === 'string' && !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(args.subdomain)) {
           return badArgsToolResult(
@@ -1935,6 +2264,27 @@ Owner-or-platform-admin only, and every change is audited. Replaces the FULL all
           subdomain: args.subdomain,
           description: args.description,
         });
+        if (result.status < 400 && result.data && typeof result.data === 'object') {
+          const body = result.data as Record<string, unknown>;
+          const data = body.data;
+          if (data && typeof data === 'object' && !Array.isArray(data)) {
+            Object.assign(data, { schema_mode: 'managed', schema_path: 'db/schema.ts',
+              schema_guidance: "Declare tables and access rules in db/schema.ts and deploy raw source; no db_migrate call is needed. Pages use the generated somewhere:data client: docs({ topic: 'declared-data', section: 'declare-a-table-and-use-it' })." });
+            const created = data as Record<string, unknown>;
+            if (starterFeatures !== 'none' && typeof created.id === 'string') {
+              const prepared = prepareProjectStarter({ projectId: created.id, appName: args.name.trim(), features: starterFeatures, ui: starterUi });
+              if (prepared.ok) {
+                // The project already exists. The wait is bounded; a timeout or
+                // a thrown call is reported as an unknown starter with recovery
+                // steps, never as a failed create an agent would repeat.
+                const attempt = await awaitStarterDeploy(callAPI(fetcher, 'POST', '/v1/deploy', authHeader, prepared.body));
+                created.starter = starterOutcome(prepared, attempt);
+              } else {
+                created.starter = { status: 'failed', detail: 'refused', error: prepared.message };
+              }
+            }
+          }
+        }
         return result;
 
       }
@@ -1945,7 +2295,7 @@ Owner-or-platform-admin only, and every change is audited. Replaces the FULL all
     name: 'project_delete',
     description: `Request deletion of a project. **Two-step flow.**
 
-Step 1 — Call \`project_delete\` with just the project_id. The platform returns a 6-digit confirmation code that expires after 10 minutes. No project state changes before the code is confirmed.
+Step 1 — \`project_delete\` takes just the project_id. The platform returns a 6-digit confirmation code that expires after 10 minutes. No project state changes before the code is confirmed.
 
 Step 2 — Human authorization is required before calling \`project_delete_confirm\` with the same project_id and code. Confirmation immediately takes the project and its hostnames offline, blocks new project effects, retains its database, files, functions, environment variables, and domain bindings for 30 days, and schedules permanent erasure after that retention period. Recovery during the retention period requires support.
 
@@ -1955,7 +2305,7 @@ Step 2 — Human authorization is required before calling \`project_delete_confi
 { "project_id": "my-saas" }
 \`\`\`
 
-The response is a SUCCESS carrying the code and a machine-readable status, e.g. \`{ "ok": true, "status": "needs_confirmation", "confirmation_code": "482917", "code": "482917", "next_call": { "tool": "project_delete_confirm", ... } }\` — minting the code is this step's whole job, so it is never an error (tsk_7575b68a). Read \`confirmation_code\` (\`code\` is the same value, kept for existing callers). The response carries no \`error_code\` and no \`canonical_error\`, so branching on those stays a reliable failure test (tsk_bc73ace6).`,
+The response is a SUCCESS carrying the code and a machine-readable status, e.g. \`{ "ok": true, "status": "needs_confirmation", "confirmation_code": "482917", "code": "482917", "next_call": { "tool": "project_delete_confirm", ... } }\` — minting the code is this step's whole job, so it is never an error. The response carries \`confirmation_code\` (\`code\` is the same value, kept for existing callers). The response carries no \`error_code\` and no \`canonical_error\`, so branching on those stays a reliable failure test.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -1971,7 +2321,10 @@ The response is a SUCCESS carrying the code and a machine-readable status, e.g. 
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","chatgpt"],
-    protocol: { oauthScopes: ['mcp'] },
+    // Step 1 only INSERTs a new 10-minute confirmation code (earlier unexpired
+    // codes stay valid) and changes no project state; project_delete_confirm
+    // is the destructive step. A repeat call mints another code.
+    protocol: { surfaceAnnotations: { chatgpt: { destructiveHint: false, idempotentHint: false, openWorldHint: false } }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, authHeader } = runtime;
       let result: ToolUpstreamResult;
@@ -2078,7 +2431,7 @@ The response is a SUCCESS carrying the code and a machine-readable status, e.g. 
 \`\`\`json
 { "project_id": "p_abc123", "name": "Acme Portal v2", "description": "Updated customer portal" }
 \`\`\``,
-    inputSchema: { type: 'object', properties: { project_id: { type: 'string', description: 'Project ID' }, name: { type: 'string', description: 'New name' }, description: { type: 'string', description: 'New description (optional)' }, placement: { type: 'string', enum: ['near-user', 'near-data'], description: "Where this project's functions RUN. 'near-user' (the default) runs them closest to each visitor and reaches across the network to the database, so every query costs a round trip. 'near-data' asks the platform to run them closer to the database where it judges that better, trading some distance from the visitor for proximity to the database; it is a preference the platform applies, not a pinned location, and it may reduce query latency but is not guaranteed to. Choose 'near-data' for query-heavy pages whose visitors are concentrated, or where a page issues reads it cannot batch; keep 'near-user' for anything latency-sensitive that barely touches the database. Takes effect on the next deploy, so an already-published version never changes underneath you." } }, required: ['project_id'] },
+    inputSchema: { type: 'object', properties: { project_id: { type: 'string', description: 'Project ID' }, name: { type: 'string', description: 'New name' }, description: { type: 'string', description: 'New description (optional)' }, placement: { type: 'string', enum: ['near-user', 'near-data'], description: "Where this project's functions RUN. 'near-user' (the default) runs them closest to each visitor and reaches across the network to the database, so every query costs a round trip. 'near-data' asks the platform to run them closer to the database where it judges that better, trading some distance from the visitor for proximity to the database; it is a hint the platform applies from observed database use, not a pinned location or a latency promise. 'near-data' suits query-heavy pages whose visitors are concentrated, or pages that issue reads they cannot batch; 'near-user' suits anything latency-sensitive that barely touches the database. Takes effect on the next deploy, so an already-published version never changes underneath you." } }, required: ['project_id'] },
   },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
     group: 'project',
@@ -2101,14 +2454,16 @@ The response is a SUCCESS carrying the code and a machine-readable status, e.g. 
   {
     definition: {
     name: 'project_update',
-    description: `Update a project's name, description, or function placement.
+    description: `Update a project's name, description, function placement, optional analytics consent policy, monthly AI spend cap, or which emails app-user signup sends.
 
 **Example:**
 
 \`\`\`json
 { "project_id": "p_abc123", "placement": "near-data" }
-\`\`\``,
-    inputSchema: { type: 'object', properties: { project_id: { type: 'string', description: 'Project ID' }, name: { type: 'string', description: 'New name' }, description: { type: 'string', description: 'New description (optional)' }, placement: { type: 'string', enum: ['near-user', 'near-data'], description: "Where this project's functions RUN. 'near-user' (the default) runs them closest to each visitor and reaches across the network to the database, so every query costs a round trip. 'near-data' asks the platform to run them closer to the database where it judges that better, trading some distance from the visitor for proximity to the database; it is a preference the platform applies, not a pinned location, and it may reduce query latency but is not guaranteed to. Choose 'near-data' for query-heavy pages whose visitors are concentrated, or where a page issues reads it cannot batch; keep 'near-user' for anything latency-sensitive that barely touches the database. Takes effect on the next deploy, so an already-published version never changes underneath you." } }, required: ['project_id'] },
+\`\`\`
+
+**AI spend cap (owner only):** \`{ "project_id": "p_abc123", "ai_spend_cap_cents": 5000 }\` sets this project's monthly AI spend cap to $50. \`null\` turns the cap off for this project (the prepaid balance still limits spend); \`"plan"\` goes back to the plan's cap. The current cap, this month's spend and every change are in \`project_get\` → \`ai_spend_cap\`.`,
+    inputSchema: { type: 'object', properties: { project_id: { type: 'string', description: 'Project ID' }, name: { type: 'string', description: 'New name' }, description: { type: 'string', description: 'New description (optional)' }, placement: { type: 'string', enum: ['near-user', 'near-data'], description: "Where this project's functions RUN. 'near-user' (the default) runs them closest to each visitor and reaches across the network to the database, so every query costs a round trip. 'near-data' asks the platform to run them closer to the database where it judges that better, trading some distance from the visitor for proximity to the database; it is a hint the platform applies from observed database use, not a pinned location or a latency promise. 'near-data' suits query-heavy pages whose visitors are concentrated, or pages that issue reads they cannot batch; 'near-user' suits anything latency-sensitive that barely touches the database. Takes effect on the next deploy, so an already-published version never changes underneath you." }, analytics_consent: { type: 'object', additionalProperties: false, properties: { mode: { type: 'string', enum: ['off', 'required'] }, policy_version: { type: 'string', pattern: '^[A-Za-z0-9._-]{1,64}$' } }, required: ['mode', 'policy_version'], description: 'Require analytics consent for platform pageviews and runtime events. Required blocks collection until matching acceptance; version changes require a new choice.' }, auth_welcome_email: { type: 'boolean', description: 'Whether app-user password signup sends the optional welcome email. Default true; false sends no welcome email and changes nothing else.' }, auth_signup_verification: { type: 'string', enum: ['at_signup', 'on_request'], description: "When app-user password signup sends the email verification code. 'at_signup' (default) sends it at signup; 'on_request' sends nothing until the app calls resend-verification for the signed-in user. Neither marks an address verified: that still needs the code, a magic link, or a provider sign-in." }, ai_spend_cap_cents: { type: ['integer', 'null', 'string'], description: "Owner only. This project's monthly AI spend cap in whole cents (e.g. 5000 = $50); null = no cap for this project; \"plan\" = use the plan's cap. At 80% the owner is warned once; at 100% every AI call from the project is refused with AI_SPEND_CAP_REACHED until the month turns (UTC) or the cap is raised." } }, required: ['project_id'] },
   },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
     group: 'project',
@@ -2121,7 +2476,9 @@ The response is a SUCCESS carrying the code and a machine-readable status, e.g. 
       let result: ToolUpstreamResult;
       {
         result = await callAPI(fetcher, 'PATCH', `/v1/projects/${encodeURIComponent(args.project_id as string)}`, authHeader, {
-          name: args.name, description: args.description, placement: args.placement,
+          name: args.name, description: args.description, placement: args.placement, analytics_consent: args.analytics_consent,
+          ai_spend_cap_cents: args.ai_spend_cap_cents,
+          auth_welcome_email: args.auth_welcome_email, auth_signup_verification: args.auth_signup_verification,
         });
         return result;
 
@@ -2133,17 +2490,17 @@ The response is a SUCCESS carrying the code and a machine-readable status, e.g. 
     name: 'project_deploy',
     description: `Deploy / ship / host / push / release your app — upload raw source (HTML, CSS, JS, server functions) to a project and put it in production at \`https://{subdomain}.somewhere.site\`. The platform compiles your code; you deploy source, not a build.
 
-**If you can run a shell, LEAD WITH the CLI: \`somewhere deploy\` reads files straight from disk (no inline JSON payload) and is the faster path. Install: \`npm i -g @somewhere-tech/cli && somewhere auth login\` (shares MCP auth). This MCP tool is the inline fallback — for agents without shell access, small projects, or when the CLI isn't available.**
+**If you can run a shell, LEAD WITH the CLI: \`somewhere deploy\` reads files straight from disk (no inline JSON payload) and is the faster path. The CLI installs with \`npm i -g @somewhere-tech/cli && somewhere auth login\` (shares MCP auth). This MCP tool is the inline fallback — for agents without shell access, small projects, or when the CLI isn't available.**
 
-**For UPDATES to an existing project, prefer \`project_patch\` with \`find\`/\`replace\` — surgical edits ship in ~200 bytes instead of resending every file. Use \`project_deploy\` for the FIRST deploy of a new project, or when you genuinely want to replace the whole tree.**
+**For UPDATES to an existing project, \`project_patch\` with \`find\`/\`replace\` ships surgical edits in ~200 bytes instead of resending every file. \`project_deploy\` is for the FIRST deploy of a new project, or for replacing the whole tree.**
 
-**Large or binary files — reference, don't paste.** Instead of inlining a big asset's content (or base64 bytes) into \`files\`, write it to project file storage first with \`fs_write\`, then reference it by storage path via \`file_refs\` (text files) or \`binary_file_refs\` (images, fonts, other binaries). The platform resolves the referenced content server-side at deploy time, so a big tree ships without a giant inline payload. Inline \`files\`/\`functions\` keep working and can be mixed with refs in the same deploy.
+**Large or binary files are referenced, not pasted.** Instead of being inlined into \`files\`, a big asset (or base64 bytes) goes to project file storage first with \`fs_write\` and is referenced by storage path via \`file_refs\` (text files) or \`binary_file_refs\` (images, fonts, other binaries). The platform resolves the referenced content server-side at deploy time, so a big tree ships without a giant inline payload. Inline \`files\`/\`functions\` keep working and can be mixed with refs in the same deploy.
 
 Deploys your app. The result lands at \`https://{subdomain}.somewhere.site\` and on any verified custom domain — every deploy reaches production.
 
-⚠️ **Omitted items are NOT all treated the same.** Static **\`files\`** are full-replacement: anything you omit from \`files\` is deleted (pass \`scope:"functions"\` to leave static untouched). **\`functions\`** are **merge-preserved by default**: a function already in production but omitted from this call is KEPT, not deleted — so you can ship a backend-only change without resending the frontend, and \`project_patch\`-only functions survive a later full deploy. Pass \`replace_functions:true\` only when you intend a deploy to delete functions you no longer ship. (Env vars, database, and uploaded \`fs\` files are never affected.) Use \`dry_run:true\` to inspect exactly what will be added / removed / modified before anything is written.
+⚠️ **Omitted items are NOT all treated the same.** Static **\`files\`** are full-replacement: anything you omit from \`files\` is deleted (\`scope:"functions"\` leaves static untouched). **\`functions\`** are **merge-preserved by default**: a function already in production but omitted from this call is KEPT, not deleted — so you can ship a backend-only change without resending the frontend, and \`project_patch\`-only functions survive a later full deploy. \`replace_functions:true\` makes a deploy delete functions it no longer ships. (Env vars, database, and uploaded \`fs\` files are never affected.) Use \`dry_run:true\` to inspect exactly what will be added / removed / modified before anything is written. **\`project_patch\` with a \`files\` map changes several files of an existing project without resending the rest: files not listed are kept.**
 
-Server-side functions are the core — handler code goes in the **\`functions\`** map (keyed by path, e.g. \`"api/hello.ts"\`) and becomes routable at \`/api/...\` on your production URL. The **\`files\`** map is for STATIC assets only (HTML, CSS, client-side JS, images). **Do not put handler code (\`api/*\`, \`_lib/*\`, root \`[id].ts\` routes) in \`files\`** — a static asset never routes, so \`/api/*\` would just serve your app's HTML. (As a safety net the deploy auto-routes any handler-shaped path it finds in \`files\` into \`functions\` and returns a loud warning, but put it in \`functions\` to begin with.)
+Server-side functions are the core — handler code goes in the **\`functions\`** map (keyed by path, e.g. \`"api/hello.ts"\`) and becomes routable at \`/api/...\` on your production URL. The **\`files\`** map is for STATIC assets only (HTML, CSS, client-side JS, images). **Handler code (\`api/*\`, \`_lib/*\`, root \`[id].ts\` routes) belongs in \`functions\`, not \`files\`** — a static asset never routes, so \`/api/*\` would just serve the app's HTML. (A handler-shaped path found in \`files\` is moved into \`functions\` with a warning.)
 
 **Function signature — the only one that works:**
 
@@ -2157,15 +2514,15 @@ export default async function (req, sw) {
 }
 \`\`\`
 
-\`sw.endpoint({ auth, body, rateLimit, handler })\` is an OPTIONAL wrapper (adds zod validation + rate limit + auth helper); the bare \`export default async function(req, sw)\` form above always works and is what to reach for when in doubt.
+For an ordinary JSON endpoint use \`sw.endpoint({ auth: 'required', body, rateLimit, handler })\`: set \`auth\` explicitly (a deploy refuses an endpoint without it; \`'none'\` is public on purpose); \`body\` is its declared schema, not zod. The bare \`export default async function(req, sw)\` form above covers webhooks, streaming and custom responses.
 
 Functions run directly on the platform with access to \`sw.db\` (database), \`sw.fs\` (file storage), \`sw.email\` (send email), \`sw.ai\` (AI models), \`sw.env\` (environment variables), \`sw.jobs\` (background jobs), \`sw.queue\`, and \`sw.logs\`. \`sw.db\` uses the function's authenticated project binding, so application code does not send a developer API key or construct a platform HTTP request. First-use activation, placement, transport, scheduling, and engine work can still contribute to latency. \`sw.db.batch([{sql, params}, ...])\` runs multiple statements as one atomic transaction; any failure rolls every statement back. (\`ctx\` is the legacy alias — same object, both names work forever.)
 
-**Conflict check (optional).** \`expected_version\` accepts three shapes:
-- omit, or pass \`"latest"\` — no concurrency check; the platform auto-resolves to current+1. Use this when you don't know or don't care about the current version (most agent flows).
-- a number — strict optimistic-concurrency CAS. If the production version doesn't match, returns 409 \`VERSION_CONFLICT\` with \`data.current_version\` so you can refetch and retry. Use only on collaborated projects where you genuinely want to detect concurrent deploys.
+**Source base (required on every live deploy).** Pass \`base_release_id\`: the \`active_release_id\` from the \`project_export\` read your source came from, or \`null\` when the project has no source yet. The base is the one that came with the edited source; a newer id read just before deploying is not a valid base. A missing base returns 400 \`BASE_REQUIRED\` and nothing changes; a base that is no longer live returns 409 \`STALE_RELEASE_BASE\` with \`data.changed_files\`. Recovery is a re-export, the change re-applied to the new source, and a deploy with the new base. \`force:true\` deliberately replaces the live source; it still fails if another deploy lands while yours builds.
 
-**Stale-base guard (optional, recommended when editing from an exported/read version).** Pass \`base_version\` from your last deploy/export response. If the project changed elsewhere since then, deploy returns 409 \`STALE_BASE\` with \`data.changed_files\`, \`data.last_change_source\`, and \`data.last_change_at\`. On \`STALE_BASE\`, call \`project_diff_versions\` before forcing; pass \`force:true\` only after reviewing the remote changes.
+**Projects without releases** use \`base_version\` from your last deploy/export response instead. If the project changed elsewhere, deploy returns 409 \`STALE_BASE\` with \`data.changed_files\`, \`data.last_change_source\`, and \`data.last_change_at\`; review \`project_diff_versions\` before choosing \`force:true\`.
+
+**Version counter check (optional, separate from the source base).** \`expected_version\` compares the project's deploy counter: a number returns 409 \`VERSION_CONFLICT\` with \`data.current_version\` when it differs; omitting it (or \`"latest"\`) skips only this extra check. Omitting it never replaces \`base_release_id\`.
 
 The success response always includes the new \`version\`. When available, it may also include \`_runtime_key_summary\`, a plain-language note on whether the runtime key for this deploy was narrowed to least-privilege scopes or fell back to blanket access.
 
@@ -2186,7 +2543,7 @@ The success response always includes the new \`version\`. When available, it may
 
 Handler code goes in \`functions\`; static assets (here, \`index.html\`) go in \`files\`.
 
-The default workflow has one environment: read production source, check, deploy once, then verify the public production URL. \`somewhere preview\` is an optional advanced capability; do not use preview inputs unless the user explicitly says the account is on Pro or Scale with preview enabled.`,
+The default workflow has one environment: read production source, check, deploy once, then verify the public production URL. \`somewhere preview\` is an optional advanced capability; preview inputs apply when a preview is explicitly requested and the account has hosted preview access (every plan includes it for signed-in accounts).`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -2201,7 +2558,7 @@ The default workflow has one environment: read production source, check, deploy 
           type: ['object', 'array'],
           additionalProperties: { type: 'string' },
           items: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] },
-          description: 'Map of function paths to ES-module source code. A native object is preferred; an array of {path, content} is also accepted. Files under api/ become routable at /api/.... Each file can default-export a single handler or export method-named (GET, POST, ...) handlers. The handler receives `(request, sw)`; `sw.env` carries env vars set via env_set, which take effect on the NEXT deploy (existing running functions keep their deployed values). (`ctx` is the legacy alias for `sw` — same object, both names work forever.) Object value preferred; a JSON-stringified object is also accepted.',
+          description: 'Map of function paths to ES-module source code. A native object is preferred; an array of {path, content} is also accepted. Files under api/ become routable at /api/.... Each file can default-export a single handler or export method-named (GET, POST, ...) handlers. The handler receives `(request, sw)`; `sw.env` carries env vars set with the `env` tool, which take effect on the NEXT deploy (existing running functions keep their deployed values). (`ctx` is the legacy alias for `sw` — same object, both names work forever.) Object value preferred; a JSON-stringified object is also accepted.',
         },
         binary_files: {
           type: 'object',
@@ -2219,17 +2576,17 @@ The default workflow has one environment: read production source, check, deploy 
           description: 'Optional binary counterpart to `file_refs` for images, fonts, and other non-text assets, e.g. {"public/logo.png": "/uploads/logo.png"}. Binary data is referenced from file storage rather than base64-encoded in `files`.',
         },
         replace_functions: { type: 'boolean', description: 'Optional authoritative-function flag. When true, functions absent from the payload are deleted; false (default) merge-preserves omitted functions. The true value is for intentional removal of functions no longer shipped.' },
-        expected_version: { oneOf: [{ type: 'number' }, { type: 'string', enum: ['latest'] }], description: 'Optional optimistic-concurrency check. A number provides strict CAS and returns 409 VERSION_CONFLICT when production differs. "latest" or omission auto-resolves the current version without a check. The strict numeric form detects concurrent deploys on collaborated projects.' },
+        expected_version: { oneOf: [{ type: 'number' }, { type: 'string', enum: ['latest'] }], description: 'Optional extra check on the deploy counter, separate from the required base_release_id. A number returns 409 VERSION_CONFLICT when the counter differs; "latest" or omission skips only this extra check.' },
         base_version: { type: 'number', description: 'Optional stale-base guard containing the version from the preceding deploy or export response. A 409 STALE_BASE indicates a remote project change and requires reviewing project_diff_versions before a forced retry.' },
-        base_release_id: { type: 'string', description: 'Production release source anchor for an exact preview snapshot. Required when expected_preview_id is null. This field is part of the advertised exact-preview schema.' },
+        base_release_id: { type: ['string', 'null'], description: 'Release id the deployed source was prepared from: the active_release_id returned with that project_export, or null when the project had no source. Required on every live deploy and on the first preview snapshot. A missing base returns 400 BASE_REQUIRED; a base that is no longer live returns 409 STALE_RELEASE_BASE with data.changed_files, and nothing changes.' },
         force: { type: 'boolean', description: 'Optional bypass for a STALE_BASE refusal after remote changes have been reviewed. A first retry is expected to inspect project_diff_versions instead.' },
         dry_run: { type: 'boolean', description: 'Optional non-writing diff of added, modified, and removed files, function changes, and version conflict. It exposes every deletion before a real deploy and returns { dry_run, static_files, functions, warnings, version_conflict }.' },
         scope: { type: 'string', enum: ['all', 'functions', 'static'], description: 'Optional partial-deploy guard. "all" (default) deploys static files and functions. "functions" leaves static files untouched; "static" leaves functions untouched. Omitted functions remain merge-preserved by default.' },
-        preview: { type: 'boolean', description: 'Advanced `somewhere preview` flag requiring a Pro or Scale plan plus explicit platform enablement; otherwise CLOUD_DEV_NOT_ENABLED is returned before resource creation. False (default) deploys directly to production.' },
+        preview: { type: 'boolean', description: 'Advanced `somewhere preview` flag requiring hosted preview access for signed-in accounts on every plan; otherwise CLOUD_DEV_NOT_ENABLED is returned before resource creation. False (default) deploys directly to production.' },
         preview_session_id: { type: 'string', description: 'Stable editing-session id for this preview lineage. Required with preview:true.' },
         preview_operation_id: { type: 'string', description: 'Stable idempotency id for this exact preview build/retry.' },
         expected_preview_id: { type: ['string', 'null'], description: 'Exact current preview id, or null for the first preview.' },
-        draft: { type: 'boolean', description: 'Deprecated compatibility alias for preview. Existing callers remain supported; new callers should use preview.' },
+        draft: { type: 'boolean', description: 'Deprecated compatibility alias for preview. Existing callers remain supported; preview supersedes it.' },
         draft_id: { type: 'string', description: 'Deprecated compatibility alias for preview_session_id.' },
         draft_operation_id: { type: 'string', description: 'Deprecated compatibility alias for preview_operation_id.' },
         expected_candidate_release_id: { type: ['string', 'null'], description: 'Deprecated compatibility alias for expected_preview_id.' },
@@ -2244,7 +2601,7 @@ The default workflow has one environment: read production source, check, deploy 
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","connector","chatgpt"],
-    protocol: { surfaceDescriptions: { connector: "Deploy raw application source to a Somewhere project and publish it at its live URL. The platform compiles the source and applies a declared db/schema.ts. The files argument contains source paths and contents, not compiled output. This can replace existing source and change the live app; project_patch updates selected files while preserving the rest. See https://somewhere.tech/docs.txt for the Somewhere deployment API contract." }, oauthScopes: ['mcp'], surfaceAnnotations: { chatgpt: { destructiveHint: true, openWorldHint: true }, connector: { destructiveHint: true } } },
+    protocol: { surfaceDescriptions: { connector: "Deploy raw application source to a Somewhere project and publish it at its live URL. The platform compiles the source and applies a declared db/schema.ts. The files argument contains source paths and contents, not compiled output. This can replace existing source and change the live app; project_patch updates selected files while preserving the rest. The Somewhere deployment API contract is at https://somewhere.cloud/docs.txt." }, oauthScopes: ['mcp'], surfaceAnnotations: { chatgpt: { destructiveHint: true, openWorldHint: true }, connector: { destructiveHint: true } } },
     execute: async (runtime, args) => {
       const { fetcher, env, authHeader, ctx, toolName } = runtime;
       let result: ToolUpstreamResult;
@@ -2400,7 +2757,7 @@ The default workflow has one environment: read production source, check, deploy 
           ...(baseVersion !== undefined ? { base_version: baseVersion } : {}),
           ...(typeof args.base_release_id === 'string' && args.base_release_id.trim()
             ? { base_release_id: args.base_release_id.trim() }
-            : {}),
+            : args.base_release_id === null ? { base_release_id: null } : {}),
           ...(force ? { force: true } : {}),
           ...(dryRun ? { dry_run: true } : {}),
           ...(scope ? { scope } : {}),
@@ -2441,39 +2798,41 @@ The default workflow has one environment: read production source, check, deploy 
   {
     definition: {
     name: 'project_patch',
-    description: `Edit / change / update / modify / fix / tweak a file in a deployed project — **edit one deployed file in place** with a find/replace or a full-file rewrite. The right tool for visual-editor iteration (Claude Design, Cursor) and any quick code change. Unchanged files are preserved; only what you send is touched. Static changes reach production in ~1 second; function changes in 2–4 seconds.
+    description: `Edit / change / update / modify / fix / tweak files in a deployed project — **edit one or several deployed files in place** with a find/replace, a full-file rewrite, or a \`files\` map of several full-file writes in one atomic patch. Suited to visual-editor iteration and any quick code change. Unchanged files are preserved; only what you send is touched. Static changes reach production in ~1 second; function changes in 2–4 seconds.
 
-Prefer this over \`project_deploy\` when editing an existing project — \`project_deploy\` replaces the whole tree and forces you to re-send unchanged files. Use \`project_deploy\` only for the first deploy of a brand-new project.
+For an existing project this touches only the files sent; \`project_deploy\` replaces the static file tree, so unchanged static files must be sent again. \`project_deploy\` is for the first deploy of a brand-new project.
+
+The source comes from \`project_export\`. Its \`active_release_id\` is the \`base_release_id\` of the patch, including on dry runs. This required release anchor identifies the exact source you edited; \`base_version\` is an additional optional conflict check.
 
 **Two modes — same tool.**
 
 **1. Find / replace (token-optimal, preferred for small edits):** pass \`path\` + \`find\` + \`replace\`. The platform reads the current file, replaces every occurrence of \`find\` with \`replace\`, and writes it back. ~200 bytes on the wire instead of re-sending the whole file.
 
 \`\`\`json
-{ "project_id": "my-saas", "path": "index.html", "find": "<h1>Pricing</h1>", "replace": "<h1>Plans &amp; pricing</h1>" }
+{ "project_id": "my-saas", "base_release_id": "<active_release_id from project_export>", "path": "index.html", "find": "<h1>Pricing</h1>", "replace": "<h1>Plans &amp; pricing</h1>" }
 \`\`\`
 
-If \`find\` doesn't match the file, you get a 400 \`FIND_NOT_FOUND\` that includes the **closest-matching region of the file** ("did you mean this region?", with offset and a 0–1 similarity score in the \`confidence\` field, under \`data.closest_match\`) plus a head/tail snippet — copy your \`find\` exactly from that region and retry. One round-trip, no need to re-read the whole file.
+If \`find\` doesn't match the file, you get a 400 \`FIND_NOT_FOUND\` with a head/tail snippet. When a sufficiently similar region exists, \`data.closest_match\` also includes its offset, text and 0–1 \`confidence\`; unrelated text may have no close match. A corrected patch uses the exact text from a current \`project_export\` and that export's release anchor.
 
 **2. Full content (rewriting the file):** pass \`path\` + \`content\`. The new bytes replace the file entirely.
 
 \`\`\`json
-{ "project_id": "my-saas", "path": "styles.css", "content": "body { background: black }" }
+{ "project_id": "my-saas", "base_release_id": "<active_release_id from project_export>", "path": "styles.css", "content": "body { background: black }" }
 \`\`\`
 
-Path auto-routes: \`api/*\`, \`_lib/*\`, and root \`[id].ts\` paths go to functions; everything else (HTML, CSS, SVG, JSON, etc.) to static. Binary assets (images, fonts) use the matching binary surface — don't try to ship raw bytes through \`content\` or \`find\`/\`replace\`.
+Path auto-routes: \`api/*\`, \`_lib/*\`, and root \`[id].ts\` paths go to functions; everything else (HTML, CSS, SVG, JSON, etc.) to static. Binary assets (images, fonts) use the matching binary surface — \`content\` and \`find\`/\`replace\` do not carry raw bytes.
 
-**Delete:** \`delete_files\` is an array of paths. Works for static files and functions; missing paths are silently ignored. To rename or replace a file atomically, combine one \`path\` + \`content\` write (or the one-entry \`files\` alias) with \`delete_files\` in the same call: the new file and removals publish as one patch transaction.
+**Delete:** \`delete_files\` is an array of paths. Works for static files and functions; missing paths are silently ignored. A rename or atomic replace combines one \`path\` + \`content\` write (or the one-entry \`files\` alias) with \`delete_files\` in the same call: the new file and removals publish as one patch transaction.
 
-**Conflict check (optional, recommended for shared projects):** pass \`base_version\` from your last deploy/export response. If another deployer landed changes since, returns 409 \`STALE_BASE\` with \`data.changed_files\`, \`data.last_change_source\`, and \`data.last_change_at\` instead of overwriting. On \`STALE_BASE\`, call \`project_diff_versions\` before forcing; pass \`force:true\` only after reviewing the remote changes. The older \`expected_version\` strict CAS still works and returns \`VERSION_CONFLICT\` when the production version differs.
+**Conflict check (optional, recommended for shared projects):** pass \`base_version\` from your last deploy/export response. If another deployer landed changes since, returns 409 \`STALE_BASE\` with \`data.changed_files\`, \`data.last_change_source\`, and \`data.last_change_at\` instead of overwriting. On \`STALE_BASE\`, \`project_diff_versions\` shows the change before forcing; \`force:true\` overwrites the remote changes. The older \`expected_version\` strict CAS still works and returns \`VERSION_CONFLICT\` when the production version differs.
 
-**Preview first (optional):** pass \`dry_run: true\` to get a per-file unified diff of what the patch WOULD change (\`data.diffs\`), plus added/modified/removed lists — nothing is written and the version doesn't change. Re-send without \`dry_run\` to apply.
+**Preview first (optional):** pass \`dry_run: true\` to get a per-file unified diff of what the patch WOULD change (\`data.diffs\`), plus added/modified/removed lists — nothing is written and the version doesn't change. The same call without \`dry_run\` applies it.
 
 **Safety net — what IS and is NOT checked.** A patch that touches **page-rendering files (HTML/JS/CSS)** is blank-page health-checked after it goes live: if it blanked a previously-rendering page, the patch is automatically rolled back and you get a 400 \`DEPLOY_BLANK_PAGE\` with \`data.rolled_back\`. Pages that were already blank before the patch are never blocked.
 
 A **function-only patch** (\`api/*\`, \`_lib/*\`, root \`[id].ts\`) is NOT blank-page-checked, and it does NOT get "the same protection as a full deploy." After a function patch the response carries a best-effort \`function_health\` field — \`{ checked, status, ok }\` from one GET of a patched route. \`function_health.ok === false\` means the route returned a 5xx (e.g. a missing import → 500): your edit shipped but is broken in production. If \`function_health.checked === false\` the route couldn't be probed (no concrete route, browser unavailable) — it was NOT verified, so confirm it yourself. A clean build is NOT a working function; only \`function_health.ok === true\` (or your own request to the route) confirms it runs.
 
-For a risky edit, use \`dry_run:true\` and \`project_check\`, then patch once and verify the public production URL. \`project_rollback\` restores the previous production version if needed.
+For a risky edit, \`dry_run:true\` and \`project_check\` come first, then one patch, verified on the public production URL. \`project_rollback\` restores the previous production version if needed.
 
 Patches reach production immediately at \`https://{subdomain}.somewhere.site\`. The success response includes the new \`version\`, a \`next_step\`, \`function_errors\` (build failures) and, for function patches, \`function_health\` (runtime 5xx). Preview is advanced and must not be selected unless the user explicitly says the account is enabled.`,
     inputSchema: {
@@ -2493,14 +2852,14 @@ Patches reach production immediately at \`https://{subdomain}.somewhere.site\`. 
           type: ['object', 'array'],
           additionalProperties: { type: 'string' },
           items: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] },
-          description: 'Forgiving single-file alias. Exactly one {"path": "content"} entry or one {path, content} item is converted to path+content and may accompany delete_files in one atomic transaction. Multiple entries are rejected; full replacement trees use project_deploy, while individual files use separate project_patch calls.',
+          description: 'Full-file content writes as a {"path": "content"} map or an array of {path, content} items. One entry is the same as path+content; several entries are written together in one atomic patch, anchored to base_release_id, and every unlisted file is kept. Paths under api/, _lib/ and root [param] routes go to functions, everything else to static files, exactly as a single path is routed. May accompany delete_files in the same transaction. Find/replace uses top-level path+find+replace, not files items.',
         },
         expected_version: { type: 'number', description: 'Optional optimistic-concurrency version from the preceding deploy or patch response. A concurrent project change returns 409 VERSION_CONFLICT with `data.current_version` instead of overwriting.' },
         base_version: { type: 'number', description: 'Optional stale-base version from the preceding deploy or export response. A 409 STALE_BASE indicates a remote change and requires reviewing project_diff_versions before a forced retry.' },
         base_release_id: { type: 'string', description: 'Required for a project with a production release. It is the `active_release_id` from the same project read or export that supplied the edited source. A missing base fails closed; a stale base returns STALE_RELEASE_BASE without applying the patch.' },
         force: { type: 'boolean', description: 'Optional bypass for a STALE_BASE refusal after remote changes have been reviewed. A first retry is expected to inspect project_diff_versions instead.' },
         dry_run: { type: 'boolean', description: 'Non-writing preview that returns per-file unified diffs plus added, modified, and removed lists. The version stays unchanged; a subsequent call without dry_run applies the patch.' },
-        preview: { type: 'boolean', description: "Advanced `somewhere preview` flag requiring a Pro or Scale plan plus explicit platform enablement; otherwise CLOUD_DEV_NOT_ENABLED is returned before resource creation. False (default) patches production." },
+        preview: { type: 'boolean', description: "Advanced `somewhere preview` flag requiring hosted preview access for signed-in accounts on every plan; otherwise CLOUD_DEV_NOT_ENABLED is returned before resource creation. False (default) patches production." },
         preview_session_id: { type: 'string', description: 'Stable editing-session id for this preview lineage. Required with preview:true.' },
         preview_operation_id: { type: 'string', description: 'Stable idempotency id for this exact preview build/retry.' },
         expected_preview_id: { type: ['string', 'null'], description: 'Exact current preview id, or null for the first preview.' },
@@ -2518,7 +2877,7 @@ Patches reach production immediately at \`https://{subdomain}.somewhere.site\`. 
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","connector","chatgpt"],
-    protocol: { surfaceDescriptions: { connector: "Update selected source files in an existing Somewhere project and deploy the changes. Supports full file contents, find/replace edits, and explicit file deletion; other files are preserved. This changes the live application. See https://somewhere.tech/docs.txt for the Somewhere project patch contract." }, oauthScopes: ['mcp'], surfaceAnnotations: { chatgpt: { destructiveHint: true, openWorldHint: true }, connector: { destructiveHint: true } } },
+    protocol: { surfaceDescriptions: { connector: "Update selected source files in an existing Somewhere project and deploy the changes. Supports full file contents, find/replace edits, and explicit file deletion; other files are preserved. This changes the live application. The Somewhere project patch contract is at https://somewhere.cloud/docs.txt." }, oauthScopes: ['mcp'], surfaceAnnotations: { chatgpt: { destructiveHint: true, openWorldHint: true }, connector: { destructiveHint: true } } },
     execute: async (runtime, args) => {
       const { fetcher, env, authHeader, ctx, toolName } = runtime;
       let result: ToolUpstreamResult;
@@ -2526,13 +2885,18 @@ Patches reach production immediately at \`https://{subdomain}.somewhere.site\`. 
         const parseMaybe = (v: unknown, name: string) =>
           v === undefined || v === null ? undefined
           : parseJsonArg(v, name);
+        if (args.files !== undefined && [args.path, args.content, args.find, args.replace].some(value => value !== undefined)) {
+          return badArgsToolResult(env, authHeader, ctx, toolName, args,
+            'Use either files for full-file updates or path with content/find+replace. These forms cannot be combined; no files were changed.');
+        }
+        let multiFiles: ReturnType<typeof splitPatchFiles> | null = null;
         if (args.files !== undefined && args.path === undefined && args.content === undefined && args.find === undefined) {
           const rawPatchFiles = parseMaybe(args.files, 'files');
           const patchFiles = coerceStringMap(rawPatchFiles, 'files');
           if (!patchFiles.ok) {
             return badArgsToolResult(
               env, authHeader, ctx, toolName, args,
-              `${patchFiles.message}\nExample:\nproject_patch({ "project_id": "my-app", "path": "index.html", "content": "<!doctype html><html></html>" })\nproject_patch edits one file per call; use project_deploy for a full replacement tree.`,
+              `${patchFiles.message}\nExample:\nproject_patch({ "project_id": "my-app", "base_release_id": "<from project_export>", "files": { "index.html": "<!doctype html><html></html>", "src/App.tsx": "..." } })\nUnlisted files are kept; use project_deploy only for a full replacement tree.`,
             );
           }
           const entries = Object.entries(patchFiles.value);
@@ -2540,17 +2904,20 @@ Patches reach production immediately at \`https://{subdomain}.somewhere.site\`. 
             const [path, content] = entries[0];
             args.path = path;
             args.content = content;
+          } else if (entries.length > 1) {
+            // Several full-file writes in one atomic patch; unlisted files are kept.
+            multiFiles = splitPatchFiles(patchFiles.value);
           } else {
             return badArgsToolResult(
               env, authHeader, ctx, toolName, args,
-              `project_patch received ${entries.length} files, but it edits one file per call.\nAtomic add-and-remove shape:\nproject_patch({ "project_id": "my-app", "path": "new.html", "content": "<!doctype html><html></html>", "delete_files": ["old.html"] })\nFor a full replacement tree, use project_deploy({ project_id, files: { "index.html": "..." } }).`,
+              'project_patch received an empty files map. Pass at least one {"path": "content"} entry, or use delete_files to remove files.\nExample:\nproject_patch({ "project_id": "my-app", "base_release_id": "<from project_export>", "files": { "new.html": "<!doctype html><html></html>" }, "delete_files": ["old.html"] })',
             );
           }
         }
-        if (args.path === undefined && args.delete_files === undefined) {
+        if (args.path === undefined && args.delete_files === undefined && multiFiles === null) {
           return badArgsToolResult(
             env, authHeader, ctx, toolName, args,
-            'project_patch requires either path plus content/find+replace, or delete_files.\nExample:\nproject_patch({ "project_id": "my-app", "path": "index.html", "find": "old", "replace": "new" })\nFull rewrite example: project_patch({ "project_id": "my-app", "path": "styles.css", "content": "body { color: black }" }).',
+            'project_patch requires either path plus content/find+replace, a files map, or delete_files.\nExample:\nproject_patch({ "project_id": "my-app", "path": "index.html", "find": "old", "replace": "new" })\nFull rewrite example: project_patch({ "project_id": "my-app", "path": "styles.css", "content": "body { color: black }" }).',
           );
         }
         if ((args.find === undefined) !== (args.replace === undefined)) {
@@ -2611,6 +2978,7 @@ Patches reach production immediately at \`https://{subdomain}.somewhere.site\`. 
           ...(args.content !== undefined ? { content: args.content } : {}),
           ...(args.find !== undefined ? { find: args.find } : {}),
           ...(args.replace !== undefined ? { replace: args.replace } : {}),
+          ...(multiFiles ?? {}),
           ...(delete_files !== undefined ? { delete_files } : {}),
           ...(expectedVersion !== undefined ? { expected_version: expectedVersion } : {}),
           ...(baseVersion !== undefined ? { base_version: baseVersion } : {}),
@@ -2641,9 +3009,9 @@ Patches reach production immediately at \`https://{subdomain}.somewhere.site\`. 
   {
     definition: {
     name: 'project_check',
-    description: `**About to deploy source you edited? Run this first.** \`project_check\` typechecks / compiles / lints WITHOUT deploying — a fast green/red so you fix everything before you ship, instead of deploy→error→fix→redeploy. Runs the SAME compile gate a real deploy runs, against the source you pass in, and returns structured errors with \`file:line\` — but writes NOTHING (no version change, nothing goes live). A green here means the deploy's compile step will pass too.
+    description: `**About to deploy source you edited? A pre-deploy check.** \`project_check\` typechecks / compiles / lints WITHOUT deploying — a fast green/red so you fix everything before you ship, instead of deploy→error→fix→redeploy. Runs the SAME compile gate a real deploy runs, against the source you pass in, and returns structured errors with \`file:line\` — but writes NOTHING (no version change, nothing goes live). A green here means the deploy's compile step will pass too.
 
-Catches the deploy-fatal classes: **syntax errors** in your function code and inline \`<script>\` blocks, **undefined symbols** (a dropped import — the \`X is not defined\` that 500s at runtime), **JSX in a .js file**, and **Vite-only \`import.meta.glob\`**. Pass the files/functions you just edited; you don't have to deploy to find out if they're broken.
+Catches the deploy-fatal classes: **syntax errors** in your function code and inline \`<script>\` blocks, **undefined symbols** (a dropped import — the \`X is not defined\` that 500s at runtime), **JSX in a .js file**, and **Vite-only \`import.meta.glob\`**. It takes the edited files/functions; you don't have to deploy to find out if they're broken.
 
 \`\`\`json
 {
@@ -2698,9 +3066,7 @@ Returns \`{ ok, errors: [{ file, line, column, message, kind }], error_count, re
   {
     definition: {
     name: 'project_check_handler',
-    description: `**Advanced — \`somewhere preview\` only.** Run one server function against inputs without deploying. This tool uses the preview's isolated database and env and therefore requires a Pro or Scale plan plus explicit platform enablement. Without it, the call returns \`CLOUD_DEV_NOT_ENABLED\` before running code or creating isolated resources. Do not choose this tool in the default live workflow; use \`project_check\`, deploy, and verify the public live route.
-
-When preview is explicitly enabled, use it to confirm a function against isolated bindings before a deploy.
+    description: `Run ONE server function against inputs without deploying, on every plan. It uses development bindings and does not check the rest of your source. A database call inside the check uses an isolated copy or is refused — never your live database. On plans without \`somewhere preview\`, each project gets 60 handler checks per hour (\`RATE_LIMITED\` after that). \`project_check\` checks that the whole project compiles.
 
 \`\`\`json
 {
@@ -2790,7 +3156,7 @@ Returns \`{ response: { status, headers, body }, logs, errors, served, isolated_
   {
     definition: {
     name: 'project_promote',
-    description: `**Advanced — \`somewhere preview\` only.** Promote one explicitly reviewed preview to production. This requires a Pro or Scale plan plus explicit platform enablement; otherwise it returns \`CLOUD_DEV_NOT_ENABLED\`. It is not part of the default edit/deploy workflow.
+    description: `**Advanced — \`somewhere preview\` only.** Promote one explicitly reviewed preview to production. This requires hosted preview access for signed-in accounts on every plan; otherwise it returns \`CLOUD_DEV_NOT_ENABLED\`. It is not part of the default edit/deploy workflow.
 
 \`\`\`json
 {
@@ -2800,11 +3166,13 @@ Returns \`{ response: { status, headers, body }, logs, errors, served, isolated_
 }
 \`\`\`
 
-Pass the exact \`preview_session_id\` and \`preview_id\` returned by the preview. \`message\` is an optional one-line deploy note.
+It takes the exact \`preview_session_id\` and \`preview_id\` returned by the preview. \`message\` is an optional one-line deploy note.
 
-**Stale-base guard (optional, recommended for shared projects):** pass \`base_live_version\` from the preview response. If production changed after that preview was created, promote returns 409 \`STALE_BASE\` with \`data.changed_files\`, \`data.last_change_source\`, and \`data.last_change_at\` instead of replacing the newer production version. On \`STALE_BASE\`, call \`project_diff_versions\` before forcing; pass \`force:true\` only after reviewing the remote changes.
+**Stale-base guard (optional, recommended for shared projects):** pass \`base_live_version\` from the preview response. If production changed after that preview was created, promote returns 409 \`STALE_BASE\` with \`data.changed_files\`, \`data.last_change_source\`, and \`data.last_change_at\` instead of replacing the newer production version. On \`STALE_BASE\`, \`project_diff_versions\` shows the change before forcing; \`force:true\` overwrites the remote changes.
 
-To undo a promote, use \`project_rollback\`.`,
+**Functions are kept by default, like deploy:** a function live in production but missing from the preview stays live, and the response lists it in \`preserved_functions\`. \`replace_functions:true\` removes those functions; the response lists them in \`removed_functions\`.
+
+\`project_rollback\` undoes a promote.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -2814,8 +3182,9 @@ To undo a promote, use \`project_rollback\`.`,
         preview_id: { type: 'string', description: 'The exact immutable preview_id that was reviewed.' },
         draft_id: { type: 'string', description: 'Deprecated compatibility alias for preview_session_id.' },
         candidate_release_id: { type: 'string', description: 'Deprecated compatibility alias for preview_id.' },
-        base_live_version: { type: 'number', description: 'Optional stale-base guard. Pass `base_live_version` from the preview response. A 409 STALE_BASE means production changed since the preview was created — call project_diff_versions before forcing.' },
-        force: { type: 'boolean', description: 'Optional. Bypasses a STALE_BASE refusal after you have reviewed the newer production changes. Do not use on the first retry; call project_diff_versions first.' },
+        base_live_version: { type: 'number', description: 'Optional stale-base guard. `base_live_version` comes from the preview response. A 409 STALE_BASE means production changed since the preview was created — project_diff_versions shows the change before forcing.' },
+        force: { type: 'boolean', description: 'Optional. Bypasses a STALE_BASE refusal once the newer production changes have been reviewed (project_diff_versions shows them); it is not intended for a first retry.' },
+        replace_functions: { type: 'boolean', description: 'Optional. When true, functions live in production but missing from the preview are removed. False (default) keeps them.' },
       },
       required: ['project_id'],
     },
@@ -2826,7 +3195,7 @@ To undo a promote, use \`project_rollback\`.`,
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","chatgpt"],
-    protocol: { surfaceAnnotations: { chatgpt: { destructiveHint: true, openWorldHint: true } }, oauthScopes: ['mcp'] },
+    protocol: { surfaceAnnotations: { chatgpt: { readOnlyHint: false, destructiveHint: true, openWorldHint: true } }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, env, authHeader, ctx, toolName } = runtime;
       let result: ToolUpstreamResult;
@@ -2869,6 +3238,7 @@ To undo a promote, use \`project_rollback\`.`,
           preview_id: previewId,
           ...(baseLiveVersion !== undefined ? { base_live_version: baseLiveVersion } : {}),
           ...(force ? { force: true } : {}),
+          ...(args.replace_functions === true || args.replace_functions === 'true' ? { replace_functions: true } : {}),
         };
         if (typeof args.message === 'string' && args.message.trim()) body.message = args.message.trim().slice(0, 200);
         body.source = 'mcp';
@@ -2885,7 +3255,7 @@ To undo a promote, use \`project_rollback\`.`,
   {
     definition: {
     name: 'project_rollback',
-    description: "Roll back the last deploy. The code flips to the previous working version immediately. If the project uses a managed database (db/schema.ts), the response also returns a `schema` plan in plain language — what the previous version expects of the database vs. what it looks like now — WITHOUT changing the schema. To also roll the schema back, re-run with with_schema: true; it re-deploys the previous version's schema through the normal deploy path, so a column the new version added is refused (not silently dropped) and a column the old version still declares is restored from retention. Data is never touched beyond the retention/restore window. To review before applying, call with preview: true — it changes NOTHING and returns `target_version` (the version it would restore); pass that back as expected_target_version to confirm, and the rollback is refused (ROLLBACK_TARGET_CHANGED) if the live version moved since your preview, so you never roll to a different version than the one you reviewed.",
+    description: "Roll back the last deploy. The code flips to the previous working version immediately. If the project uses a managed database (db/schema.ts), the response also returns a `schema` plan in plain language — what the previous version expects of the database vs. what it looks like now — WITHOUT changing the schema. with_schema: true also rolls the schema back; it re-deploys the previous version's schema through the normal deploy path, so a column the new version added is refused (not silently dropped) and a column the old version still declares is restored from retention. Data is never touched beyond the retention/restore window. preview: true reviews before applying — it changes NOTHING and returns `target_version` (the version it would restore); that value as expected_target_version confirms it, and the rollback is refused (ROLLBACK_TARGET_CHANGED) if the live version moved since your preview, so the rollback never lands on a different version than the one you reviewed.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -2931,7 +3301,7 @@ To undo a promote, use \`project_rollback\`.`,
 ] }
 \`\`\`
 
-A rejected entry's \`version\` is the version it WOULD have become (may be \`null\`); it never went live. Each successful entry carries \`rollback_available\` — only entries marked \`true\` can be put back into production with \`project_restore_version\` / \`project_rollback\`. Failure entries also include \`failure_id\`, a safe \`classification\`, and \`remediation\`. Resolve one exact reference with \`somewhere api GET /v1/deploy/failure/<failure_id>\`; the endpoint requires access to the owning project and never returns the private stack or provider diagnostic.`,
+A rejected entry's \`version\` is the version it WOULD have become (may be \`null\`); it never went live. Each successful entry carries \`rollback_available\` — only entries marked \`true\` can be put back into production with \`project_restore_version\` / \`project_rollback\`. Failure entries also include \`failure_id\`, a safe \`classification\`, and \`remediation\`. \`somewhere api GET /v1/deploy/failure/<failure_id>\` resolves one exact reference; the endpoint requires access to the owning project and never returns the private stack or provider diagnostic.`,
     inputSchema: {
       type: 'object',
       properties: { project_id: { type: 'string', description: "Project ID, subdomain, or 'default'." } },
@@ -2945,7 +3315,7 @@ A rejected entry's \`version\` is the version it WOULD have become (may be \`nul
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","connector","chatgpt"],
-    protocol: { surfaceDescriptions: { connector: "Read recent successful, rejected, and failed deployment attempts for a Somewhere project, with release identifiers and outcomes." }, oauthScopes: ['mcp'] },
+    protocol: { surfaceAnnotations: { chatgpt: { destructiveHint: false, openWorldHint: false } }, surfaceDescriptions: { connector: "Read recent successful, rejected, and failed deployment attempts for a Somewhere project, with release identifiers and outcomes." }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, authHeader } = runtime;
       let result: ToolUpstreamResult;
@@ -2959,7 +3329,7 @@ A rejected entry's \`version\` is the version it WOULD have become (may be \`nul
   {
     definition: {
     name: 'project_design_tokens',
-    description: `**Design tokens read from the authored CSS of the project's active release** — palette, typography, spacing scale, radii — as structured JSON. The right starting point for a visual editor (Claude Design, Cursor) that wants to "match the existing look" before redesigning.
+    description: `**Design tokens read from the authored CSS of the project's active release** — palette, typography, spacing scale, radii — as structured JSON. A starting point for a visual editor that matches the existing look before redesigning.
 
 Scope is exact: the platform reads the \`.css\` files as you authored them in the source of the exact active release (\`source_scope: 'authored_css'\`) — not the compiled or rendered styles a browser sees, and never a newer or older deploy. The answer names what it read: \`version\`, \`release_id\` and \`source_manifest_hash\`, plus \`input_characters\` (the first 50,000 characters of the concatenated CSS are inspected; \`truncated: true\` when there was more) and \`cached\`. A cached result is reused only for the same release and source hash. If the project has no active release (\`ACTIVE_RELEASE_MISSING\`, 409) or the release has no authored CSS (\`NO_CSS_FOUND\`, 404), you get that error — never tokens from a different source. Requires editor access.
 
@@ -3015,11 +3385,11 @@ Scope is exact: the platform reads the \`.css\` files as you authored them in th
   {
     definition: {
     name: 'project_screenshots',
-    description: `**Real picture of the deployed site for each recent version.** The platform captures a desktop screenshot of the project's homepage after every deploy and stores it alongside the version history. Use this to show "what does this app look like right now" (e.g. for design / visual-editor workflows) or "did my last deploy change the way the homepage renders" (regression spot-check).
+    description: `**Real picture of the deployed site for each recent version.** The platform captures a desktop screenshot of the project's homepage after every deploy and stores it alongside the version history. Answers "what does this app look like right now" (e.g. for design / visual-editor workflows) and "did the last deploy change the way the homepage renders" (regression spot-check).
 
-Pass an optional \`version\` to filter to a specific deploy.
+An optional \`version\` filters to a specific deploy.
 
-By DEFAULT returns metadata only per screenshot (version, viewport, captured_at, size_bytes) — the large inline base64 image bytes are omitted to keep your context lean. Pass \`include_data: true\` to get each as a \`data_url\` (\`data:image/png;base64,...\`) you can render with \`<img src={data_url}>\`, or use the \`browser\` tool to actually see/inspect the live page.
+By DEFAULT returns metadata only per screenshot (version, viewport, captured_at, size_bytes) — the large inline base64 image bytes are omitted to keep your context lean. \`include_data: true\` returns each as a \`data_url\` (\`data:image/png;base64,...\`) you can render with \`<img src={data_url}>\`; the \`browser\` tool sees and inspects the live page.
 
 **Example:**
 
@@ -3040,7 +3410,7 @@ By DEFAULT returns metadata only per screenshot (version, viewport, captured_at,
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
         version: { type: 'number', description: 'Optional — filter to a single deploy version.' },
-        include_data: { type: 'boolean', description: 'Optional, default false. When false (default) the response omits the large inline base64 image bytes and returns metadata only — keeps your context lean. Set true only when you actually need the pixels.' },
+        include_data: { type: 'boolean', description: 'Optional, default false. When false (default) the response omits the large inline base64 image bytes and returns metadata only — keeps your context lean. true returns the pixels.' },
       },
       required: ['project_id'],
     },
@@ -3091,11 +3461,11 @@ By DEFAULT returns metadata only per screenshot (version, viewport, captured_at,
   {
     definition: {
     name: 'docs_query',
-    description: `Query the source truth of a project — routes, symbols+doc-comments, import graph (depends-on/used-by), tables, task refs, coverage, and bounded rich route contracts — assembled from the source of the project's ACTIVE release. Use this INSTEAD of grepping files to understand a project.
+    description: `Query the source truth of a project — routes, symbols+doc-comments, import graph (depends-on/used-by), tables, task refs, coverage, and bounded rich route contracts — assembled from the source of the project's ACTIVE release. It answers questions about a project without grepping files.
 
-By default the platform selects the sidecar of the exact active release (its ready, same-project version); there is no fallback to a newer or older sidecar. A successful default answer carries \`version_source: 'active_release'\`, \`release_id\` and \`source_manifest_hash\` as selection metadata — what was selected, not independent certification of the artifact bytes. Pass \`version\` for an exact older sidecar; that answer carries \`version_source: 'explicit'\` and no release metadata. When the active release cannot be resolved (none active, not found, not ready, its source missing or temporarily unavailable) the answer is a neutral release-status error with \`version_source: 'active_release'\` and the \`release_id\` where one exists — no source hash, and never a claim that you must redeploy. A project whose selected release has no sidecar answers \`DOCS_SIDECAR_NOT_FOUND\` (404). Input problems are ordinary validation or project-not-found errors.
+By default the platform selects the sidecar of the exact active release (its ready, same-project version); there is no fallback to a newer or older sidecar. A successful default answer carries \`version_source: 'active_release'\`, \`release_id\` and \`source_manifest_hash\` as selection metadata — what was selected, not independent certification of the artifact bytes. \`version\` selects an exact older sidecar; that answer carries \`version_source: 'explicit'\` and no release metadata. When the active release cannot be resolved (none active, not found, not ready, its source missing or temporarily unavailable) the answer is a neutral release-status error with \`version_source: 'active_release'\` and the \`release_id\` where one exists — no source hash, and never a claim that you must redeploy. A project whose selected release has no sidecar answers \`DOCS_SIDECAR_NOT_FOUND\` (404). Input problems are ordinary validation or project-not-found errors.
 
-The result comes from the deploy-version-keyed docs sidecar selected for that release, not from a live grep. Pass \`path\`, \`symbol\`, or \`route\` to receive the matching methods/query actions, schema columns and constraints, \`sw.*\` and environment-name bindings (never values), and imported-helper evidence. The response never includes the whole readable Markdown document. If a sidecar is partial or omitted files, the response includes source hash/version/completeness flags so absence is not mistaken for proof that code is not deployed. The private canonical platform artifact is explicitly SOURCE truth, not serving/runtime-effective truth.
+The result comes from the deploy-version-keyed docs sidecar selected for that release, not from a live grep. \`path\`, \`symbol\`, or \`route\` returns the matching methods/query actions, schema columns and constraints, \`sw.*\` and environment-name bindings (never values), and imported-helper evidence. The response never includes the whole readable Markdown document. If a sidecar is partial or omitted files, the response includes source hash/version/completeness flags so absence is not mistaken for proof that code is not deployed. The private canonical platform artifact is explicitly SOURCE truth, not serving/runtime-effective truth.
 
 **Examples:**
 
@@ -3109,7 +3479,7 @@ The result comes from the deploy-version-keyed docs sidecar selected for that re
       type: 'object',
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed." },
-        version: { type: 'number', description: 'Optional — pin to a specific deploy version. Defaults to the current live deploy sidecar.' },
+        version: { type: 'number', description: 'Optional — pins a specific deploy version. Defaults to the current live deploy sidecar.' },
         path: { type: 'string', description: 'Optional — exact deployed source path, e.g. api/checkout.ts or src/App.tsx.' },
         symbol: { type: 'string', description: 'Optional — exported symbol name to find, including its doc comment and file.' },
         route: { type: 'string', description: 'Optional — route path or METHOD + path, e.g. /api/checkout or POST /api/checkout.' },
@@ -3124,7 +3494,7 @@ The result comes from the deploy-version-keyed docs sidecar selected for that re
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","connector","chatgpt"],
-    protocol: { surfaceDescriptions: { connector: "Query a project’s generated source index for routes, symbols, tables, and dependencies. Optional path, symbol, or route filters select relevant evidence. Defaults to the active release; an unavailable index returns a specific status error. The indexed source follows the Somewhere API contract at https://somewhere.tech/docs.txt (functions, schema file, routes)." }, oauthScopes: ['mcp'] },
+    protocol: { surfaceAnnotations: { chatgpt: { destructiveHint: false, openWorldHint: false } }, surfaceDescriptions: { connector: "Query a project’s generated source index for routes, symbols, tables, and dependencies. Optional path, symbol, or route filters select relevant evidence. Defaults to the active release; an unavailable index returns a specific status error. The indexed source follows the Somewhere API contract at https://somewhere.cloud/docs.txt (functions, schema file, routes)." }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, authHeader } = runtime;
       let result: ToolUpstreamResult;
@@ -3142,10 +3512,22 @@ The result comes from the deploy-version-keyed docs sidecar selected for that re
   },
   {
     definition: {
+      name: 'project_seo_check',
+      description: "Inspect deployed SEO metadata from the active release's homepage HTML, robots.txt and sitemap.xml artifacts. Returns release identity, automatic fallback versus app-supplied provenance, metadata issues and advisory suggestions. This does not fetch the public site, execute JavaScript, crawl routes, edit source or verify indexing/ranking. Public HTTP/function responses and client-route coverage remain unobserved.",
+      inputSchema: { type: 'object', properties: { project_id: { type: 'string', description: 'Project ID, subdomain or slug.' } }, required: ['project_id'] },
+    },
+    annotations: { title: 'Deployed SEO metadata', readOnlyHint: true, idempotentHint: true },
+    group: 'project', core: true, coreRank: 112, visibility: 'authenticated', paid: false,
+    surfaces: ["full", "connector", "chatgpt"],
+    protocol: { surfaceAnnotations: { chatgpt: { destructiveHint: false, openWorldHint: false } }, oauthScopes: ['mcp'] },
+    execute: async (runtime, args) => runtime.callApi('GET', `/v1/projects/${encodeURIComponent(String(args.project_id))}/seo`),
+  },
+  {
+    definition: {
     name: 'project_docs',
-    description: `**Readable documentation for the deployed project.** Returns deterministic docs generated from the exact deployed source, plus routes, symbols, data tables, dependency graph, coverage flags, and a Mermaid map. Read this BEFORE editing an unfamiliar project.
+    description: `**Readable documentation for the deployed project.** Returns deterministic docs generated from the exact deployed source, plus routes, symbols, data tables, dependency graph, coverage flags, and a Mermaid map. It is the starting read for an unfamiliar project.
 
-By default the document describes the project's active release (a successful default answer carries \`version_source: 'active_release'\`, \`release_id\` and \`source_manifest_hash\`); pass \`version\` for an exact older one, which carries \`version_source: 'explicit'\` and no release metadata. The deterministic document is available shortly after a successful deploy. A single asynchronous Luna flex-tier pass may add \`docs.prose\` without delaying deploy; it is separately labeled \`ai_generated_untrusted_summary\` and must be verified against \`docs.markdown\`. \`docs.status\` says \`deterministic\` or \`enriched\`. Existing projects receive docs on their next deploy and are not backfilled.`,
+By default the document describes the project's active release (a successful default answer carries \`version_source: 'active_release'\`, \`release_id\` and \`source_manifest_hash\`); \`version\` selects an exact older one, which carries \`version_source: 'explicit'\` and no release metadata. The deterministic document is available shortly after a successful deploy. A single asynchronous Luna flex-tier pass may add \`docs.prose\` without delaying deploy; it is separately labeled \`ai_generated_untrusted_summary\` and must be verified against \`docs.markdown\`. \`docs.status\` says \`deterministic\` or \`enriched\`. Existing projects receive docs on their next deploy and are not backfilled.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -3162,7 +3544,7 @@ By default the document describes the project's active release (a successful def
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","connector","chatgpt"],
-    protocol: { surfaceDescriptions: { connector: "Read documentation generated from a project’s active release, or an explicitly requested older version. Includes source coverage and release identity. Optional AI prose is labeled as an untrusted summary; an unavailable document returns a specific status error." }, oauthScopes: ['mcp'] },
+    protocol: { surfaceAnnotations: { chatgpt: { destructiveHint: false, openWorldHint: false } }, surfaceDescriptions: { connector: "Read documentation generated from a project’s active release, or an explicitly requested older version. Includes source coverage and release identity. Optional AI prose is labeled as an untrusted summary; an unavailable document returns a specific status error." }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, authHeader } = runtime;
       let result: ToolUpstreamResult;
@@ -3182,7 +3564,7 @@ By default the document describes the project's active release (a successful def
 
 Useful when you have many projects and can't remember which one was "the recipe thing with the auth bug" — or when asked to operate on a project you've never seen.
 
-Empty \`text\` means no description yet — fall back to project name + subdomain.
+Empty \`text\` means no description yet; the project name and subdomain are what remain.
 
 **Example:**
 
@@ -3200,7 +3582,7 @@ Empty \`text\` means no description yet — fall back to project name + subdomai
       type: 'object',
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
-        version: { type: 'number', description: 'Optional — pin to a specific deploy version. Defaults to the latest generated description.' },
+        version: { type: 'number', description: 'Optional — pins a specific deploy version. Defaults to the latest generated description.' },
       },
       required: ['project_id'],
     },
@@ -3226,11 +3608,11 @@ Empty \`text\` means no description yet — fall back to project name + subdomai
   {
     definition: {
     name: 'project_comments_list',
-    description: `**Open visual-annotator comments left on the deployed site.** The dashboard's "Review" mode lets a founder / collaborator click any element on the live page and leave a note; this tool returns those notes so an agent (Claude Design, Claude Code) can pick them up, apply the fix, and call \`project_comment_resolve\`.
+    description: `**Open visual-annotator comments left on the deployed site.** The dashboard's "Review" mode lets an owner or collaborator click any element on the live page and leave a note; this tool returns those notes so a client can apply the fix and resolve each one with \`project_comment_resolve\`.
 
-Each comment carries the CSS selector of the element it was attached to, a short text snippet of what the user clicked, and the comment body. Use the selector + snippet to locate the element in your rendered source. (The record also has \`source_file\`/\`source_line\` fields, but the visual annotator does not populate them today — they're null in practice; don't rely on them.)
+Each comment carries the CSS selector of the element it was attached to, a short text snippet of what the user clicked, and the comment body. The selector + snippet locate the element in the rendered source. (The record also has \`source_file\`/\`source_line\` fields, but the visual annotator does not populate them today — they're null in practice.)
 
-Pass \`status\` to filter — \`open\` (default), \`resolved\`, or \`all\`.
+\`status\` filters — \`open\` (default), \`resolved\`, or \`all\`.
 
 **Example:**
 
@@ -3288,7 +3670,7 @@ Pass \`status\` to filter — \`open\` (default), \`resolved\`, or \`all\`.
   {
     definition: {
     name: 'project_comment_resolve',
-    description: `Mark a visual-annotator comment as resolved. Call this after you've shipped the change the comment was asking for — it stops the comment from showing in the dashboard's open queue and tells future agents the work is done.
+    description: `Mark a visual-annotator comment as resolved once the change it asked for has shipped. A resolved comment leaves the dashboard's open queue and reads as done to later readers.
 
 **Example:**
 
@@ -3329,15 +3711,15 @@ Pass \`status\` to filter — \`open\` (default), \`resolved\`, or \`all\`.
   {
     definition: {
     name: 'project_export',
-    description: `**Pull the entire project in one call.** Returns every deployed file — static HTML/CSS/JS as text, binary assets (images, fonts, favicons, .ico/.png/.woff*/etc) base64-encoded, server functions as source — keyed by path. This is the Claude Design / visual-editor fast path: one call → entire project → edit → \`project_deploy\` back.
+    description: `**Pull the entire project in one call.** Returns every deployed file — static HTML/CSS/JS as text, binary assets (images, fonts, favicons, .ico/.png/.woff*/etc) base64-encoded, server functions as source — keyed by path. This is the visual-editor fast path: one call → entire project → edit → \`project_deploy\` back.
 
 For workflows like "redesign my homepage" or "swap the color scheme on the live site," this is the entry point. Pairs with \`project_deploy\` (full replacement) and \`project_patch\` (single-file update) on the write side.
 
 Response shape: flat \`files: [{ path, type, content, encoding }]\` array with explicit per-entry type ("static" / "binary" / "function"), plus the legacy \`static_files\` / \`binary_files\` / \`functions\` maps for backwards compatibility. SVG is utf-8 text (it's XML); PNG / ICO / fonts / etc come back base64.
 
-**Pass \`static_only: true\` if you only need the visual layer** (HTML / CSS / SVG / images / fonts) and not the server functions. Typical projects have 5–10× more function bytes than static bytes, so this is the right default for design / redesign / "swap the color scheme" workflows. The \`functions\` map comes back empty; \`static_files\` and \`binary_files\` are unchanged.
+**\`static_only: true\` returns only the visual layer** (HTML / CSS / SVG / images / fonts) and not the server functions. Typical projects have 5–10× more function bytes than static bytes, so this is the right default for design / redesign / "swap the color scheme" workflows. The \`functions\` map comes back empty; \`static_files\` and \`binary_files\` are unchanged.
 
-If you only need one file (e.g. just CSS), use \`project_file_read\`. If you only need the tree (paths + sizes, no contents), use \`project_files_list\` — much cheaper.
+For one file (e.g. just CSS), \`project_file_read\` is lighter; for the tree alone (paths + sizes, no contents), \`project_files_list\` is much cheaper.
 
 **Example:**
 
@@ -3360,7 +3742,7 @@ If you only need one file (e.g. just CSS), use \`project_file_read\`. If you onl
         preview_session_id: { type: 'string', description: 'Exact open preview session paired with preview_id and env:"dev". It does not fall back to another source.' },
         preview_id: { type: 'string', description: 'Exact current candidate of preview_session_id. Both fields are required together.' },
         project_id: { type: 'string', description: "Project ID, slug, subdomain, or 'default'." },
-        env: { type: 'string', enum: ['dev', 'prod'], description: 'Which environment to pull from. Defaults to "prod" (the live deployed source). Explicit "dev" requires the optional Pro/Scale + enabled preview capability.' },
+        env: { type: 'string', enum: ['dev', 'prod'], description: 'Which environment to pull from. Defaults to "prod" (the live deployed source). Explicit "dev" requires hosted preview access for signed-in accounts on every plan.' },
         static_only: { type: 'boolean', description: 'When true, skip server functions and return only static files (HTML/CSS/SVG/images/fonts). Right default for design / redesign workflows. Defaults to false.' },
       },
       required: ['project_id'],
@@ -3373,7 +3755,7 @@ If you only need one file (e.g. just CSS), use \`project_file_read\`. If you onl
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","connector","chatgpt"],
-    protocol: { surfaceDescriptions: { connector: "Export a Somewhere project as raw source files for inspection or editing. This reads the project source; it does not deploy changes." }, oauthScopes: ['mcp'] },
+    protocol: { surfaceAnnotations: { chatgpt: { destructiveHint: false, openWorldHint: false } }, surfaceDescriptions: { connector: "Export a Somewhere project as raw source files for inspection or editing. This reads the project source; it does not deploy changes." }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, env, authHeader } = runtime;
       let result: ToolUpstreamResult;
@@ -3392,14 +3774,14 @@ If you only need one file (e.g. just CSS), use \`project_file_read\`. If you onl
   {
     definition: {
     name: 'project_deploy_log',
-    description: `Get the build log for a deploy — the entry the bundler detected, every chunk it emitted with sizes, function bundle sizes, and any warnings. Compilation runs on the platform (you deploy raw source), so this is how you SEE what the build did — why CSS dropped, which chunk a warning came from — instead of reverse-engineering compiled output. Omit \`version\` for the latest deploy; pass a version from \`project_deploys\` for a past one. Complements the \`build_log\` + \`rollback\` fields that \`project_deploy\` now returns inline.
+    description: `Get the build log for a deploy — the entry the bundler detected, every chunk it emitted with sizes, function bundle sizes, and any warnings. Compilation runs on the platform (you deploy raw source), so this is how you SEE what the build did — why CSS dropped, which chunk a warning came from — instead of reverse-engineering compiled output. Without \`version\`, it returns the latest deploy; a version from \`project_deploys\` returns a past one. Complements the \`build_log\` + \`rollback\` fields that \`project_deploy\` now returns inline.
 
-Also surfaces failure context alongside (or instead of) a normal build log: \`last_failed_build\` (the most recent build that failed to compile), \`last_rejected\` (the most recent deploy rejected before compile, e.g. bundled-output detection), and \`recent_failures\` (up to 5 safe rows with \`failure_id\`, \`code\`, \`classification\`, \`message\`, \`remediation\`, \`known_cause\`, \`version\`, and \`at\`). Resolve one exact reference with \`somewhere api GET /v1/deploy/failure/<failure_id>\`. If the project has never had a successful deploy, \`version\` comes back \`null\` with an empty \`build_log\` and whatever failure context exists — that's the answer to "why did my first deploy fail," not an error.`,
+Also surfaces failure context alongside (or instead of) a normal build log: \`last_failed_build\` (the most recent build that failed to compile), \`last_rejected\` (the most recent deploy rejected before compile, e.g. bundled-output detection), and \`recent_failures\` (up to 5 safe rows with \`failure_id\`, \`code\`, \`classification\`, \`message\`, \`remediation\`, \`known_cause\`, \`version\`, and \`at\`). \`somewhere api GET /v1/deploy/failure/<failure_id>\` resolves one exact reference. If the project has never had a successful deploy, \`version\` comes back \`null\` with an empty \`build_log\` and whatever failure context exists — that's the answer to "why did my first deploy fail," not an error.`,
     inputSchema: {
       type: 'object',
       properties: {
         project_id: { type: 'string', description: "Project ID, slug, subdomain, or 'default'." },
-        version: { type: 'number', description: 'Deploy version to fetch the log for (from project_deploys). Omit for the latest deploy.' },
+        version: { type: 'number', description: 'Deploy version to fetch the log for (from project_deploys). Omitted: the latest deploy.' },
       },
       required: ['project_id'],
     },
@@ -3428,7 +3810,7 @@ Also surfaces failure context alongside (or instead of) a normal build log: \`la
     name: 'project_files_list',
     description: `List every deployed file in the project — path, type (static/binary/function), size, last_modified. **No file bytes.** Cheap tree listing for "show me what's in there" before deciding what to pull.
 
-Pair with \`project_file_read\` for surgical one-file pulls, or \`project_export\` to grab everything in one shot.
+\`project_file_read\` reads one file; \`project_export\` returns everything in one shot.
 
 **Example:**
 
@@ -3450,7 +3832,7 @@ Pair with \`project_file_read\` for surgical one-file pulls, or \`project_export
         preview_session_id: { type: 'string', description: 'Exact open preview session paired with preview_id and env:"dev". It does not fall back to another source.' },
         preview_id: { type: 'string', description: 'Exact current candidate of preview_session_id. Both fields are required together.' },
         project_id: { type: 'string', description: "Project ID, slug, subdomain, or 'default'." },
-        env: { type: 'string', enum: ['dev', 'prod'], description: 'Which environment to list. Defaults to "prod" (live). Explicit "dev" requires the optional Pro/Scale + enabled preview capability.' },
+        env: { type: 'string', enum: ['dev', 'prod'], description: 'Which environment to list. Defaults to "prod" (live). Explicit "dev" requires hosted preview access for signed-in accounts on every plan.' },
       },
       required: ['project_id'],
     },
@@ -3492,7 +3874,7 @@ Pair with \`project_file_read\` for surgical one-file pulls, or \`project_export
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","connector","chatgpt"],
-    protocol: { surfaceDescriptions: { connector: "List source file paths in a Somewhere project so individual files can be inspected before editing." }, oauthScopes: ['mcp'] },
+    protocol: { surfaceAnnotations: { chatgpt: { destructiveHint: false, openWorldHint: false } }, surfaceDescriptions: { connector: "List source file paths in a Somewhere project so individual files can be inspected before editing." }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, env, authHeader } = runtime;
       let result: ToolUpstreamResult;
@@ -3512,7 +3894,7 @@ Pair with \`project_file_read\` for surgical one-file pulls, or \`project_export
     name: 'project_file_read',
     description: `Read the raw source of a single deployed file. Returns the actual bytes that were uploaded — not DOM-rendered HTML, not a screenshot. Static files come back as UTF-8 text; binary files (images, fonts, etc.) come back base64-encoded; server functions return their source code.
 
-Pair with \`project_files_list\` to discover available paths, or use \`project_export\` for a full pull.
+\`project_files_list\` lists available paths; \`project_export\` returns the full project.
 
 **Example:**
 
@@ -3527,7 +3909,7 @@ Pair with \`project_files_list\` to discover available paths, or use \`project_e
         preview_id: { type: 'string', description: 'Exact current candidate of preview_session_id. Both fields are required together.' },
         project_id: { type: 'string', description: "Project ID, slug, subdomain, or 'default'." },
         path: { type: 'string', description: 'File path relative to the project root (e.g. "index.html", "api/checkout.mjs", "assets/hero.jpg").' },
-        env: { type: 'string', enum: ['dev', 'prod'], description: 'Which environment to read from. Defaults to "prod" (live). Explicit "dev" requires the optional Pro/Scale + enabled preview capability.' },
+        env: { type: 'string', enum: ['dev', 'prod'], description: 'Which environment to read from. Defaults to "prod" (live). Explicit "dev" requires hosted preview access for signed-in accounts on every plan.' },
       },
       required: ['project_id', 'path'],
     },
@@ -3539,7 +3921,7 @@ Pair with \`project_files_list\` to discover available paths, or use \`project_e
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","connector","chatgpt"],
-    protocol: { surfaceDescriptions: { connector: "Read a source file from a Somewhere project by path. Project source follows the Somewhere API contract at https://somewhere.tech/docs.txt." }, oauthScopes: ['mcp'] },
+    protocol: { surfaceAnnotations: { chatgpt: { destructiveHint: false, openWorldHint: false } }, surfaceDescriptions: { connector: "Read a source file from a Somewhere project by path. Project source follows the Somewhere API contract at https://somewhere.cloud/docs.txt." }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, env, authHeader } = runtime;
       let result: ToolUpstreamResult;
@@ -3574,17 +3956,17 @@ Pair with \`project_files_list\` to discover available paths, or use \`project_e
 // }
 \`\`\`
 
-Returns at most \`max_results\` matches (default 100, max 1000), capped per file too; \`truncated: true\` means a cap clipped the results — narrow the \`pattern\` or \`glob\`. Searches the live \`prod\` source by default. Explicit \`env: "dev"\` requires the optional Pro/Scale + enabled preview capability.`,
+Returns at most \`max_results\` matches (default 100, max 1000), capped per file too; \`truncated: true\` means a cap clipped the results — narrow the \`pattern\` or \`glob\`. Searches the live \`prod\` source by default. Explicit \`env: "dev"\` requires hosted preview access for signed-in accounts on every plan.`,
     inputSchema: {
       type: 'object',
       properties: {
         preview_session_id: { type: 'string', description: 'Exact open preview session paired with preview_id and env:"dev". It does not fall back to another source.' },
         preview_id: { type: 'string', description: 'Exact current candidate of preview_session_id. Both fields are required together.' },
         project_id: { type: 'string', description: "Project ID, slug, subdomain, or 'default'." },
-        scope: { type: 'string', enum: ['live'], description: 'Admin-only. Search every live project instead of one project; omit project_id.' },
+        scope: { type: 'string', enum: ['live'], description: 'Admin-only. Search every live project instead of one project; project_id is omitted.' },
         pattern: { type: 'string', description: 'A regular expression to search for (e.g. "export function \\\\w+", "TODO|FIXME"). Catastrophic patterns (nested unbounded repeats like "(a+)+") are rejected.' },
         glob: { type: 'string', description: 'Optional path filter. No-slash globs match the filename ("*.ts"); slashed globs match the path ("api/**", "src/components/*.tsx").' },
-        env: { type: 'string', enum: ['dev', 'prod'], description: 'Which environment\'s source to search. Defaults to "prod" (live). Explicit "dev" requires the optional Pro/Scale + enabled preview capability.' },
+        env: { type: 'string', enum: ['dev', 'prod'], description: 'Which environment\'s source to search. Defaults to "prod" (live). Explicit "dev" requires hosted preview access for signed-in accounts on every plan.' },
         max_results: { type: 'number', description: 'Cap on total matches returned. Default 100, max 1000.' },
         case_insensitive: { type: 'boolean', description: 'Match case-insensitively. Default false.' },
       },
@@ -3598,7 +3980,7 @@ Returns at most \`max_results\` matches (default 100, max 1000), capped per file
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","connector","chatgpt"],
-    protocol: { surfaceDescriptions: { connector: "Search source files in a Somewhere project for text or a pattern and return matching locations." }, oauthScopes: ['mcp'] },
+    protocol: { surfaceAnnotations: { chatgpt: { destructiveHint: false, openWorldHint: false } }, surfaceDescriptions: { connector: "Search source files in a Somewhere project for text or a pattern and return matching locations." }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, env, authHeader } = runtime;
       let result: ToolUpstreamResult;
@@ -3622,7 +4004,7 @@ Returns at most \`max_results\` matches (default 100, max 1000), capped per file
   {
     definition: {
     name: 'project_restore_version',
-    description: `Restore a specific past deploy version to be the live production version. Use project_deploys first to see which versions are available: an entry with \`rollback_available: false\` is still in the history but its build is no longer restorable (the call is refused and nothing changes — deploy that version's source again to bring it back). The currently live version is a no-op.
+    description: `Restore a specific past deploy version to be the live production version. project_deploys shows which versions are available: an entry with \`rollback_available: false\` is still in the history but its build is no longer restorable (the call is refused and nothing changes — deploying that version's source again brings it back). The currently live version is a no-op.
 
 **Example:**
 
@@ -3661,9 +4043,9 @@ Returns at most \`max_results\` matches (default 100, max 1000), capped per file
   {
     definition: {
     name: 'project_diff_versions',
-    description: `Compare two preserved deploy versions of a project. Returns per-file added / removed / changed paths, plus truncated text previews for changed files. Use this after a 409 VERSION_CONFLICT to see what the other deployer shipped before merging and retrying.
+    description: `Compare two preserved deploy versions of a project. Returns per-file added / removed / changed paths, plus truncated text previews for changed files. After a 409 VERSION_CONFLICT it shows what the other deployer shipped, ahead of merging and retrying.
 
-Both versions must still exist in the preserved-snapshot window (the platform keeps the most recent 10 versions). Use \`project_deploys\` first to confirm both numbers are available.
+Both versions must still exist in the preserved-snapshot window (the platform keeps the most recent 10 versions). \`project_deploys\` shows whether both numbers are available.
 
 **Example:**
 
@@ -3683,7 +4065,7 @@ Both versions must still exist in the preserved-snapshot window (the platform ke
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
         from: { type: 'number', description: 'The earlier version number (e.g. your last expected_version)' },
-        to: { type: 'number', description: 'The later version number (e.g. current_version from the 409 response, or pass project_get().version)' },
+        to: { type: 'number', description: 'The later version number (e.g. current_version from the 409 response, or project_get().version)' },
       },
       required: ['project_id', 'from', 'to'],
     },
@@ -3711,7 +4093,7 @@ Both versions must still exist in the preserved-snapshot window (the platform ke
   {
     definition: {
     name: 'project_transfer',
-    description: `Transfer a project to another user by email. If they don't have a somewhere.tech account, they'll receive an invitation.
+    description: `Transfer a project to another user by email. If they don't have a somewhere.cloud account, they'll receive an invitation.
 
 **Example:**
 
@@ -3774,7 +4156,7 @@ Collaborators have full edit access (deploy, files, db, ai, email) EXCEPT: delet
   {
     definition: {
     name: 'project_add_collaborator',
-    description: `Add a collaborator to a project by email. Owner-only. The user must already have a somewhere.tech account.
+    description: `Add a collaborator to a project by email. Owner-only. The user must already have a somewhere.cloud account.
 
 Collaborators get full edit access (deploy, files, db, ai, email) EXCEPT: delete, transfer, env var values, spend caps, and managing other collaborators. All work billed to the project owner.
 
@@ -3787,7 +4169,7 @@ Collaborators get full edit access (deploy, files, db, ai, email) EXCEPT: delete
       type: 'object',
       properties: {
         project_id: { type: 'string', description: 'Project ID' },
-        email: { type: 'string', description: 'Email of an existing somewhere.tech user' },
+        email: { type: 'string', description: 'Email of an existing somewhere.cloud user' },
       },
       required: ['project_id', 'email'],
     },
@@ -3811,7 +4193,7 @@ Collaborators get full edit access (deploy, files, db, ai, email) EXCEPT: delete
   {
     definition: {
     name: 'project_remove_collaborator',
-    description: `Remove a collaborator from a project. Owner-only. Pass the collaborator's user_id (from project_list_collaborators).`,
+    description: `Remove a collaborator from a project. Owner-only. It takes the collaborator's user_id (from project_list_collaborators).`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -3840,7 +4222,7 @@ Collaborators get full edit access (deploy, files, db, ai, email) EXCEPT: delete
   {
     definition: {
     name: 'deploy_status',
-    description: 'Return deploy state, including the immutable production release, current version, previews, and file counts. Every production hostname serves the selected production release.',
+    description: 'Read production deploy state on every plan: published state, immutable release, current version and file counts. Preview details require hosted-preview read access. When unavailable, preview_comparison is unavailable and preview comparison values are null; this does not mean the files are in sync. Every production hostname serves the selected production release.',
     inputSchema: {
       type: 'object',
       properties: { project_id: { type: 'string', description: "Project ID, subdomain, or 'default'." } },
@@ -3848,6 +4230,7 @@ Collaborators get full edit access (deploy, files, db, ai, email) EXCEPT: delete
     },
     outputSchema: readOutputSchema({
       published: { type: 'boolean', description: 'Whether the project is currently published. False after project_undeploy — the source is retained, nothing is serving.' },
+      preview_comparison: { type: 'string', enum: ['available', 'unavailable'], description: 'Unavailable means preview details were not read; null comparison values are not an empty or synchronized preview.' },
       active_release_id: { type: ['string', 'null'], description: 'The release currently serving. Null when the project is not published.' },
       retained_release_id: { type: ['string', 'null'], description: 'The release the project would serve if published — kept through an undeploy so export, patch, rollback and the next deploy all still work.' },
       preview_id: { type: ['string', 'null'] },
@@ -3874,12 +4257,12 @@ Collaborators get full edit access (deploy, files, db, ai, email) EXCEPT: delete
       production_content_hash: { type: ['string', 'null'], description: "Immutable content hash of the production release's source. A promoted release and the preview it came from report the SAME hash, so confirming you shipped the artifact you tested is one equality check, with no diffing. Null for releases published before content hashes were recorded." },
       dev_updated_at: { type: ['string', 'null'] },
       prod_updated_at: { type: ['string', 'null'] },
-      in_sync: { type: 'boolean' },
-      dev_ahead: { type: 'boolean' },
-      files_changed: { type: 'number' },
+      in_sync: { type: ['boolean', 'null'] },
+      dev_ahead: { type: ['boolean', 'null'] },
+      files_changed: { type: ['number', 'null'] },
       dev_file_count: { type: ['number', 'null'] },
       prod_file_count: { type: ['number', 'null'] },
-      dev_has_functions: { type: 'boolean' },
+      dev_has_functions: { type: ['boolean', 'null'] },
       prod_has_functions: { type: 'boolean' },
       added_files: { type: 'array', items: { type: 'string' } },
       removed_files: { type: 'array', items: { type: 'string' } },
@@ -3932,7 +4315,7 @@ Collaborators get full edit access (deploy, files, db, ai, email) EXCEPT: delete
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","chatgpt"],
-    protocol: { oauthScopes: ['mcp'] },
+    protocol: { surfaceAnnotations: { chatgpt: { destructiveHint: false, openWorldHint: false } }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, authHeader } = runtime;
       let result: ToolUpstreamResult;
@@ -3994,7 +4377,7 @@ Collaborators get full edit access (deploy, files, db, ai, email) EXCEPT: delete
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","connector","chatgpt"],
-    protocol: { surfaceDescriptions: { connector: "Read a Somewhere project’s public URLs and release information, including its verified custom domain when available." }, oauthScopes: ['mcp'] },
+    protocol: { surfaceAnnotations: { chatgpt: { destructiveHint: false, openWorldHint: false } }, surfaceDescriptions: { connector: "Read a Somewhere project’s public URLs and release information, including its verified custom domain when available." }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, authHeader } = runtime;
       let result: ToolUpstreamResult;
@@ -4009,11 +4392,11 @@ Collaborators get full edit access (deploy, files, db, ai, email) EXCEPT: delete
   {
     definition: {
     name: 'github_app_install',
-    description: `Start the preferred GitHub App connection flow. Returns a GitHub consent link for the human to open and choose an account/repositories. After consent, call \`github_installations\`, then \`github_list_repos\`, then \`github_connect\` with the selected \`installation_id\`. No personal access token or manual webhook is needed.`,
+    description: `Start the preferred GitHub App connection flow. Returns a one-time Somewhere link (valid 10 minutes) for the human to open in a browser signed in to this same Somewhere account; it continues to GitHub to choose an account/repositories. After consent, the sequence is \`github_installations\`, \`github_list_repos\`, then \`github_connect\` with the selected \`installation_id\`. No personal access token or manual webhook is needed.`,
     inputSchema: {
       type: 'object',
       properties: {
-        return_to: { type: 'string', description: 'Optional somewhere.tech dashboard URL GitHub should return the browser to.' },
+        return_to: { type: 'string', description: 'Optional Somewhere dashboard URL GitHub should return the browser to.' },
       },
       required: [],
     },
@@ -4026,7 +4409,7 @@ Collaborators get full edit access (deploy, files, db, ai, email) EXCEPT: delete
     surfaces: ["full"],
     execute: async (runtime, args) => {
       const { fetcher, authHeader } = runtime;
-      const returnTo = typeof args.return_to === 'string' ? args.return_to : 'https://somewhere.tech/dashboard';
+      const returnTo = githubReturnTo(args.return_to);
       return callAPI(
         fetcher,
         'GET',
@@ -4038,7 +4421,7 @@ Collaborators get full edit access (deploy, files, db, ai, email) EXCEPT: delete
   {
     definition: {
     name: 'github_installations',
-    description: `List the caller's authorized GitHub App installations. Use the returned \`installation_id\` with \`github_list_repos\` and \`github_connect\`. An empty list means the human still needs to open the link from \`github_app_install\`.`,
+    description: `List the caller's authorized GitHub App installations. The returned \`installation_id\` feeds \`github_list_repos\` and \`github_connect\`. An empty list means the human still needs to open the link from \`github_app_install\`.`,
     inputSchema: { type: 'object', properties: {}, required: [] },
   },
     annotations: { title: 'List GitHub App installations', readOnlyHint: true, idempotentHint: true },
@@ -4057,7 +4440,7 @@ Collaborators get full edit access (deploy, files, db, ai, email) EXCEPT: delete
     name: 'github_connect',
     description: `Connect a GitHub repository + branch to a project, deploy the branch's current HEAD, then automatically deploy every future push through the same pipeline as \`somewhere deploy\`.
 
-Preferred: call \`github_app_install\` if needed, choose an ID from \`github_installations\`, and pass \`installation_id\`. The App uses short-lived tokens and signed App-level webhooks—no PAT paste or manual repo webhook. By default this call resolves and deploys HEAD immediately; poll \`github_status\` for the returned \`initial_deploy.commit_sha\` until deployed/failed. The PAT/manual-webhook fields remain compatibility fallbacks.
+Preferred path: \`github_app_install\` if needed, then an ID from \`github_installations\`, passed as \`installation_id\`. The App uses short-lived tokens and signed App-level webhooks—no PAT paste or manual repo webhook. By default this call resolves and deploys HEAD immediately; \`github_status\` reports the returned \`initial_deploy.commit_sha\` as deployed or failed. The PAT/manual-webhook fields remain compatibility fallbacks.
 
 **Example:**
 
@@ -4071,10 +4454,10 @@ Preferred: call \`github_app_install\` if needed, choose an ID from \`github_ins
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, slug, or 'default'." },
         repo: { type: 'string', description: 'Repository as "owner/name" (e.g. "alice/my-saas").' },
         branch: { type: 'string', description: 'Branch to deploy from. Defaults to "main".' },
-        root_dir: { type: 'string', description: 'Optional subdirectory inside the repo to deploy (a monorepo package dir). Omit to deploy from the repo root.' },
+        root_dir: { type: 'string', description: 'Optional subdirectory inside the repo to deploy (a monorepo package dir). Omitted: deploys from the repo root.' },
         installation_id: { type: 'number', description: 'Preferred. Caller-owned GitHub App installation from github_installations.' },
-        deploy_head: { type: 'boolean', description: 'Resolve and deploy the branch HEAD immediately. Defaults to true; set false only when updating connection metadata without a deploy.' },
-        access_token: { type: 'string', description: 'GitHub personal access token (repo + webhook scope). Supply it to auto-install the push webhook and to read private repos. Omit on reconnect to keep the stored token; pass "" to clear it.' },
+        deploy_head: { type: 'boolean', description: 'Resolve and deploy the branch HEAD immediately. Defaults to true; false updates connection metadata without a deploy.' },
+        access_token: { type: 'string', description: 'GitHub personal access token (repo + webhook scope). It auto-installs the push webhook and reads private repos. Omitted on reconnect, the stored token is kept; "" clears it.' },
       },
       required: ['project_id', 'repo'],
     },
@@ -4110,7 +4493,7 @@ Preferred: call \`github_app_install\` if needed, choose an ID from \`github_ins
   {
     definition: {
     name: 'github_status',
-    description: `Show a project's GitHub push-to-deploy connection: repo, branch, App/manual mode, and the last exact commit's deploy status/error. After \`github_connect\`, poll until that commit is \`deployed\` or \`failed\`; \`connected\` alone does not prove the site deployed. Returns \`{ connected: false }\` if no repo is connected.
+    description: `Show a project's GitHub push-to-deploy connection: repo, branch, App/manual mode, and the last exact commit's deploy status/error. After \`github_connect\`, it reports that commit as \`deployed\` or \`failed\`; \`connected\` only means the repo is linked; that commit's own status says whether it deployed. Returns \`{ connected: false }\` if no repo is connected.
 
 **Example:**
 
@@ -4226,7 +4609,7 @@ Preferred: call \`github_app_install\` if needed, choose an ID from \`github_ins
   {
     definition: {
     name: 'db_describe',
-    description: `Schema inspection, list tables, show schema, table structure, columns, types — describe the project database. With no table argument, lists the table names. With a table name, returns its column names, types, constraints, and row count.
+    description: `Schema inspection, list tables, show schema, table structure, columns, types — describe the project database. With no table argument, lists visible managed and raw table names with table_planes metadata. Omitted plane prefers a declared managed table; plane:"raw" inspects a same-name raw table. With a table name, returns its column names, types, constraints, and row count.
 
 **Example:**
 
@@ -4242,6 +4625,7 @@ Preferred: call \`github_app_install\` if needed, choose an ID from \`github_ins
       type: 'object',
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
+        plane: { type: 'string', enum: ['managed', 'raw'], description: 'Optional database plane. The default lists both planes or prefers a declared managed table.' },
         table: { type: 'string', description: 'Optional table name; an omitted value lists all tables.' },
       },
       required: ['project_id'],
@@ -4254,13 +4638,14 @@ Preferred: call \`github_app_install\` if needed, choose an ID from \`github_ins
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","connector","chatgpt"],
-    protocol: { surfaceDescriptions: { connector: "Inspect a Somewhere project database. With no table, list table names; with a table, read its columns, types, constraints, and row count." }, oauthScopes: ['mcp'] },
+    protocol: { surfaceAnnotations: { chatgpt: { destructiveHint: false, openWorldHint: false } }, surfaceDescriptions: { connector: "Inspect a Somewhere project database. With no table it lists table names; with a table it reads its columns, types, constraints, and row count." }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, authHeader } = runtime;
       let result: ToolUpstreamResult;
       {
         const params = new URLSearchParams();
         params.set('project_id', args.project_id as string);
+        if (args.plane) params.set('plane', args.plane as string);
         if (args.table) {
           // Single table schema
           params.set('table', args.table as string);
@@ -4277,9 +4662,9 @@ Preferred: call \`github_app_install\` if needed, choose an ID from \`github_ins
   {
     definition: {
     name: 'db_query',
-    description: `SQL query, run SQL, SELECT, INSERT, UPDATE, DELETE, execute SQL against the project database — the read/write-ROWS entry point. A documented Postgres-flavored syntax subset is translated; the default database keeps its own expression, typing, comparison, and ordering semantics. For example, division by zero returns NULL rather than throwing. The database is created on first use, but tables are not — define your schema with db_migrate first.
+    description: `SQL query, run SQL, SELECT, INSERT, UPDATE, DELETE, execute SQL against the project database — the read/write-ROWS entry point. A documented Postgres-flavored syntax subset is translated; the default database keeps its own expression, typing, comparison, and ordering semantics. For example, division by zero returns NULL rather than throwing. The database is created on first use, but tables are not — new projects declare them in \`db/schema.ts\` and deploy raw source; db_migrate is for legacy SQL-mode projects. Raw SQL reaches the project's raw SQL database only; on a project that keeps its tables in the managed database, rows are read with db_browse (plane: "managed"), schema with db_describe, and writes go through sw.db in functions.
 
-Schema changes (CREATE / ALTER / DROP) belong in db_migrate, NOT here and NEVER inline in a deployed function's handler: runtime DDL runs on every request, isn't versioned, and hides new tables from the platform's per-user data protections (a table with an owner_id/user_id column is cross-user readable until it's scoped). db_query is for the rows.
+Schema changes (CREATE / ALTER / DROP) belong in \`db/schema.ts\` plus deploy for managed projects, or db_migrate for legacy SQL-mode projects, not here, and not inline in a deployed function's handler: runtime DDL runs on every request, isn't versioned, and hides new tables from the platform's per-user data protections (a table with an owner_id/user_id column is cross-user readable until it's scoped). db_query is for the rows.
 
 Every successful query returns \`{ data: [], count: N, changes: N, last_row_id: X }\`: \`data\` contains returned rows, \`count\` counts those rows, and \`changes\` counts affected rows. A write without RETURNING has empty \`data\` and a zero \`count\` even when it changes rows. \`last_row_id\` is a number, an exact decimal integer string when the ID exceeds JavaScript’s safe integer range, or null; other transport metadata may also be present.
 
@@ -4322,7 +4707,7 @@ The database has a 30-second hard query ceiling. \`timeout_ms\` bounds how long 
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","chatgpt","connector"],
-    protocol: { surfaceDescriptions: { connector: "Execute SQL against a project database, with optional bound parameters. Statements can read, insert, update, or delete data; writes persist." }, surfaceAnnotations: { chatgpt: { destructiveHint: true }, connector: {"title":"Db Query","readOnlyHint":false,"destructiveHint":true} }, oauthScopes: ['mcp'] },
+    protocol: { surfaceDescriptions: { connector: "Execute SQL against a project database, with optional bound parameters. Statements can read, insert, update, or delete data; writes persist." }, surfaceAnnotations: { chatgpt: { destructiveHint: true, openWorldHint: true }, connector: {"title":"Db Query","readOnlyHint":false,"destructiveHint":true} }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, env, authHeader, ctx, toolName } = runtime;
       let result: ToolUpstreamResult;
@@ -4331,7 +4716,7 @@ The database has a 30-second hard query ceiling. \`timeout_ms\` bounds how long 
         if (typeof args.sql !== 'string' || !args.sql.trim()) {
           return badArgsToolResult(
             env, authHeader, ctx, toolName, args,
-            'db_query requires a non-empty sql string.\nExample:\ndb_query({ "project_id": "my-app", "sql": "SELECT * FROM users WHERE id = ?", "params": ["usr_123"] })\nUse db_migrate for CREATE/ALTER/DROP schema changes.',
+            'db_query requires a non-empty sql string.\nExample:\ndb_query({ "project_id": "my-app", "sql": "SELECT * FROM users WHERE id = ?", "params": ["usr_123"] })\nFor new managed projects, declare tables in db/schema.ts and deploy. Use db_migrate only for legacy SQL-mode schema changes.',
           );
         }
         if (params !== undefined && !Array.isArray(params)) {
@@ -4356,7 +4741,7 @@ The database has a 30-second hard query ceiling. \`timeout_ms\` bounds how long 
   {
     definition: {
     name: 'run_code',
-    description: `Run a short script once, server-side, against a project's own bindings — get the result + console logs back in one call. Use this instead of deploying a throwaway debug endpoint or making dozens of tool calls to inspect data, try a query variant, or run a one-off transformation.
+    description: `Run a short script once, server-side, against a project's own bindings — get the result + console logs back in one call. It replaces a throwaway debug endpoint or dozens of tool calls when inspecting data, trying a query variant, or running a one-off transformation.
 
 \`code\` is an ES module whose default async function receives \`sw\` (the same database / files / search / ai bindings a deployed function gets) and returns a JSON-serializable value:
 
@@ -4369,15 +4754,16 @@ The database has a 30-second hard query ceiling. \`timeout_ms\` bounds how long 
 
 Runs with the project's OWN authority, not your developer key: no env secrets unless you pass \`include_env: true\`, no admin, no cross-project access, and outbound fetch is limited to public hosts. Returns \`{ result, logs, duration_ms, error? }\`. \`result\` is capped at 256KB (truncated with a notice past that); \`timeout_ms\` defaults to 10000, max 30000.
 
-**Threading state across calls (opt-in):** pass a stable \`session_id\` to carry explicit JSON state between runs. The saved JSON is exposed to your script as a read-only \`sw.session\`; to save state for the next call, return a \`{ session: {...} }\` object (it is stored under that \`session_id\`, separately from \`result\`). Absent \`session_id\` = stateless, byte-identical to a normal run. This is explicit data you thread by id — NOT live-variable/closure persistence.`,
+**Threading state across calls (opt-in):** pass a stable \`session_id\` to carry explicit JSON state between runs. The saved JSON is exposed to your script as a read-only \`sw.session\`; a returned \`{ session: {...} }\` object saves state for the next call (it is stored under that \`session_id\`, separately from \`result\`). Absent \`session_id\` = stateless, byte-identical to a normal run. This is explicit data you thread by id — NOT live-variable/closure persistence.`,
     inputSchema: {
       type: 'object',
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, slug, or 'default'. Resolved server-side." },
-        code: { type: 'string', description: 'ES module source: export default async function (sw) { ...; return value }. The default export is called with sw; its (JSON-serializable) return value comes back as result.' },
+        code: { type: 'string', description: 'ES module source: export default async function (sw, args) { ...; return value }. args is a read-only object of per-run strings (empty when omitted); existing (sw) scripts also work. The JSON-serializable return value comes back as result.' },
+        args: { type: 'object', maxProperties: 64, propertyNames: { pattern: '^[A-Za-z_][A-Za-z0-9_]*$', not: { enum: ['__proto__', 'prototype', 'constructor'] } }, additionalProperties: { type: 'string' }, description: 'Per-run string inputs (at most 16KiB UTF-8 JSON), passed as the frozen second argument to export default async (sw, args). Separate from env and saved sessions; omitted means an empty object. Secrets belong in project env.' },
         timeout_ms: { type: 'number', description: 'Abort the script after N ms. Default 10000. Clamped to [1, 30000].' },
-        include_env: { type: 'boolean', description: 'Expose the project env vars as sw.env. Default false — leave off unless the script genuinely needs a secret.' },
-        session_id: { type: 'string', description: 'Opt-in session key (<=128 chars, [A-Za-z0-9_-]). Loads saved JSON as a read-only sw.session before the run; return { session } to persist for the next call (stored state capped at 64KB). Absent = stateless.' },
+        include_env: { type: 'boolean', description: 'Expose the project env vars as sw.env. Default false — off unless the script needs a secret.' },
+        session_id: { type: 'string', description: 'Opt-in session key (<=128 chars, [A-Za-z0-9_-]). Loads saved JSON as a read-only sw.session before the run; a returned { session } persists for the next call (stored state capped at 64KB). Absent = stateless.' },
       },
       required: ['project_id', 'code'],
     },
@@ -4388,8 +4774,10 @@ Runs with the project's OWN authority, not your developer key: no env secrets un
     coreRank: 35,
     visibility: 'authenticated',
     paid: false,
-    surfaces: ["full","chatgpt","connector"],
-    protocol: { surfaceDescriptions: { connector: "Execute a short ES-module script against one project’s live bindings and return JSON plus console logs. The default async function receives sw. Writes persist; the script is temporary. Optional session_id preserves explicit returned JSON between runs. include_env exposes project secrets only when true. Platform AI media generation and financial transfers are unavailable in connector runs. Runtime API reference: https://somewhere.tech/docs.txt." }, surfaceAnnotations: { chatgpt: { destructiveHint: true, openWorldHint: true }, connector: {"title":"Run Code","readOnlyHint":false,"destructiveHint":true} }, oauthScopes: ['mcp'] },
+    // Not on ChatGPT (founder, 2026-10-17): a generic code executor is the shape
+    // the plugin review refuses. Full MCP, the connector and the CLI keep it.
+    surfaces: ["full","connector"],
+    protocol: { surfaceDescriptions: { connector: "Execute a short ES-module script against one project’s live bindings and return JSON plus console logs. The default async function receives sw. Writes persist; the script is temporary. Optional session_id preserves explicit returned JSON between runs. include_env exposes project secrets only when true. Platform AI media generation and financial transfers are unavailable in connector runs. Runtime API reference: https://somewhere.cloud/docs.txt." }, surfaceAnnotations: { connector: {"title":"Run Code","readOnlyHint":false,"destructiveHint":true} }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { env, authHeader } = runtime;
       let result: ToolUpstreamResult;
@@ -4399,10 +4787,11 @@ Runs with the project's OWN authority, not your developer key: no env secrets un
         result = await callRunner(env, 'POST', '/run', authHeader, {
           project_id: args.project_id,
           code: args.code,
+          args: args.args,
           timeout_ms: args.timeout_ms,
           include_env: args.include_env,
           session_id: args.session_id,
-          ...(runtime.surface === 'connector' ? { execution_policy: 'connector' } : {}),
+          ...(runCodeExecutionPolicyForSurface(runtime.surface) ? { execution_policy: runCodeExecutionPolicyForSurface(runtime.surface) } : {}),
         });
         return result;
 
@@ -4413,7 +4802,7 @@ Runs with the project's OWN authority, not your developer key: no env secrets un
   {
     definition: {
     name: 'db_batch',
-    description: `Run multiple SQL statements as a single atomic transaction. Every statement commits together, or none do — a single failure rolls the entire batch back. Use this whenever a logical operation spans more than one write (account deletion across multiple tables, moving money between rows, denormalized counters). Max 1000 statements per call.
+    description: `Run multiple SQL statements as a single atomic transaction. Every statement commits together, or none do — a single failure rolls the entire batch back. Suited to any logical operation that spans more than one write (account deletion across multiple tables, moving money between rows, denormalized counters). Max 1000 statements per call.
 
 Each statement returns its own \`{ rows, count, changes, last_row_id }\` in \`results[i]\` matching the order you passed in.
 
@@ -4433,7 +4822,7 @@ Each statement returns its own \`{ rows, count, changes, last_row_id }\` in \`re
       type: 'object',
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
-        statements: { type: ['array', 'string'], description: 'Array of { sql, params? } objects. Prefer a native JSON array; a JSON-stringified array is also accepted. Each runs atomically; any error rolls every statement back. Max 1000.' },
+        statements: { type: ['array', 'string'], description: 'Array of { sql, params? } objects. Accepts a native JSON array; a JSON-stringified array is also accepted. Each runs atomically; any error rolls every statement back. Max 1000.' },
         ...DATABASE_TARGET_INPUT_PROPERTIES,
       },
       required: ['project_id', 'statements'],
@@ -4490,16 +4879,9 @@ Each statement returns its own \`{ rows, count, changes, last_row_id }\` in \`re
   {
     definition: {
     name: 'db_migrate',
-    description: `Create a table / add a column / change the schema — run a schema migration (DDL) against the project database. Use for CREATE TABLE, ALTER TABLE, ADD COLUMN, CREATE INDEX, DROP. This is how you set up your database tables before inserting data. Multiple statements allowed, separated by \`;\`. Idempotent migrations (\`IF NOT EXISTS\`) are safe to re-run. Developer-only — app-user JWTs are rejected.
+    description: `Run explicit SQL schema migrations for legacy SQL-mode projects. New projects use declared data: define tables and access rules in \`db/schema.ts\` and deploy raw source; db_migrate does not create their tables. docs({ topic: 'declared-data', section: 'declare-a-table-and-use-it' }) has a complete example. Managed projects refuse DDL with SCHEMA_LOCKED and apply no SQL.
 
-**Example:**
-
-\`\`\`json
-{
-  "project_id": "my-saas",
-  "sql": "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, created_at INTEGER); CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);"
-}
-\`\`\``,
+For SQL-mode projects, CREATE TABLE, ALTER TABLE, CREATE INDEX and DROP are supported; multiple statements may be separated by \`;\`. Explicit preview targeting changes only that preview database. Developer-only — app-user JWTs are rejected.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -4517,7 +4899,7 @@ Each statement returns its own \`{ rows, count, changes, last_row_id }\` in \`re
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","chatgpt","connector"],
-    protocol: { surfaceDescriptions: { connector: "Apply a SQL migration to a project database. Schema and data changes persist." }, surfaceAnnotations: { chatgpt: { destructiveHint: true }, connector: {"title":"Db Migrate","readOnlyHint":false,"destructiveHint":true} }, oauthScopes: ['mcp'] },
+    protocol: { surfaceDescriptions: { connector: "Run a SQL schema migration for a legacy SQL-mode project. New projects declare tables in db/schema.ts and deploy raw source; docs declared-data, section declare-a-table-and-use-it, has the example. Managed-project DDL is refused without applying SQL." }, surfaceAnnotations: { chatgpt: { destructiveHint: true, openWorldHint: false }, connector: {"title":"Db Migrate","readOnlyHint":false,"destructiveHint":true} }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, authHeader } = runtime;
       let result: ToolUpstreamResult;
@@ -4539,7 +4921,7 @@ Each statement returns its own \`{ rows, count, changes, last_row_id }\` in \`re
 
 The generated entry preserves the table's shape faithfully — column types, single-column primary key, indexes, unique constraints, auto-timestamp defaults, and (for a per-user table) its owner column as \`owner({ column })\`. A composite primary key, a view, a triggered table, or a column type the managed schema can't represent is refused with a plain fix-it. A column whose stored values don't match its declared type is loosened and reported, never silently changed.
 
-Pass \`with\` when importing several related tables at once so a foreign key between them can be represented.
+\`with\` imports several related tables at once so a foreign key between them can be represented.
 
 **Example:**
 
@@ -4565,7 +4947,7 @@ Pass \`with\` when importing several related tables at once so a foreign key bet
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","chatgpt","connector"],
-    protocol: { surfaceDescriptions: { connector: "Read an existing table and generate its managed schema declaration without changing the database." }, surfaceAnnotations: { connector: {"title":"Db Import","readOnlyHint":true} },  oauthScopes: ['mcp'] },
+    protocol: { surfaceDescriptions: { connector: "Read an existing table and generate its managed schema declaration without changing the database." }, surfaceAnnotations: { chatgpt: { openWorldHint: false }, connector: {"title":"Db Import","readOnlyHint":true} },  oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, authHeader } = runtime;
       const body: Record<string, unknown> = { project_id: args.project_id, table: args.table };
@@ -4578,7 +4960,7 @@ Pass \`with\` when importing several related tables at once so a foreign key bet
     name: 'db_import_csv',
     description: `Import CSV data into a database table. If the table doesn't exist and \`create_table\` is true, it will be created with column types inferred from the data (INTEGER / REAL / TEXT). Headers in the CSV become column names.
 
-Inline CSV strings are capped at 5 MB. For larger files, upload to \`/v1/fs\` first and pass the filepath.
+Inline CSV strings are capped at 5 MB. Larger files are uploaded to \`/v1/fs\` first and passed by filepath.
 
 **Example:**
 
@@ -4612,7 +4994,7 @@ Inline CSV strings are capped at 5 MB. For larger files, upload to \`/v1/fs\` fi
       const { fetcher, authHeader } = runtime;
       let result: ToolUpstreamResult;
       {
-        result = await callAPI(fetcher, 'POST', '/v1/db/import', authHeader, {
+        result = await callAPI(fetcher, 'POST', '/v1/db/import-csv', authHeader, {
           project_id: args.project_id,
           table: args.table,
           ...(args.csv !== undefined ? { csv: args.csv } : {}),
@@ -4627,7 +5009,7 @@ Inline CSV strings are capped at 5 MB. For larger files, upload to \`/v1/fs\` fi
   {
     definition: {
     name: 'db_browse',
-    description: `Browse rows in a database table with pagination, sorting, and filtering. Use this to inspect data without writing SQL.
+    description: `Browse rows in a database table with pagination, sorting, and filtering. Inspects data without writing SQL.
 
 Filters use the same operators as db_query: \`eq\`, \`neq\`, \`gt\`, \`gte\`, \`lt\`, \`lte\`, \`like\`, \`ilike\`, \`is\`, \`not\`.
 
@@ -4652,6 +5034,7 @@ Filters use the same operators as db_query: \`eq\`, \`neq\`, \`gt\`, \`gte\`, \`
         offset: { type: 'number', description: 'Default 0.' },
         order_by: { type: 'string', description: 'Column to sort by.' },
         order: { type: 'string', description: 'asc | desc. Default desc.' },
+        plane: { type: 'string', enum: ['managed', 'raw'], description: 'Optional database plane. The default reads a declared managed table from the managed database, otherwise the raw database.' },
         filters: {
           type: 'array',
           description: 'Optional filters: [{ column, op, value }]. Operators: eq, neq, gt, gte, lt, lte, like, ilike, is, not.',
@@ -4678,6 +5061,7 @@ Filters use the same operators as db_query: \`eq\`, \`neq\`, \`gt\`, \`gte\`, \`
           ...(args.offset !== undefined ? { offset: args.offset } : {}),
           ...(args.order_by !== undefined ? { order_by: args.order_by } : {}),
           ...(args.order !== undefined ? { order: args.order } : {}),
+          ...(args.plane !== undefined ? { plane: args.plane } : {}),
           ...(filters !== undefined ? { filters } : {}),
         });
         return result;
@@ -4688,7 +5072,7 @@ Filters use the same operators as db_query: \`eq\`, \`neq\`, \`gt\`, \`gte\`, \`
   {
     definition: {
     name: 'db_export',
-    description: `Export a database table as CSV. Returns the CSV content as a string. Pass filters to export a subset (same shape as db_browse). Capped at 100,000 rows — use filters for larger tables.
+    description: `Export a database table as CSV. Returns the CSV content as a string. Filters export a subset (same shape as db_browse). Capped at 100,000 rows — filters cover larger tables.
 
 **Example:**
 
@@ -4766,7 +5150,7 @@ Filters use the same operators as db_query: \`eq\`, \`neq\`, \`gt\`, \`gte\`, \`
     name: 'db_dump',
     description: `Full SQL dump of the project's database — schema (CREATE TABLE / INDEX / TRIGGER) + every row as INSERT statements. The output is standard SQL you can pipe into any SQL database client to restore, or migrate to Postgres via \`pgloader\`.
 
-Returns the raw .sql file as a string. One call gives you the complete database schema and rows to take anywhere.
+Returns the raw .sql file as a string. One call gives you the complete raw SQL database's schema and rows to take anywhere. A project that keeps its tables in the managed database has no raw SQL database to dump (RAW_DATABASE_NOT_READY); its managed rows are read with db_browse (plane: "managed") and their schema and row counts with db_describe.
 
 Table access declarations and sensitive-column marks are platform policy, not SQL. Their labels travel as comment lines in the SQL preamble and, parsed, as \`excluded_security_policy.policies\` (labels only, never applied by a SQL restore); a warning appears only when the list is non-empty. \`policies: []\` on a successful capture means no table-access declarations were found in this capture — it does not establish that access is safe or preserve your application's authorization, and member join definitions and handler authorization are outside that list. After restoring, re-declare with \`db_scope_set\` or redeploy \`db/schema.ts\`, then verify with \`db_scope_list\`.
 
@@ -4824,7 +5208,7 @@ Refusals, never a partial file: \`DATABASE_NOT_INITIALIZED\` (409 — the dump n
 
 For a SQL-mode project: declare a database table as per-user scoped — the platform scopes STRUCTURED queries against it (\`sw.db.from\` / \`count\` / \`insert\` / \`update\` / \`remove\`) to the rows the signed-in user owns (their \`owner_column\` value). Developer-only. Scoping applies only to the structured builder the platform composes; raw \`sw.db.query\` SQL is trusted server code and runs exactly as written, so write the ownership filter into raw statements yourself (\`WHERE user_id = ?\`). On the legacy SQL-mode HTTP/SDK surface, app-user browser requests to the database are refused with \`BROWSER_DB_ACCESS_REMOVED\`; a SQL-mode app's browser reaches data only through its server functions.
 
-Pass \`intent: "shared"\` to mark a SQL-mode table as intentionally cross-user, or re-call to lift enforcement on an already-scoped table (keeps the row on record, turns off enforcement, rebakes live functions). The same call is available in-band from a deployed function or run_code script as \`await sw.db.scope("bookings", { owner_column: "user_id" })\` on SQL-mode projects.
+\`intent: "shared"\` marks a SQL-mode table as intentionally cross-user, and on an already-scoped table lifts enforcement (keeps the row on record, turns off enforcement, rebakes live functions). The same call is available in-band from server code as \`await sw.db.scope("bookings", { owner_column: "user_id" })\` on SQL-mode projects.
 
 **Example:**
 
@@ -4850,7 +5234,7 @@ Pass \`intent: "shared"\` to mark a SQL-mode table as intentionally cross-user, 
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","connector","chatgpt"],
-    protocol: { surfaceAnnotations: { chatgpt: { destructiveHint: true }, connector: { destructiveHint: true } }, surfaceDescriptions: { connector: "Declare the owner column and access scope for a Somewhere project database table. This changes authorization rules for structured database access." }, oauthScopes: ['mcp'] },
+    protocol: { surfaceAnnotations: { chatgpt: { destructiveHint: true, openWorldHint: false }, connector: { destructiveHint: true } }, surfaceDescriptions: { connector: "Declare the owner column and access scope for a Somewhere project database table. This changes authorization rules for structured database access." }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, authHeader } = runtime;
       let result: ToolUpstreamResult;
@@ -4896,7 +5280,7 @@ Pass \`intent: "shared"\` to mark a SQL-mode table as intentionally cross-user, 
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","connector","chatgpt"],
-    protocol: { surfaceDescriptions: { connector: "Read configured table ownership and access scopes for a Somewhere project database." }, oauthScopes: ['mcp'] },
+    protocol: { surfaceAnnotations: { chatgpt: { destructiveHint: false, openWorldHint: false } }, surfaceDescriptions: { connector: "Read configured table ownership and access scopes for a Somewhere project database." }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, authHeader } = runtime;
       let result: ToolUpstreamResult;
@@ -4907,13 +5291,52 @@ Pass \`intent: "shared"\` to mark a SQL-mode table as intentionally cross-user, 
       }
     },
   },
+  {
+    definition: {
+    name: 'db_explain_access',
+    description: `Explain whether one app user of your project may read, update or delete one existing row of a declared table right now, and which declared rule link decides it. For a table declared with \`allOf(gate, who)\`, \`create\` is also explained, for a new row in the named row's group: create authority comes from the gate's create roles alone. The answer comes from the same access rules and active release the app enforces, read live. It names declared tables and columns only, never row values or other users' memberships. Developer-only; the project must be one you can edit.
+
+Reasons: ROW_NOT_FOUND, SUBJECT_NOT_ELIGIBLE (no such signed-up, unbanned user in this project), PARENT_MISSING, NOT_OWNER, NOT_A_MEMBER, NOT_OWNER_OR_MEMBER, NOT_OWNER_OR_GROUP_MEMBER, NOT_OWNER_OR_GROUP_ROLE, NOT_OWNER_OR_APP_ROLE, OPERATION_NOT_GRANTED, GROUP_ROLE_NOT_ALLOWED, APP_ROLE_NOT_HELD, GROUP_POLICY_CHANGED, and for allOf GATE_DENIED (the gate refused: not a current member, or no role for the operation) or WHO_DENIED (a current member who is not the row's owner, nor allowed by the who slot's role). An allowed answer carries \`note: OWNER_BRANCH_WITHOUT_MEMBERSHIP\` when it rests only on owning an anyOf(owner(), member()|group()) row while not in its group: removing a member does not revoke their access to the rows they own under anyOf. If the access check cannot run, the answer is AUTHORITY_UNAVAILABLE (retry), never a denial.
+
+**Example:**
+
+\`\`\`json
+{ "project_id": "my-trips", "table": "expenses", "id": 42, "operation": "update", "user": "usr_123" }
+// Returns: { "allowed": false, "chain": [{ "table": "expenses", "rule": "parent", "via": "trip_id" }, { "table": "trips", "rule": "group" }], "reason": { "code": "GROUP_ROLE_NOT_ALLOWED", "table": "trips", ... } }
+\`\`\``,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug." },
+        table: { type: 'string', description: 'A table declared in db/schema.ts.' },
+        id: { type: ['string', 'integer'], description: "The row's primary-key value." },
+        operation: { type: 'string', enum: ['read', 'create', 'update', 'delete'], description: 'The operation to explain. create: allOf tables only.' },
+        user: { type: 'string', description: 'The app user id to explain access for (a user of this project).' },
+      },
+      required: ['project_id', 'table', 'id', 'operation', 'user'],
+    },
+  },
+    annotations: { title: 'Explain row access', readOnlyHint: true, idempotentHint: true },
+    group: 'db',
+    core: false,
+    visibility: 'authenticated',
+    paid: false,
+    surfaces: ["full"],
+    protocol: { oauthScopes: ['mcp'] },
+    execute: async (runtime, args) => {
+      const { fetcher, authHeader } = runtime;
+      return await callAPI(fetcher, 'POST', '/v1/db/access-explain', authHeader, {
+        project_id: args.project_id, table: args.table, id: args.id, operation: args.operation, user: args.user,
+      });
+    },
+  },
   // ── auth ─────────────────────────────────────────────
   {
     definition: {
     name: 'account',
-    description: `Which somewhere.tech account is this session connected as? Takes no arguments and reads only the caller's own account.
+    description: `Which somewhere.cloud account is this session connected as? Takes no arguments and reads only the caller's own account.
 
-Use it to answer "who am I connected as" without guessing a route or inferring an identity from the project list.
+It answers "who am I connected as" without a guessed route or an identity inferred from the project list.
 
 **Example:**
 
@@ -4924,7 +5347,7 @@ Use it to answer "who am I connected as" without guessing a route or inferring a
 //            "summary": "Connected as Alice (alice@example.com). The email address is verified." }
 \`\`\`
 
-This is the DEVELOPER ACCOUNT holding the projects. For the end user of a customer's app, use \`auth_me\` with that user's app token.`,
+This is the DEVELOPER ACCOUNT holding the projects. For the end user of a customer's app, \`auth_me\` with that user's app token answers instead.`,
     inputSchema: {
       type: 'object',
       properties: {},
@@ -4941,12 +5364,12 @@ This is the DEVELOPER ACCOUNT holding the projects. For the end user of a custom
     protocol: {
       oauthScopes: ['mcp'],
       surfaceDescriptions: {
-        connector: 'Which somewhere.tech account this connector is signed in as. No arguments; reads only the caller\'s own account.',
-        chatgpt: 'Which somewhere.tech account this connection is signed in as. No arguments; reads only the caller\'s own account.',
+        connector: 'Which somewhere.cloud account this connector is signed in as. No arguments; reads only the caller\'s own account.',
+        chatgpt: 'Which somewhere.cloud account this connection is signed in as. No arguments; reads only the caller\'s own account.',
       },
       surfaceAnnotations: {
         connector: { title: 'Account', readOnlyHint: true },
-        chatgpt: { title: 'Account', readOnlyHint: true },
+        chatgpt: { title: 'Account', readOnlyHint: true, destructiveHint: false, openWorldHint: false },
       },
     },
     execute: async (runtime) => {
@@ -4976,13 +5399,13 @@ This is the DEVELOPER ACCOUNT holding the projects. For the end user of a custom
   {
     definition: {
     name: 'auth_signup',
-    description: `Register user, create account, new user, sign up, onboard user — sign up a new end user for your app. Returns the user ID and authentication token. Passwords are securely hashed. Call this from your server-side code, not from browser code.
+    description: `Register user, create account, new user, sign up, onboard user — sign up a new end user for your app. Returns registration and user metadata; credentials are omitted from MCP output. This result cannot sign an agent in from a transcript. Sign-in goes through the app’s normal secure sign-in flow. Passwords are securely hashed. Intended for server-side code, not browser code.
 
 **Example:**
 
 \`\`\`json
 { "project_id": "my-saas", "email": "alice@example.com", "password": "s3cure!Pass" }
-// Returns: { "user_id": "u_abc", "token": "eyJ...", "refresh_token": "rt_..." }
+// Returns registration and user metadata without authentication credentials.
 \`\`\``,
     inputSchema: {
       type: 'object',
@@ -5017,7 +5440,7 @@ This is the DEVELOPER ACCOUNT holding the projects. For the end user of a custom
           password: args.password,
           display_name: args.display_name ?? args.displayName ?? args.full_name ?? args.fullName ?? args.name,
         });
-        return result;
+        return signupResultForChat(result);
 
       }
     },
@@ -5113,13 +5536,13 @@ This is the DEVELOPER ACCOUNT holding the projects. For the end user of a custom
   {
     definition: {
     name: 'auth_google_url',
-    description: `Get a Google OAuth URL for end-user login. Redirect users to this URL to start the OAuth flow. After login, the platform redirects back to redirect_uri with a short-lived authorization code in the query string (\`?code=...\`). The JWT is never put in the URL — your backend exchanges the code for the JWT via POST /v1/auth/google/exchange (smt_ key required, server-side only), or via \`sw.auth.googleExchange({ code })\` from inside a deployed function. Codes are single-use and expire after 60 seconds. See docs({ topic: 'sw.auth' }) for the full flow.
+    description: `Get a Google OAuth URL for end-user login. Redirect users to this URL to start the OAuth flow. After login, the platform redirects back to redirect_uri with a short-lived authorization code in the query string (\`?code=...\`). The JWT is never put in the URL — your backend exchanges the code for the JWT via POST /v1/auth/google/exchange (smt_ key required, server-side only), or via \`sw.auth.googleExchange({ code })\` from inside a deployed function. Codes are single-use and expire after 60 seconds. docs({ topic: 'sw.auth' }) documents the full flow.
 
 **Example:**
 
 \`\`\`json
 { "project_id": "my-saas", "redirect_uri": "https://my-saas.somewhere.site/auth/callback" }
-// Returns: { "url": "https://api.somewhere.tech/v1/auth/google?project_id=...&redirect_uri=..." }
+// Returns: { "url": "https://api.somewhere.cloud/v1/auth/google?project_id=...&redirect_uri=..." }
 \`\`\``,
     inputSchema: {
       type: 'object',
@@ -5140,7 +5563,7 @@ This is the DEVELOPER ACCOUNT holding the projects. For the end user of a custom
       {
         // Public custom-domain URL — was hardcoded to the .workers.dev
         // staging hostname which leaked into end-user OAuth flows.
-        const url = `https://api.somewhere.tech/v1/auth/google?project_id=${encodeURIComponent(args.project_id as string)}&redirect_uri=${encodeURIComponent(args.redirect_uri as string)}`;
+        const url = googleAuthStartUrl(args.project_id as string, args.redirect_uri as string);
         return {
           content: [{ type: 'text', text: JSON.stringify({ ok: true, data: { url } }, null, 2) }],
         };
@@ -5153,7 +5576,7 @@ This is the DEVELOPER ACCOUNT holding the projects. For the end user of a custom
     name: 'auth_password_export_request',
     description: `Request a one-time password credential export for a project you own. The platform emails a six-digit approval code only to the current verified owner account email; this tool never returns the code or any password hash.
 
-After the owner receives the code, use the Somewhere CLI's protected auth export command to write the download directly to a new local file. The approval expires after 10 minutes, is bound to this account, project, and exact verified owner email, and can be used once. Collaborators, app-user sessions, runtime keys, unverified accounts, and download attempts without the emailed code are refused.
+After the owner receives the code, the Somewhere CLI's protected auth export command writes the download directly to a new local file. The approval expires after 10 minutes, is bound to this account, project, and exact verified owner email, and can be used once. Collaborators, app-user sessions, runtime keys, unverified accounts, and download attempts without the emailed code are refused.
 
 **Example:**
 
@@ -5223,7 +5646,7 @@ After the owner receives the code, use the Somewhere CLI's protected auth export
   {
     definition: {
     name: 'auth_user_delete',
-    description: 'Delete an end-user account by id from one of your projects. Cascades through sessions, password resets, and email verifications. Use this for admin tooling and test-harness cleanup — end users delete their own account through their app, not via this tool. Customer data in your project database is NOT touched (delete those rows yourself before calling this).',
+    description: 'Delete an end-user account by id from one of your projects. Cascades through sessions, password resets, and email verifications. It is for admin tooling and test-harness cleanup — end users delete their own account through their app, not via this tool. Customer data in your project database is NOT touched (delete those rows yourself before calling this).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -5265,10 +5688,10 @@ After the owner receives the code, use the Somewhere CLI's protected auth export
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
         user_id: { type: 'string', description: 'The end-user id to update (from auth_users_list or auth_signup)' },
-        display_name: { type: 'string', description: 'New display name (max 200 chars). Pass null via raw JSON to clear.' },
-        metadata: { type: 'object', description: 'Replacement metadata blob (any JSON-serializable object, max 16 KB). Pass null via raw JSON to clear.' },
+        display_name: { type: 'string', description: 'New display name (max 200 chars). null via raw JSON clears it.' },
+        metadata: { type: 'object', description: 'Replacement metadata blob (any JSON-serializable object, max 16 KB). null via raw JSON clears it.' },
         role: { type: 'string', enum: ['user', 'admin'], description: 'Platform-owned app role. Only this developer-key control-plane path can change it; app-user profile updates cannot.' },
-        banned: { type: 'boolean', description: 'Set true to suspend the account; false to lift the ban. Suspended users can\'t log in, refresh, or use any existing JWT (next /me call returns 403 AUTH_BANNED).' },
+        banned: { type: 'boolean', description: 'true suspends the account; false to lift the ban. Suspended users can\'t log in or refresh, and any existing JWT stops working within 60 seconds (then /me returns 403 AUTH_BANNED).' },
         banned_reason: { type: 'string', description: 'Operator-set free text shown only in admin tooling (never to the user). Max 1000 chars.' },
       },
       required: ['project_id', 'user_id'],
@@ -5306,52 +5729,8 @@ After the owner receives the code, use the Somewhere CLI's protected auth export
   },
   {
     definition: {
-    name: 'auth_impersonate',
-    description: `Mint a 1-hour access token bound to a target end user so you can act as them (support reproduction, admin tooling, debugging). The token carries \`impersonating: true\` plus \`impersonator_id\` claims, so any audit log can tell impersonated requests apart. No refresh token is issued — mint a fresh one if you need more time. Banned users cannot be impersonated.
-
-**Example:**
-
-\`\`\`json
-{ "project_id": "my-saas", "user_id": "au_abc123" }
-// Returns: { "access_token": "eyJ...", "user": {...}, "expires_in": 3600, "impersonating": true }
-\`\`\``,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
-        user_id: { type: 'string', description: 'The end-user id to impersonate' },
-      },
-      required: ['project_id', 'user_id'],
-    },
-  },
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
-    group: 'auth',
-    core: false,
-    visibility: 'authenticated',
-    paid: false,
-    surfaces: ["full"],
-    execute: async (runtime, args) => {
-      const { fetcher, authHeader } = runtime;
-      let result: ToolUpstreamResult;
-      {
-        const params = new URLSearchParams();
-        params.set('project_id', args.project_id as string);
-        result = await callAPI(
-          fetcher,
-          'POST',
-          `/v1/auth/users/${encodeURIComponent(args.user_id as string)}/impersonate?${params.toString()}`,
-          authHeader,
-          {},
-        );
-        return result;
-
-      }
-    },
-  },
-  {
-    definition: {
     name: 'auth_list_sessions',
-    description: "List a user's active sessions (most recent first). Returns session id, created_at, expires_at — never the session token itself (we only store hashes). Use the id with auth_revoke_session to kill a single device.",
+    description: "List a user's active sessions (most recent first). Returns session id, created_at, expires_at — never the session token itself (we only store hashes). auth_revoke_session with the id ends the session of a single device.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -5387,7 +5766,7 @@ After the owner receives the code, use the Somewhere CLI's protected auth export
   {
     definition: {
     name: 'auth_revoke_session',
-    description: "Revoke a single session by id (from auth_list_sessions). The session token immediately stops authenticating. Pair with banning if you also want to kill the 1-hour access JWT before it expires.",
+    description: "Revoke a single session by id (from auth_list_sessions). The session stops authenticating within 60 seconds (a verified credential may be reused for up to 60 s; it is never refreshed past that or past the token's expiry).",
     inputSchema: {
       type: 'object',
       properties: {
@@ -5423,7 +5802,7 @@ After the owner receives the code, use the Somewhere CLI's protected auth export
   {
     definition: {
     name: 'auth_revoke_all_sessions',
-    description: "Revoke every session AND refresh token the user holds. Force-logout the user everywhere. Active 1-hour access JWTs keep validating signature-wise until they expire — pair with auth_user_update {banned:true} for immediate cut-off.",
+    description: "Revoke every session AND refresh token the user holds. Force-logout the user everywhere. Existing access JWTs are invalidated too; a copy held elsewhere stops working within 60 seconds (the sign-in cache bound).",
     inputSchema: {
       type: 'object',
       properties: {
@@ -5459,7 +5838,7 @@ After the owner receives the code, use the Somewhere CLI's protected auth export
   {
     definition: {
     name: 'auth_webhook_set',
-    description: "Configure a project-scoped webhook URL that fires on app-user lifecycle events (currently auth.user.deleted; more events later). Use this to clean up your own per-project tables (posts.author_id, comments.user_id, etc.) when a user is deleted — the platform cascades sessions/resets/verifications but not your application data, so without a webhook those rows are orphaned. Returns the HMAC secret used to sign delivery — store it server-side. Re-call with rotate_secret=true to rotate. Signature header X-Somewhere-Signature: t={ms},v1={hex} computed as HMAC-SHA256({ms}.{rawBody}, secret). Same scheme as inbox webhooks.",
+    description: "Configure the project's webhook URL. The platform POSTs signed events there: app-user lifecycle (auth.user.created/updated/deleted), refresh-token reuse alerts (refresh_token_reuse), payment callbacks (payment.completed, payment.refunded) and subscription notices (subscription.activated/updated/canceled); the response lists them. It lets an app clean up its own per-project tables (posts.author_id, comments.user_id, etc.) when a user is deleted — the platform cascades sessions/resets/verifications but not your application data, so without a webhook those rows are orphaned. Returns the HMAC secret only on first setup or when rotate_secret=true generates a new one; it belongs server-side. Ordinary URL updates keep the existing secret without returning it. Signature header X-Somewhere-Signature: t={ms},v1={hex} computed as HMAC-SHA256({ms}.{rawBody}, secret). Same scheme as inbox webhooks.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -5523,7 +5902,7 @@ After the owner receives the code, use the Somewhere CLI's protected auth export
   {
     definition: {
     name: 'auth_logout',
-    description: 'Revoke an end-user session AND/OR their refresh token. Pass at least one of session_token or refresh_token. Both are accepted in the same call — passing both is the safe default after a logout button click so a leaked refresh token can\'t outlive the session row.',
+    description: 'Revoke an end-user session AND/OR their refresh token. It takes at least one of session_token or refresh_token. Both are accepted in the same call — passing both is the safe default after a logout button click so a leaked refresh token can\'t outlive the session row.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -5628,7 +6007,7 @@ After the owner receives the code, use the Somewhere CLI's protected auth export
   {
     definition: {
     name: 'auth_request_email_verification',
-    description: 'Send a 6-digit verification code to the logged-in end user. Pass the user\'s app token. Code expires in 15 minutes. Rate-limited to 1 send per minute per user.',
+    description: 'Send a 6-digit verification code to the logged-in end user. It takes the user\'s app token. Code expires in 15 minutes. Rate-limited to 1 send per minute per user.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -5667,7 +6046,7 @@ After the owner receives the code, use the Somewhere CLI's protected auth export
   {
     definition: {
     name: 'auth_verify_email',
-    description: `Verify the 6-digit code that was emailed to the user. On success, \`email_verified\` is set to true. After 5 wrong attempts the code is wiped — request a new one.
+    description: `Verify the 6-digit code that was emailed to the user. On success, \`email_verified\` is set to true. After 5 wrong attempts the code is wiped and a new one is needed.
 
 **Example:**
 
@@ -5788,9 +6167,9 @@ The link expires in 15 minutes and can only be used once. Token verification goe
     name: 'auth_mfa_enroll',
     description: `Start TOTP enrolment for the logged-in end user. Returns \`{ secret, enrollment_id, otpauth_uri, issuer, account }\` — render \`otpauth_uri\` as a QR code so the user can scan it with Google Authenticator / Authy / 1Password.
 
-The enrollment remains inactive until the user proves recent account authority and confirms the authenticator code. Call \`auth_mfa_activation_reauth\` with the returned \`enrollment_id\`; the password method returns an \`activation_token\`, while the email method returns a \`challenge_id\` for \`auth_mfa_activation_reauth_verify\`. Then call \`auth_mfa_verify\` with the enrollment, activation token, and authenticator code.
+The enrollment remains inactive until the user proves recent account authority and confirms the authenticator code. \`auth_mfa_activation_reauth\` takes the returned \`enrollment_id\`; the password method returns an \`activation_token\`, while the email method returns a \`challenge_id\` for \`auth_mfa_activation_reauth_verify\`. \`auth_mfa_verify\` then takes the enrollment, activation token, and authenticator code.
 
-Returns 409 ALREADY_ENROLLED if the user already has MFA on — call \`auth_mfa_unenroll\` first.`,
+Returns 409 ALREADY_ENROLLED if the user already has MFA on — \`auth_mfa_unenroll\` comes first.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -5828,7 +6207,7 @@ Returns 409 ALREADY_ENROLLED if the user already has MFA on — call \`auth_mfa_
   {
     definition: {
     name: 'auth_mfa_activation_reauth',
-    description: `Establish recent authority for one exact pending MFA enrollment. Use \`method: "password"\` with the user's current \`password\` to receive a short-lived one-time \`activation_token\`. Use \`method: "email"\` to send a 6-digit code to the account's current stored email and receive a \`challenge_id\`; exchange that code through \`auth_mfa_activation_reauth_verify\`.
+    description: `Establish recent authority for one exact pending MFA enrollment. \`method: "password"\` with the user's current \`password\` returns a short-lived one-time \`activation_token\`. \`method: "email"\` sends a 6-digit code to the account's current stored email and returns a \`challenge_id\`; exchange that code through \`auth_mfa_activation_reauth_verify\`.
 
 The proof and activation are bound to the supplied \`app_token\` session and the exact pending enrollment. \`password\` is required only for the password method; email requests carry no password.`,
     inputSchema: {
@@ -5837,7 +6216,7 @@ The proof and activation are bound to the supplied \`app_token\` session and the
         app_token: { type: 'string', description: 'App-user JWT for the current session activating MFA' },
         enrollment_id: { type: 'string', description: 'Pending enrollment ID returned by auth_mfa_enroll' },
         method: { type: 'string', enum: ['password', 'email'], description: 'Fresh-authority method: password or email' },
-        password: { type: 'string', description: 'Current password — required when method is password; omit when method is email' },
+        password: { type: 'string', description: 'Current password — required when method is password; not used when method is email' },
       },
       required: ['app_token', 'enrollment_id', 'method'],
     },
@@ -5962,7 +6341,7 @@ The single successful activation returns \`{ enabled: true, backup_codes: [...] 
   {
     definition: {
     name: 'auth_mfa_challenge',
-    description: `Second factor exchange. Call this from your BFF after \`auth_login\` returned \`{ mfa_required: true, mfa_token }\`. \`code\` is either the user's current 6-digit TOTP or one of their 10-char backup codes (backup codes are consumed on use).
+    description: `Second factor exchange, used by a BFF after \`auth_login\` returned \`{ mfa_required: true, mfa_token }\`. \`code\` is either the user's current 6-digit TOTP or one of their 10-char backup codes (backup codes are consumed on use).
 
 On success returns the same shape as \`auth_login\` — \`access_token\`, \`refresh_token\`, \`session_token\`, and the user object.`,
     inputSchema: {
@@ -6037,7 +6416,7 @@ On success returns the same shape as \`auth_login\` — \`access_token\`, \`refr
   {
     definition: {
     name: 'auth_refresh',
-    description: `Exchange a refresh token for a fresh (access_token, refresh_token) pair. Refresh tokens rotate — the old one is invalidated. Access tokens last 1 hour; refresh tokens last 30 days. Call this from your server, not browser code.
+    description: `Exchange a refresh token for a fresh (access_token, refresh_token) pair. Refresh tokens rotate — the old one is invalidated. Access tokens last 1 hour; refresh tokens last 30 days. Intended for server code, not browser code.
 
 **Example:**
 
@@ -6076,11 +6455,11 @@ On success returns the same shape as \`auth_login\` — \`access_token\`, \`refr
   {
     definition: {
     name: 'auth_cli_pair',
-    description: `Mint a short-lived \`smt_\` API key for ephemeral environments (Claude Code Web, sandboxes, containers). The agent writes the returned token to \`~/.somewhere/credentials\` (or runs \`somewhere auth set <token>\`) and the CLI works for the rest of the session — without sending the user through a browser-based login.
+    description: `Mint a short-lived \`smt_\` API key for ephemeral environments (hosted coding environments, sandboxes, containers). \`somewhere auth set\` takes the returned key through standard input or the command environment as \`SOMEWHERE_TOKEN\`. The CLI verifies and stores it, so the session can use the CLI without a browser login. Positional tokens are refused; the key does not belong in command arguments or chat.
 
-Returns: \`{ id, key: "smt_...", prefix, name, kind: "cli_pair", expires_at, ttl_seconds }\`. Key auto-expires in 24h; call this again on the next session.
+Returns: \`{ id, key: "smt_...", prefix, name, kind: "cli_pair", expires_at, ttl_seconds }\`. Key auto-expires in 24h; the next session takes a new key. No refresh token is returned here: the pairing response omits the long-lived refresh credential. \`somewhere auth login\` gives a CLI session that renews itself; it stores its credentials directly in the CLI config.
 
-Use when you have a shell but no CLI credentials. After pairing, use first-class CLI commands for routine work and \`somewhere call <tool> '<json>'\` for the complete platform tool catalog. If no shell exists, stay on MCP.
+For a shell without CLI credentials. The CLI is the scoped package \`@somewhere-tech/cli\` (\`npm i -g @somewhere-tech/cli\`). After pairing, first-class CLI commands cover routine work and \`somewhere call <tool> '<json>'\` covers the complete platform tool catalog. Without a shell, the MCP tools are the path.
 
 Security note: scoped to the same user as the caller. Auditable as kind='cli_pair' separately from your main developer key, so a stolen ephemeral token is revocable on its own.
 
@@ -6088,16 +6467,17 @@ Security note: scoped to the same user as the caller. Auditable as kind='cli_pai
 
 \`\`\`text
 1. Call auth_cli_pair() → { key: "smt_...", expires_at: "..." }
-2. Run: somewhere auth set <key>
-3. Run: somewhere whoami     // confirms identity
-4. somewhere deploy           // fast file-system deploy
+2. Set SOMEWHERE_TOKEN to the returned key in the command environment.
+3. Run: somewhere auth set   // reads SOMEWHERE_TOKEN
+4. Run: somewhere whoami     // confirms identity
+5. somewhere deploy          // deploy raw source
 \`\`\``,
     inputSchema: {
       type: 'object',
       properties: {
         label: {
           type: 'string',
-          description: 'Optional short label that ends up in the key name for audit trail (e.g. "claude-code-web", "codespace-1234"). Defaults to "ephemeral". Max 40 chars; non-alphanumeric stripped.',
+          description: 'Optional short label that ends up in the key name for audit trail (e.g. "web-sandbox", "codespace-1234"). Defaults to "ephemeral". Max 40 chars; non-alphanumeric stripped.',
         },
       },
       required: [],
@@ -6109,7 +6489,8 @@ Security note: scoped to the same user as the caller. Auditable as kind='cli_pai
     coreRank: 95,
     visibility: 'authenticated',
     paid: false,
-    surfaces: ["full"],
+    surfaces: ["full","connector"],
+    protocol: { surfaceDescriptions: { connector: "Create a short-lived (24-hour) API key that links the somewhere CLI in a shell environment to this account; the CLI then performs the same operations as this connector. Returns the key, its prefix and its expiry. The key is recorded as its own CLI pairing key, revocable separately, and no refresh credential is returned. The CLI reads the key from standard input or the SOMEWHERE_TOKEN environment variable through `somewhere auth set`. No operation on this connector requires it." }, surfaceAnnotations: { connector: {"title":"Link Somewhere CLI","readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false} }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, authHeader } = runtime;
       let result: ToolUpstreamResult;
@@ -6117,7 +6498,7 @@ Security note: scoped to the same user as the caller. Auditable as kind='cli_pai
         const body: Record<string, unknown> = {};
         if (typeof args.label === 'string') body.label = args.label;
         result = await callAPI(fetcher, 'POST', '/v1/keys/cli-pair', authHeader, body);
-        return result;
+        return cliPairResultForChat(result);
 
       }
     },
@@ -6320,13 +6701,13 @@ Available variables: \`{{project_name}}\`, \`{{reset_link}}\` (password_reset), 
     name: 'fs_write',
     description: `**fs_write = text and small inline content. fs_upload = real files.** Write UTF-8 text or other small content already present in the tool call to project file storage. Parent directories are auto-created. Overwrites create a new version automatically (history keeps the last 3 versions on Free, 10 on Builder).
 
-For images, PDFs, video, zip files, fonts, large artifacts, and task attachments, use \`fs_upload\` so binary bytes never enter model context. Base64 input remains accepted here only for backward compatibility with existing callers; do not choose it for new binary uploads.
+Images, PDFs, video, zip files, fonts, large artifacts, and task attachments go through \`fs_upload\`, so binary bytes never enter model context. Base64 input remains accepted here only for backward compatibility with existing callers; new binary uploads go through \`fs_upload\`.
 
-Use this for notes, JSON, CSV, generated source text, and small cached text that is not project code (project code goes through project_deploy).
+It holds notes, JSON, CSV, generated source text, and small cached text that is not project code (project code goes through project_deploy).
 
-There are two file surfaces: deployed source is read with \`project_files_list\` / \`project_file_read\`; \`fs_write\` and \`fs_read\` are runtime storage for uploads and generated files via \`sw.fs\`. If you want \`src/App.tsx\` or \`api/foo.ts\`, use \`project_file_read\`, not \`fs_read\`.
+There are two file surfaces: deployed source is read with \`project_files_list\` / \`project_file_read\`; \`fs_write\` and \`fs_read\` are runtime storage for uploads and generated files via \`sw.fs\`. Project source such as \`src/App.tsx\` or \`api/foo.ts\` is read with \`project_file_read\`, not \`fs_read\`.
 
-**Files are PRIVATE by default.** To serve a file at a public URL (e.g. an image you embed in your app), pass \`public: true\` — then call \`fs_public_url\` to get the URL. Without it the file is only reachable through your authenticated code.
+**Files are PRIVATE by default.** A file served at a public URL (e.g. an embedded app image) takes \`public: true\`, and \`fs_public_url\` returns the URL. Without it the file is only reachable through your authenticated code.
 
 **Example (text):**
 
@@ -6338,7 +6719,7 @@ There are two file surfaces: deployed source is read with \`project_files_list\`
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
         path: { type: 'string', description: 'Full path with leading slash, e.g. "/images/avatar.png"' },
-        content: { type: 'string', description: 'File content — UTF-8 text or base64 bytes (set content_type to match).' },
+        content: { type: 'string', description: 'File content — UTF-8 text or base64 bytes (content_type matches it).' },
         content_type: { type: 'string', description: 'MIME type, e.g. "image/png", "application/pdf". Defaults to application/octet-stream.' },
         public: { type: 'boolean', description: 'Public /storage URL exposure without auth. False (default) keeps files private; true supports images and assets embedded in an application.' },
       },
@@ -6352,12 +6733,11 @@ There are two file surfaces: deployed source is read with \`project_files_list\`
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","chatgpt","connector"],
-    protocol: { surfaceDescriptions: { connector: "Write content to a project file path. Existing content at that path is replaced. See https://somewhere.tech/docs.txt for the Somewhere file API contract (paths, visibility, signed and public URLs)." }, surfaceAnnotations: { chatgpt: { destructiveHint: true }, connector: {"title":"Fs Write","readOnlyHint":false,"destructiveHint":true} },  oauthScopes: ['mcp'] },
+    protocol: { surfaceDescriptions: { connector: "Write content to a project file path. Existing content at that path is replaced. The Somewhere file API contract (paths, visibility, signed and public URLs) is at https://somewhere.cloud/docs.txt." }, surfaceAnnotations: { chatgpt: { destructiveHint: true, openWorldHint: true }, connector: {"title":"Fs Write","readOnlyHint":false,"destructiveHint":true} },  oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, env, authHeader } = runtime;
       let result: ToolUpstreamResult;
       {
-        const projectId = encodeURIComponent(args.project_id as string);
         const path = (args.path as string).startsWith('/')
           ? (args.path as string).slice(1)
           : (args.path as string);
@@ -6367,7 +6747,9 @@ There are two file surfaces: deployed source is read with \`project_files_list\`
         // one-call public-upload path after the default flipped to private.
         const writeHeaders: Record<string, string> = { 'Authorization': authHeader, 'Content-Type': contentType };
         if (args.public === true) writeHeaders['X-Visibility'] = 'public';
-        const resp = await fetcher.fetch(`https://api-internal/v1/fs/${projectId}/${path}`, {
+        let url: string;
+        try { url = internalFsUrl(args.project_id as string, path); } catch (err) { return invalidInternalPath(err); }
+        const resp = await fetcher.fetch(url, {
           method: 'PUT',
           headers: writeHeaders,
           body: args.content as string,
@@ -6424,11 +6806,11 @@ There are two file surfaces: deployed source is read with \`project_files_list\`
   {
     definition: {
     name: 'fs_upload',
-    description: `**fs_upload = files. fs_write = text and small inline content.** Uploads an image, PDF, video, zip, font, large artifact, or attachment without placing binary bytes or base64 in conversational context.
+    description: `**fs_upload = files. fs_write = text and small inline content.** Uploads an image, PDF, video, zip, font, large artifact, or attachment without carrying binary bytes or base64 in tool arguments.
 
 **Client capability matrix:**
 - **Native-file connector clients:** \`file\` carries a temporary authorized file reference that this tool streams through the upload relay.
-- **Clients with raw HTTP access:** an omitted \`file\` mints a one-time \`upload_url\` that accepts raw bytes with the returned Content-Type. This two-step transport keeps base64 outside conversational context.
+- **Clients with raw HTTP access:** an omitted \`file\` mints a one-time \`upload_url\` that accepts raw bytes with the returned Content-Type. This two-step transport keeps base64 out of tool arguments. One request carries at most 100 MB; a bigger file goes up in parts through the returned \`multipart_url\` (start, send each part, then complete — the reply spells out the steps). With \`size_bytes\`, a file over 90 MB comes back already started, with \`parts_url\`, \`part_size\`, \`part_count\` and \`complete_url\`; a size over the plan's per-file limit is refused with PAYLOAD_TOO_LARGE before any byte moves.
 - **Other shell-less MCP clients:** standard MCP arguments have no protocol-level file input, so upload availability depends on compatible host file references or raw HTTP access.
 
 The connector reference and upload URL are temporary transports, not the durable artifact. After storage, the saved bytes are addressed by \`path\`; \`fs_signed_url\` provides a private human download and \`public:true\` with \`fs_public_url\` provides a permanent public URL. The PUT response and native call both return \`{ path, size_bytes, content_type, version }\`.
@@ -6445,6 +6827,12 @@ The connector reference and upload URL are temporary transports, not the durable
 
 \`\`\`json
 { "project_id": "my-saas", "path": "/uploads/archive.zip", "content_type": "application/zip" }
+\`\`\`
+
+**Large file (over 90 MB), uploaded in parts:**
+
+\`\`\`json
+{ "project_id": "my-saas", "path": "/uploads/video.mp4", "content_type": "video/mp4", "size_bytes": 125829120 }
 \`\`\``,
     inputSchema: {
       type: 'object',
@@ -6464,6 +6852,7 @@ The connector reference and upload URL are temporary transports, not the durable
         },
         content_type: { type: 'string', description: 'Optional MIME override, e.g. "image/png". Otherwise inferred from connector metadata and filename/path.' },
         public: { type: 'boolean', description: 'Serve this file at a public /storage URL. Default false (private).' },
+        size_bytes: { type: 'integer', description: 'Raw-PUT fallback only: the whole file size in bytes, when known. Over 90 MB, the upload starts in parts and the reply carries parts_url, part_size, part_count and complete_url; over the plan limit, it is refused with PAYLOAD_TOO_LARGE before any byte moves.' },
       },
       required: ['project_id', 'path'],
     },
@@ -6476,7 +6865,7 @@ The connector reference and upload URL are temporary transports, not the durable
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","chatgpt","connector"],
-    protocol: { surfaceDescriptions: { connector: "Upload a file from a supplied URL into project files. See https://somewhere.tech/docs.txt for the Somewhere file API contract (paths, visibility, signed and public URLs)." }, surfaceAnnotations: { chatgpt: { destructiveHint: true, openWorldHint: true }, connector: {"title":"Fs Upload","readOnlyHint":false,"destructiveHint":true} },  oauthScopes: ['mcp'] },
+    protocol: { surfaceDescriptions: { connector: "Upload a file from a supplied URL into project files. The Somewhere file API contract (paths, visibility, signed and public URLs) is at https://somewhere.cloud/docs.txt." }, surfaceAnnotations: { chatgpt: { destructiveHint: true, openWorldHint: true }, connector: {"title":"Fs Upload","readOnlyHint":false,"destructiveHint":true} },  oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, authHeader } = runtime;
       let result: ToolUpstreamResult;
@@ -6505,12 +6894,45 @@ The connector reference and upload URL are temporary transports, not the durable
           );
 
           if (!file) {
+            const sizeBytes = args.size_bytes;
+            if (sizeBytes !== undefined && (typeof sizeBytes !== 'number' || !Number.isSafeInteger(sizeBytes) || sizeBytes <= 0)) {
+              throw new FileUploadError('VALIDATION_ERROR', 'size_bytes must be the whole file size in bytes, a positive integer.', 400);
+            }
+            if (mint.multipart_url && sizeBytes !== undefined
+              && (sizeBytes > SINGLE_REQUEST_MAX_BYTES || sizeBytes > mint.max_size)) {
+              // Started here so a size over the plan's limit is refused now,
+              // before the caller sends any byte.
+              const session = await startMultipartUpload(fetcher, mint.multipart_url, sizeBytes, contentType);
+              result = {
+                status: 200,
+                data: {
+                  ok: true,
+                  data: {
+                    path: mint.path,
+                    size_bytes: session.size_bytes,
+                    content_type: contentType,
+                    public: mint.public === true,
+                    part_size: session.part_size,
+                    part_count: session.part_count,
+                    parts_url: session.parts_url,
+                    complete_url: session.complete_url,
+                    abort_url: session.abort_url,
+                    expires_at: session.expires_at,
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/octet-stream' },
+                    next: 'The upload has started in parts. PUT each part n = 1..part_count to parts_url + "/" + n; every part except the last is exactly part_size bytes (at most 90 MB). Then POST complete_url; its response is the storage record. An upload not completed within 6 hours is discarded, parts included; DELETE abort_url discards it sooner.',
+                  },
+                },
+              };
+              return result;
+            }
             result = {
               status: 200,
               data: {
                 ok: true,
                 data: {
                   upload_url: mint.url,
+                  ...(mint.multipart_url ? { multipart_url: mint.multipart_url } : {}),
                   path: mint.path,
                   expires_at: mint.expires_at,
                   max_size: mint.max_size,
@@ -6518,7 +6940,10 @@ The connector reference and upload URL are temporary transports, not the durable
                   public: mint.public === true,
                   method: 'PUT',
                   headers: { 'Content-Type': mint.content_type },
-                  next: 'PUT the raw file bytes to upload_url. The PUT response is the storage record.',
+                  next: mint.multipart_url
+                    ? 'PUT the raw file bytes to upload_url. The PUT response is the storage record. One request carries at most 100 MB; a bigger file goes up in parts through multipart_url instead (see multipart).'
+                    : 'PUT the raw file bytes to upload_url. The PUT response is the storage record.',
+                  ...(mint.multipart_url ? { multipart: MULTIPART_UPLOAD_GUIDANCE } : {}),
                 },
               },
             };
@@ -6532,6 +6957,7 @@ The connector reference and upload URL are temporary transports, not the durable
             contentType,
             undefined,
             mint.max_size,
+            mint.multipart_url,
           );
           result = { status: 200, data: { ok: true, data: record } };
         } catch (error) {
@@ -6548,11 +6974,11 @@ The connector reference and upload URL are temporary transports, not the durable
     name: 'fs_read',
     description: `Get file, download file, fetch file contents, view file, cat, ls — read a file or list a directory from the project filesystem. If the path ends with \`/\` or matches a directory, returns a directory listing; otherwise returns the file content.
 
-There are two file surfaces: deployed source is read with \`project_files_list\` / \`project_file_read\`; \`fs_read\`, \`fs_write\`, and \`fs_upload\` use runtime storage via \`sw.fs\`. If you want \`src/App.tsx\` or \`api/foo.ts\`, use \`project_file_read\`, not \`fs_read\`.
+There are two file surfaces: deployed source is read with \`project_files_list\` / \`project_file_read\`; \`fs_read\`, \`fs_write\`, and \`fs_upload\` use runtime storage via \`sw.fs\`. Project source such as \`src/App.tsx\` or \`api/foo.ts\` is read with \`project_file_read\`, not \`fs_read\`.
 
 Optional \`lines\` returns only a line range from a text file as JSON with \`{ content, lines: [start, end], total_lines }\` — useful for peeking into large files without downloading them whole.
 
-For a directory listing, set \`recursive: true\` to return every descendant in one call, with an optional \`depth\` cap.
+For a directory listing, \`recursive: true\` returns every descendant in one call, with an optional \`depth\` cap.
 
 **Example:**
 
@@ -6588,12 +7014,11 @@ For a directory listing, set \`recursive: true\` to return every descendant in o
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","chatgpt","connector"],
-    protocol: { surfaceDescriptions: { connector: "Read a project file’s content. See https://somewhere.tech/docs.txt for the Somewhere file API contract (paths, visibility, signed and public URLs)." }, surfaceAnnotations: { connector: {"title":"Fs Read","readOnlyHint":true} },  oauthScopes: ['mcp'] },
+    protocol: { surfaceDescriptions: { connector: "Read a project file’s content. The Somewhere file API contract (paths, visibility, signed and public URLs) is at https://somewhere.cloud/docs.txt." }, surfaceAnnotations: { chatgpt: { destructiveHint: false, openWorldHint: false }, connector: {"title":"Fs Read","readOnlyHint":true} },  oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, authHeader } = runtime;
       let result: ToolUpstreamResult;
       {
-        const projectId = encodeURIComponent(args.project_id as string);
         let path = (args.path as string).startsWith('/')
           ? (args.path as string).slice(1)
           : (args.path as string);
@@ -6607,7 +7032,9 @@ For a directory listing, set \`recursive: true\` to return every descendant in o
           if (typeof args.depth === 'number') params.set('depth', String(args.depth));
         }
         const qs = params.toString() ? `?${params.toString()}` : '';
-        const resp = await fetcher.fetch(`https://api-internal/v1/fs/${projectId}/${path}${qs}`, {
+        let url: string;
+        try { url = internalFsUrl(args.project_id as string, path, qs); } catch (err) { return invalidInternalPath(err); }
+        const resp = await fetcher.fetch(url, {
           method: 'GET',
           headers: { 'Authorization': authHeader },
         });
@@ -6649,7 +7076,7 @@ Text files only. Capped at 2000 lines per side.
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
         path: { type: 'string', description: 'Full path to the file with leading slash.' },
-        version: { type: 'number', description: 'Archived version number to diff against. Omit for the most recent previous version.' },
+        version: { type: 'number', description: 'Archived version number to diff against. Omitted: the most recent previous version.' },
       },
       required: ['project_id', 'path'],
     },
@@ -6741,11 +7168,12 @@ Supported syntax: \`*\` (not across /), \`**\` (across /), \`?\` (one char), \`{
       const { fetcher, authHeader } = runtime;
       let result: ToolUpstreamResult;
       {
-        const projectId = encodeURIComponent(args.project_id as string);
         const path = (args.path as string).startsWith('/')
           ? (args.path as string).slice(1)
           : (args.path as string);
-        const resp = await fetcher.fetch(`https://api-internal/v1/fs/${projectId}/${path}`, {
+        let url: string;
+        try { url = internalFsUrl(args.project_id as string, path); } catch (err) { return invalidInternalPath(err); }
+        const resp = await fetcher.fetch(url, {
           method: 'DELETE',
           headers: { 'Authorization': authHeader },
         });
@@ -6759,7 +7187,7 @@ Supported syntax: \`*\` (not across /), \`**\` (across /), \`?\` (one char), \`{
   {
     definition: {
     name: 'fs_move',
-    description: `Move or rename a file or directory. Instant regardless of file size. Pass \`overwrite: true\` to atomically replace the destination if it already exists — use this instead of a separate \`fs_delete\` + \`fs_move\` pair, which can race and leave the file in an inconsistent state.
+    description: `Move or rename a file or directory. Instant regardless of file size. \`overwrite: true\` atomically replaces the destination if it already exists — unlike a separate \`fs_delete\` + \`fs_move\` pair, which can race and leave the file in an inconsistent state.
 
 **Example:**
 
@@ -6831,7 +7259,7 @@ Supported syntax: \`*\` (not across /), \`**\` (across /), \`?\` (one char), \`{
   {
     definition: {
     name: 'fs_stat',
-    description: 'Get metadata for a file or directory without downloading the contents. Returns path, name, type, size_bytes, content_type, visibility, version, created_at, and updated_at.',
+    description: 'Get metadata for a file or directory without downloading the contents. Returns path, name, type, size_bytes, content_type, visibility, version, created_at, and updated_at; a file in a declared file collection also returns collection, group (member collections) and owner_subject_id. File tools act with your developer authority over every file in the project.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -6865,9 +7293,9 @@ Supported syntax: \`*\` (not across /), \`**\` (across /), \`?\` (one char), \`{
   {
     definition: {
     name: 'fs_public_url',
-    description: `Get a public URL for a file written via fs_write. The URL is hosted on the project's subdomain at \`/storage/{path}\` and can be embedded directly as an image src, anchor href, etc. — no signing or auth.
+    description: `Get a public URL for a file written via fs_write. The URL is hosted on the project's subdomain at \`/storage/{path}\` and can be embedded directly as an image src, anchor href, etc. — no signing or auth. A file in a declared file collection takes its visibility from db/schema.ts: make_public on it answers FILE_VISIBILITY_DECLARED (docs({ topic: 'declared-files' })).
 
-Files are PRIVATE by default. Asking for a public URL does NOT silently expose a private file: a private file returns an error unless you pass \`make_public: true\` to publish it. An already-public file just returns its URL. For a time-limited link to a private file WITHOUT making it world-readable, use \`fs_signed_url\`.
+Files are PRIVATE by default. Asking for a public URL does NOT silently expose a private file: a private file returns an error unless you pass \`make_public: true\` to publish it. An already-public file just returns its URL. \`fs_signed_url\` gives a time-limited link to a private file WITHOUT making it world-readable.
 
 **Example:**
 
@@ -6897,7 +7325,7 @@ Files are PRIVATE by default. Asking for a public URL does NOT silently expose a
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","chatgpt","connector"],
-    protocol: { surfaceDescriptions: { connector: "Make a project file public and return its public URL. See https://somewhere.tech/docs.txt for the Somewhere file API contract (paths, visibility, signed and public URLs)." }, surfaceAnnotations: { connector: {"title":"Fs Public Url","readOnlyHint":false,"destructiveHint":true} },  oauthScopes: ['mcp'] },
+    protocol: { surfaceDescriptions: { connector: "Make a project file public and return its public URL. The Somewhere file API contract (paths, visibility, signed and public URLs) is at https://somewhere.cloud/docs.txt." }, surfaceAnnotations: { connector: {"title":"Fs Public Url","readOnlyHint":false,"destructiveHint":true} },  oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, authHeader } = runtime;
       let result: ToolUpstreamResult;
@@ -6993,15 +7421,18 @@ Files are PRIVATE by default. Asking for a public URL does NOT silently expose a
   {
     definition: {
     name: 'fs_search',
-    description: `Search for text across files in the project filesystem. Literal substring match (case-sensitive), returns matching file paths with line numbers and one line of context above and below each hit.
+    description: `Search the text files a project stores (source, JSON, markdown, HTML, CSS and similar; binaries are skipped). The answer's \`mode\` says how it searched:
 
-Only searches text files (source code, JSON, markdown, HTML, CSS, etc.) — skips binaries. Caps at 1 MB per file, 500 files scanned by default.
+- \`fts5\` (normal): the project's search index. Each run of ASCII letters and digits in the query matches the start of a word, ignoring case. Results are \`{ path, snippet }\`, best first. Each write indexes the first ${FS_INDEX_MAX} characters of a text file; when the index is built for files already stored, files over ${FS_INDEX_MAX} bytes are skipped.
+- \`scan\` (when the index is not ready or falls back, and for preview files): a literal, case-sensitive match, line by line, over at most \`max_files\` files, skipping files over ${FS_SCAN_MAX_FILE_BYTES} bytes. Results are \`{ path, line, snippet, before, after }\` and the answer adds \`files_scanned\`. A production scan schedules index backfill.
+
+\`truncated: true\` means the answer reached \`limit\`, so there may be more. A 503 \`FILE_INDEX_UNAVAILABLE\` means the index needs recovery; a later search succeeds once it recovers.
 
 **Example:**
 
 \`\`\`json
-// Find every place we import the auth helper:
-{ "project_id": "my-saas", "path": "/", "query": "from './auth'" }
+// Files that mention the auth client:
+{ "project_id": "my-saas", "path": "/", "query": "createSomewhereAuth" }
 
 // Scoped to a subtree:
 { "project_id": "my-saas", "path": "/src/api/", "query": "TODO" }
@@ -7011,9 +7442,9 @@ Only searches text files (source code, JSON, markdown, HTML, CSS, etc.) — skip
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
         path: { type: 'string', description: 'Directory to search under (defaults to "/"). Trailing slash optional.' },
-        query: { type: 'string', description: 'Literal substring to search for. Case-sensitive.' },
-        limit: { type: 'number', description: 'Max matches to return (default 50, cap 500).' },
-        max_files: { type: 'number', description: 'Max files to scan (default 500, cap 2000).' },
+        query: { type: 'string', description: `Text to search for, up to ${FS_SEARCH_QUERY_MAX_CHARS} characters. Indexed search matches words, ignoring case; the scan fallback matches it literally and case-sensitively.` },
+        limit: { type: 'number', description: `Max matches to return (default ${FS_SEARCH_LIMIT_DEFAULT}, cap ${FS_SEARCH_LIMIT_MAX}).` },
+        max_files: { type: 'number', description: `Max files the scan fallback reads (default ${FS_SEARCH_MAX_FILES_DEFAULT}, cap ${FS_SEARCH_MAX_FILES_MAX}). Not used by indexed search.` },
       },
       required: ['project_id', 'query'],
     },
@@ -7087,7 +7518,7 @@ Literal string match (not regex). Only works on text files.
   {
     definition: {
     name: 'fs_signed_url',
-    description: `Mint a short-lived signed URL for a file. The URL is fetchable without an API key — the token IS the auth. Use for email attachments, image previews, "download once" handoffs to recipients who don't have a developer key.
+    description: `Mint a short-lived signed URL for a file. The URL is fetchable without an API key — the token IS the auth. It suits email attachments, image previews, and "download once" handoffs to recipients without a developer key.
 
 \`expires_in\` is in seconds, min 60, max 604800 (7 days), default 3600 (1 hour). After expiry the URL returns 403.
 
@@ -7095,7 +7526,7 @@ Literal string match (not regex). Only works on text files.
 
 \`\`\`json
 { "project_id": "my-saas", "path": "/uploads/invoice-2026.pdf", "expires_in": 86400 }
-// Returns: { "url": "https://api.somewhere.tech/v1/fs-signed/eyJ...", "expires_at": "2026-05-13T..." }
+// Returns: { "url": "https://api.somewhere.cloud/v1/fs-signed/eyJ...", "expires_at": "2026-05-13T..." }
 \`\`\``,
     inputSchema: {
       type: 'object',
@@ -7114,7 +7545,7 @@ Literal string match (not regex). Only works on text files.
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","chatgpt","connector"],
-    protocol: { surfaceDescriptions: { connector: "Create a temporary signed link granting access to a project file. See https://somewhere.tech/docs.txt for the Somewhere file API contract (paths, visibility, signed and public URLs)." }, surfaceAnnotations: { connector: {"title":"Fs Signed Url","readOnlyHint":false,"destructiveHint":true} },  oauthScopes: ['mcp'] },
+    protocol: { surfaceDescriptions: { connector: "Create a temporary signed link granting access to a project file. The Somewhere file API contract (paths, visibility, signed and public URLs) is at https://somewhere.cloud/docs.txt." }, surfaceAnnotations: { chatgpt: { openWorldHint: true }, connector: {"title":"Fs Signed Url","readOnlyHint":false,"destructiveHint":true} },  oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, authHeader } = runtime;
       let result: ToolUpstreamResult;
@@ -7130,9 +7561,9 @@ Literal string match (not regex). Only works on text files.
   {
     definition: {
     name: 'fs_integrity_check',
-    description: `Scan a project's files for orphan metadata — rows pointing at a file blob that no longer exists. Returns the list of orphans. Pass \`auto_clean: true\` to delete the orphan rows in the same call.
+    description: `Scan a project's files for orphan metadata — rows pointing at a file blob that no longer exists. Returns the list of orphans. \`auto_clean: true\` deletes the orphan rows in the same call.
 
-Use after suspected partial-failure incidents or as a periodic sweep. Returns counts and a sample of orphan paths.
+It suits suspected partial-failure incidents or a periodic sweep. Returns counts and a sample of orphan paths.
 
 **Example:**
 
@@ -7182,34 +7613,18 @@ Use after suspected partial-failure incidents or as a periodic sweep. Returns co
   {
     definition: {
     name: 'env',
-    description: `Environment variables, secrets, env vars, config, API keys, .env, settings — get/set/delete project environment variables. Set: provide key + value. Delete: provide key + \`delete: true\`. List: provide only project_id. Values are encrypted at rest and never exposed in list responses.
-
-⚠️ **A \`VITE_\`/\`REACT_APP_\` prefix makes the value PUBLIC.** Those names are compiled into the project's browser JavaScript as plain text, so every visitor can read them — that is what the prefix means to Vite/CRA. Pass \`public: true\` for values that are genuinely public (API base URL, Supabase URL or anon/publishable key, Stripe *publishable* key). NEVER give a real secret one of those names: \`VITE_STRIPE_SECRET\` is a published secret. Keep secrets prefix-free and read them as \`sw.env.KEY\` inside a function. \`public: true\` records that the exposure is intended — it does NOT withhold anything: a prefixed value is compiled into browser code whether or not it is marked, and leaving it unmarked only means you get warned about it at set time and on every deploy. Renaming without the prefix is the only thing that keeps a value out of the browser. List results include \`browser_exposed\` (the name publishes this value) and \`visibility\` (\`public\` once the owner confirmed that is intended).
-
-⏱ **Takes effect on next \`project_deploy\`, not next request.** Env vars are baked into the function bundle at deploy time — and, for \`VITE_\`/\`REACT_APP_\` names, into the browser bundle. Running functions keep the old value until you redeploy.
-
-**Example:**
-
-\`\`\`json
-// Set:
-{ "project_id": "my-saas", "key": "STRIPE_SECRET_KEY", "value": "sk_live_..." }
-
-// Delete:
-{ "project_id": "my-saas", "key": "OLD_KEY", "delete": true }
-
-// List:
-{ "project_id": "my-saas" }
-// Returns: { "project_id": "...", "keys": [{ "key": "STRIPE_SECRET_KEY", "scope": "all", "visibility": "server", "browser_exposed": false, "created_at": "2026-04-20T..." }, ...] }
-\`\`\``,
+    description: `Environment variables, secrets, config and integration keys. It sets with project_id, key and value; deletes with key and delete:true; lists with project_id only. Values are encrypted and omitted from list results. New values are private for server functions by default. A VITE_ or REACT_APP_ prefix alone never publishes a value. A public value reaches browser code as a prefixed name saved with public:true, after a deploy. Recognized secret credentials, including test credentials, cannot be marked public. Server functions read sw.env.NAME. Browser code reads import.meta.env.VITE_NAME or process.env.REACT_APP_NAME only for explicitly public values. A private browser reference refuses compilation. Provider and purpose are optional descriptive labels, not access controls. Saving a value or changing visibility takes effect on the next deploy; already published browser assets can retain earlier public values. List and save responses contain exact references and effective visibility, never values. A project's combined environment values have a 5,120 byte limit.`,
     inputSchema: {
       type: 'object',
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
         key: { type: 'string', description: 'Variable name, e.g. "STRIPE_SECRET_KEY"' },
         value: { type: 'string', description: 'Variable value (will be encrypted). Required when setting.' },
-        scope: { type: 'string', enum: ['all', 'dev', 'prod'], description: "Optional scope. 'all' (default) applies to the live project and any explicitly enabled preview. 'prod' restricts the value to live. 'dev' is advanced and requires the optional Pro/Scale + enabled preview capability." },
-        delete: { type: 'boolean', description: 'Set to true to delete the variable specified by key.' },
-        public: { type: 'boolean', description: "Explicit consent for this value to be compiled into the project's PUBLIC browser JavaScript. Only meaningful for VITE_/REACT_APP_ names (those are the ones the compiler inlines). Default false = server-side only. Set true for values any visitor may read (API base URL, Supabase URL / anon or publishable key, Stripe publishable key). Never true for a real secret." },
+        scope: { type: 'string', enum: ['all', 'dev', 'prod'], description: "Optional scope. 'all' (default) applies to live and any enabled preview. 'prod' restricts the value to live. 'dev' requires hosted preview access for signed-in accounts on every plan." },
+        delete: { type: 'boolean', description: 'true deletes the variable specified by key.' },
+        public: { type: 'boolean', description: 'Explicit browser visibility. New values default private; omitted on rotation preserves current visibility. Requires a VITE_/REACT_APP_ name and redeploy to appear in browser code. Recognized credentials cannot be public.' },
+        provider: { type: 'string', description: 'Optional non-secret integration label (max 64 characters). Omitted: retained; empty string clears.' },
+        purpose: { type: 'string', description: 'Optional non-secret description (max 240 characters). Omitted: retained; empty string clears.' },
       },
       required: ['project_id'],
     },
@@ -7242,6 +7657,8 @@ Use after suspected partial-failure incidents or as a periodic sweep. Returns co
             // so a plain value rotation cannot silently un-publish a value a
             // project depends on. (tsk_20b7f5f9)
             ...(args.public !== undefined ? { public: args.public } : {}),
+            ...(args.provider !== undefined ? { provider: args.provider } : {}),
+            ...(args.purpose !== undefined ? { purpose: args.purpose } : {}),
           });
         } else {
           // List env vars
@@ -7256,7 +7673,7 @@ Use after suspected partial-failure incidents or as a periodic sweep. Returns co
   {
     definition: {
     name: 'dev_env_init',
-    description: `**Advanced — \`somewhere preview\` only.** Initialize an isolated backend for this project. This requires a Pro or Scale plan plus explicit platform enablement; otherwise it returns \`CLOUD_DEV_NOT_ENABLED\` before creating resources. The fork runs asynchronously; poll with \`dev_env_status\` until \`dev_db_status: 'ready'\`. Per-table row cap is 50,000 for the fork — larger tables truncate (returned in \`truncatedTables\`).
+    description: `**Advanced — \`somewhere preview\` only.** Initialize an isolated backend for this project. This requires hosted preview access for signed-in accounts on every plan; otherwise it returns \`CLOUD_DEV_NOT_ENABLED\` before creating resources. The fork runs asynchronously; \`dev_env_status\` reports \`dev_db_status: 'ready'\` when done. The database copy does not truncate rows: a table over 50,000 rows makes the copy fail. \`dev_env_status\` reports a failed copy in \`dev_db_error\`.
 
 \`\`\`json
 // Init dev backend (one-time):
@@ -7289,7 +7706,7 @@ Use after suspected partial-failure incidents or as a periodic sweep. Returns co
   {
     definition: {
     name: 'dev_env_refresh',
-    description: `**Advanced — \`somewhere preview\` only.** Re-fork production into the existing isolated preview database. Requires a Pro or Scale plan plus explicit platform enablement. Async — poll \`dev_env_status\`; the isolated environment must already exist.`,
+    description: `**Advanced — \`somewhere preview\` only.** Re-fork production into the existing isolated preview database. Requires hosted preview access for signed-in accounts on every plan. Async — \`dev_env_status\` reports progress; the isolated environment must already exist.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -7317,7 +7734,7 @@ Use after suspected partial-failure incidents or as a periodic sweep. Returns co
   {
     definition: {
     name: 'dev_env_status',
-    description: `**Advanced — \`somewhere preview\` only.** Return isolated-environment status. Requires a Pro or Scale plan plus explicit platform enablement. Fields: \`has_dev_db\`, \`dev_db_status\`, \`dev_db_initialized_at\`, and \`dev_db_error\`.`,
+    description: `**Advanced — \`somewhere preview\` only.** Return isolated-environment status. Requires hosted preview access for signed-in accounts on every plan. Fields: \`has_dev_db\`, \`dev_db_status\`, \`dev_db_initialized_at\`, and \`dev_db_error\`.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -7346,9 +7763,9 @@ Use after suspected partial-failure incidents or as a periodic sweep. Returns co
   {
     definition: {
     name: 'email_send',
-    description: `**Adding a welcome, receipt, status, or alert email to an app?** \`email_send\` sends one transactional email to one recipient on every plan. Omit \`from\` to use the platform-managed sender immediately; the project name appears as the sender label. Pass \`from\` to use your own verified sender domain. Domains bought through us or connected with our nameservers are set up automatically; for a domain you host elsewhere, verify it once in Settings → Domains. A caller cannot explicitly name a platform domain.
+    description: `**Adding a welcome, receipt, status, or alert email to an app?** \`email_send\` sends one transactional email to one recipient on every plan. Without \`from\`, the platform-managed sender is used immediately; the project name appears as the sender label. \`from\` selects a verified sender domain of the app. Domains bought through us or connected with our nameservers are set up automatically; a domain hosted elsewhere is verified once in Settings → Domains. A caller cannot explicitly name a platform domain.
 
-The platform-managed sender is transactional-only. Add a verified sender domain for your own branding and marketing email. Outbound transactional email is available on Free, Builder, Pro, Scale, and Enterprise. The plan's email allowance and send rate limit apply either way; read current limits from /v1/pricing. Provide \`html\` or \`text\` (or both). \`reply_to\` is optional.
+The platform-managed sender is transactional-only. A verified sender domain carries the branding of the app itself and its marketing email. Outbound transactional email is available on Free, Builder, Pro, Scale, and Enterprise. The plan's email allowance and send rate limit apply either way; current limits are at /v1/pricing. It takes \`html\` or \`text\` (or both). \`reply_to\` is optional.
 
 **Example:**
 
@@ -7422,7 +7839,7 @@ The platform-managed sender is transactional-only. Add a verified sender domain 
   {
     definition: {
     name: 'email_status',
-    description: `Look up the safe delivery timeline for an email previously sent by a project or issued by the platform for that project's app auth. Pass the tracking_id (same as the id returned from email_send or an authorized project workflow). Returns origin, source, auth_purpose when recorded, every lifecycle event — sent, delivered, opened, clicked, bounced, complained — in order, and event_counts. Message bodies, auth codes, credential links, and provider payloads are not returned. Historical rows without trusted sent provenance report origin/source as unknown. An opened event may come from an image proxy or automated scanner; it does not prove a person read the email or signed in. Missing events mean unknown, and this tool does not imply that open tracking is active.
+    description: `Look up the safe delivery timeline for an email previously sent by a project or issued by the platform for that project's app auth. It takes the tracking_id (same as the id returned from email_send or an authorized project workflow). Returns origin, source, auth_purpose when recorded, every lifecycle event — sent, delivered, opened, clicked, bounced, complained — in order, and event_counts. Message bodies, auth codes, credential links, and provider payloads are not returned. Historical rows without trusted sent provenance report origin/source as unknown. An opened event can come from an image proxy or automated scanner as well as a person, so it is an image-fetch event; reading and sign-in are separate actions. Missing events mean unknown, and this tool does not imply that open tracking is active.
 
 **Example:**
 
@@ -7457,7 +7874,7 @@ The platform-managed sender is transactional-only. Add a verified sender domain 
   {
     definition: {
     name: 'email_events_list',
-    description: `List recent project mail and platform-issued app auth mail recorded for an authorized project. Each row includes origin, source, auth_purpose when recorded, latest delivery status (sent / delivered / opened / clicked / bounced / complained / delivery_delayed), and event_counts. Historical rows without trusted sent provenance report origin/source as unknown. Use the timeline for delivery diagnostics: an opened event may come from an image proxy or automated scanner and does not prove a human read the email or signed in; missing events mean unknown, and this tool does not imply that open tracking is active. For a specific message's safe timeline, follow up with email_status({ id: tracking_id }).`,
+    description: `List recent project mail and platform-issued app auth mail recorded for an authorized project. Each row includes origin, source, auth_purpose when recorded, latest delivery status (sent / delivered / opened / clicked / bounced / complained / delivery_delayed), and event_counts. Historical rows without trusted sent provenance report origin/source as unknown. The timeline supports delivery diagnostics: an opened event can come from an image proxy or automated scanner as well as a person, so it is an image-fetch event; reading and sign-in are separate actions; missing events mean unknown, and this tool does not imply that open tracking is active. email_status({ id: tracking_id }) has a specific message's safe timeline.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -7491,7 +7908,7 @@ The platform-managed sender is transactional-only. Add a verified sender domain 
   {
     definition: {
     name: 'email_bounces_list',
-    description: `Deduplicated list of recipient addresses that have bounced or complained (spam-marked) in a project. Use this to scrub a mailing list before sending — "kept blasting a dead address" is the most common email bug we see. Returns one row per address with last_status, last_at, and occurrences. Window defaults to 30 days (max 365). Pair with your own send loop: skip any address that appears here.`,
+    description: `Deduplicated list of recipient addresses that have bounced or complained (spam-marked) in a project. It supports scrubbing a mailing list before sending — repeated sends to a dead address are the most common email problem. Returns one row per address with last_status, last_at, and occurrences. Window defaults to 30 days (max 365). A send loop skips any address that appears here.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -7524,13 +7941,38 @@ The platform-managed sender is transactional-only. Add a verified sender domain 
   },
   {
     definition: {
-    name: 'email_test_inbox',
-    description: `Read rendered auth messages sent to one address in a project's controlled test inbox. Use an address shaped like \`robot@<project-subdomain>.test.somewhere.site\` when testing passwordless sign-in. These messages are stored instead of being delivered, and each row includes \`magic_link\` when the auth template supplied one. Real recipient mail never appears here.`,
+    name: 'email_reputation',
+    description: `Is this project's email paused for a high bounce or spam-report rate? Every project sends through the platform's shared sender, so a project whose rolling 24-hour bounce or spam-report rate crosses the published line is paused automatically: its sends (auth email included) answer EMAIL_PROJECT_PAUSED until the rate recovers, then resume on their own. Returns { state: 'healthy'|'paused', reason, paused_at, resumed_at, window: { hours, sent, bounced, complained, bounce_rate, complaint_rate }, thresholds }. email_bounces_list shows which addresses caused it.`,
     inputSchema: {
       type: 'object',
       properties: {
         project_id: { type: 'string', description: 'Project ID, subdomain, or slug.' },
-        address: { type: 'string', description: 'Exact project-owned test address to read.' },
+      },
+      required: ['project_id'],
+    },
+  },
+    annotations: { readOnlyHint: true, idempotentHint: true },
+    group: 'email',
+    core: false,
+    visibility: 'authenticated',
+    paid: false,
+    surfaces: ["full"],
+    execute: async (runtime, args) => {
+      const { fetcher, authHeader } = runtime;
+      const params = new URLSearchParams();
+      params.set('project_id', String(args.project_id));
+      return callAPI(fetcher, 'GET', `/v1/email/reputation?${params.toString()}`, authHeader);
+    },
+  },
+  {
+    definition: {
+    name: 'email_test_inbox',
+    description: `Read rendered messages sent to one address in a project's controlled test inbox: auth email and the project's own \`sw.email.send\` to that address (which returns status \`captured\`). Passwordless sign-in tests use an address shaped like \`robot@<project-subdomain>.test.somewhere.site\`. These messages are stored instead of being delivered, and each row includes \`magic_link\` when the auth template supplied one and \`verification_code\` when the message carries a code (email verification, sign-in code). Real recipient mail never appears here.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string', description: 'Project ID, subdomain, or slug.' },
+        address: { type: 'string', description: 'Exact project-owned test address to read, or an address at a reserved domain such as example.com whose auth email was held here.' },
         limit: { type: 'number', description: 'Newest messages to return (default 20, max 100).' },
       },
       required: ['project_id', 'address'],
@@ -7556,12 +7998,12 @@ The platform-managed sender is transactional-only. Add a verified sender domain 
     name: 'managed_email_send',
     description: `Compose one managed email and send it to either an explicit recipient list or a saved contact segment. A segment is \`{ "tag": "..." }\` or \`{ "all": true }\`. Every recipient gets a distinct idempotency claim derived from \`idempotency_key\`, so retrying the same batch does not send duplicates. The result reports every recipient as sent, suppressed, preference-blocked, failed, or queued for a rate-limited later minute.
 
-Marketing email requires \`topic\`; recipient preferences, suppression, and the unsubscribe footer are enforced by the managed email sender. Provide \`html\` or \`text\` (or both).`,
+Marketing email requires \`topic\`; recipient preferences, suppression, and the unsubscribe footer are enforced by the managed email sender. It takes \`html\` or \`text\` (or both).`,
     inputSchema: {
       type: 'object',
       properties: {
         project_id: { type: 'string', description: 'Project ID, subdomain, slug, or default.' },
-        recipients: { type: 'array', maxItems: 1000, items: { type: 'string' }, description: 'Explicit recipient email addresses. Use this or segment, not both.' },
+        recipients: { type: 'array', maxItems: 1000, items: { type: 'string' }, description: 'Explicit recipient email addresses. Mutually exclusive with segment.' },
         segment: {
           type: 'object',
           description: 'Saved contact audience: exactly one of tag or all: true.',
@@ -7578,7 +8020,7 @@ Marketing email requires \`topic\`; recipient preferences, suppression, and the 
         topic: { type: 'string', enum: ['project-updates', 'milestones', 'announcements', 'founder-notes'], description: 'Required for marketing email.' },
         subtype: { type: 'string', description: 'Optional reporting subtype.' },
         template_key: { type: 'string', description: 'Optional reporting template key.' },
-        idempotency_key: { type: 'string', description: 'Stable key for this composed batch. Reuse it only when retrying the identical send.' },
+        idempotency_key: { type: 'string', description: 'Stable key for this composed batch. The same key belongs only to a retry of the identical send.' },
       },
       required: ['project_id', 'from', 'subject', 'idempotency_key'],
     },
@@ -7664,15 +8106,15 @@ Marketing email requires \`topic\`; recipient preferences, suppression, and the 
   {
     definition: {
     name: 'ai_complete',
-    description: `Call a platform AI model for a project. Start with ai_catalog for current models and prices; docs({topic:"sw.ai"}) explains the full contract.
+    description: `Call a platform AI model for a project. ai_catalog lists current models and prices; docs({topic:"sw.ai"}) explains the full contract.
 
-Omit both provider and model for free gpt-6-luna: 10 requests/minute and 200/day per project owner on every plan, 8,192 estimated input tokens including system/tools/history, and at most 1,024 output tokens. Standard service, reasoning disabled, 20-second provider deadline including the body. No paid fallback, BYOK charge, or automatic paid repair.
+With neither provider nor model, the call uses free gpt-6-luna: 10 requests/minute and 200/day per project owner on every plan, 8,192 estimated input tokens including system/tools/history, and at most 1,024 output tokens. Standard service, reasoning disabled, 20-second provider deadline including the body. No paid fallback, BYOK charge, or automatic paid repair.
 
-Explicit provider/model selection uses that model's normal billing path, including explicitly selecting gpt-6-luna. Included workers-ai models retain their separate limits. Read ai_catalog instead of guessing model IDs.
+Explicit provider/model selection uses that model's normal billing path, including explicitly selecting gpt-6-luna. Included workers-ai models retain their separate limits. ai_catalog lists the valid model IDs.
 
-messages is a JSON-stringified array of {role,content}. For text use result.text; result.content contains text/tool_use blocks. With response_schema, inspect result.parsed and result.parse_error. Paid OpenAI/Anthropic responses may report pending cost: unknown is not zero, and you should not repeat a successful model call to settle accounting.
+messages is a JSON-stringified array of {role,content}. For text use result.text; result.content contains text/tool_use blocks. With response_schema, the result carries result.parsed and result.parse_error. Paid OpenAI/Anthropic responses may report pending cost: unknown is not zero, and repeating a successful model call does not settle accounting.
 
-Tool-capable models accept Anthropic-shaped tool definitions and tool_result messages. Pass a caller-chosen conversation_id together with subject_type and subject_id to retain history under that scope; reuse that caller key on subsequent ai_complete calls. Use the same scope with ai_conversation_list, ai_conversation_delete, and ai_conversation_fork. Later turns send only new messages. History works across supported providers. Free-default overflow truncates history for the request and never runs paid summarization. For larger conversations and explicit paid compaction read docs({topic:"sw.ai"}).
+Tool-capable models accept Anthropic-shaped tool definitions and tool_result messages. A caller-chosen conversation_id together with subject_type and subject_id retains history under that scope; that caller key continues the conversation on later ai_complete calls. ai_conversation_list, ai_conversation_delete, and ai_conversation_fork take the same scope. Later turns send only new messages. History works across supported providers. Free-default overflow truncates history for the request and never runs paid summarization. For larger conversations and explicit paid compaction read docs({topic:"sw.ai"}).
 
 Structured output: pass response_schema as a JSON-stringified JSON Schema, without caller tools or streaming.`,
     inputSchema: {
@@ -7687,12 +8129,12 @@ Structured output: pass response_schema as a JSON-stringified JSON Schema, witho
         tools: { type: 'string', description: 'Optional JSON-stringified Anthropic tool definitions. Passed through unchanged.' },
         tool_choice: { type: 'string', description: 'Optional JSON-stringified Anthropic tool_choice directive (e.g. {"type":"auto"} or {"type":"tool","name":"fs_search"}).' },
         response_schema: { type: 'string', description: 'Optional JSON-stringified JSON Schema. The response exposes parsed and parse_error. This field cannot combine with tools or stream; the free default makes no repair request.' },
-        conversation_id: { type: 'string', description: 'Optional caller-chosen chat key (any string up to 128 chars). Reuse this key on subsequent ai_complete calls to load prior turns. To read, delete, or fork the saved record, first call ai_conversation_list without conversation_id and use its returned id.' },
-        subject_type: { type: 'string', description: "Required with conversation_id. Conversation owner type; use 'app_user' for signed-in app users. Reuse the same scope for conversation reads." },
-        subject_id: { type: 'string', description: 'Required with conversation_id. Conversation owner id. Reuse the same scope for conversation reads.' },
+        conversation_id: { type: 'string', description: 'Optional caller-chosen chat key (any string up to 128 chars). The same key on later ai_complete calls loads prior turns. Reading, deleting or forking the saved record takes the id that ai_conversation_list returns when called without conversation_id.' },
+        subject_type: { type: 'string', description: "Required with conversation_id. Conversation owner type; 'app_user' is for signed-in app users. Conversation reads take the same scope." },
+        subject_id: { type: 'string', description: 'Required with conversation_id. Conversation owner id. Conversation reads take the same scope.' },
         history_max_messages: { type: 'number', description: 'Optional. Cap on the number of stored history messages prepended on this call. Oldest dropped first. Default 50. Only applies when conversation_id is set.' },
         history_max_tokens: { type: 'number', description: 'Optional retained-history token budget (estimated), default 32000. New messages/system are counted against the overall input cap too.' },
-        compaction: { type: 'string', description: 'Optional truncate (default) or summarize. Free default always truncates; explicit paid summarization can incur an additional model charge. See docs sw.ai.' },
+        compaction: { type: 'string', description: 'Optional truncate (default) or summarize. Free default always truncates; explicit paid summarization can incur an additional model charge. Details: docs sw.ai.' },
       },
       required: ['project_id', 'messages'],
     },
@@ -7716,7 +8158,7 @@ Structured output: pass response_schema as a JSON-stringified JSON Schema, witho
           return { status: 400, data: {
             ok: false,
             error: 'VALIDATION_ERROR',
-            message: 'ai_complete requires both subject_type and subject_id when conversation_id is supplied. Use the same scope with ai_conversation_list, ai_conversation_delete, and ai_conversation_fork.',
+            message: 'ai_complete requires both subject_type and subject_id when conversation_id is supplied. ai_conversation_list, ai_conversation_delete, and ai_conversation_fork take the same scope.',
           } };
         }
         const messages = parseJsonArg(args.messages, 'messages');
@@ -7754,14 +8196,14 @@ Structured output: pass response_schema as a JSON-stringified JSON Schema, witho
   {
     definition: {
     name: 'ai_conversation_list',
-    description: 'List the saved AI conversations for one subject, or fetch one with its messages. subject_type and subject_id are required so conversation history never falls back to a project-wide view. Omit conversation_id to list (most-recently-updated first; each row includes id, created_at, updated_at, message_count, summarized_message_count, and summary_updated_at). Pass conversation_id to fetch that single conversation — returns its summary (rolling text from compaction:"summarize", null otherwise), summary_updated_at, and the message log in chronological order. By default a fetch returns only live (non-summarized) messages, matching what the model sees on the next call; pass include_summarized:true to also see rows folded into the summary.',
+    description: 'List the saved AI conversations for one subject, or fetch one with its messages. subject_type and subject_id are required so conversation history never falls back to a project-wide view. Without conversation_id it lists (most-recently-updated first; each row includes id, created_at, updated_at, message_count, summarized_message_count, and summary_updated_at). With conversation_id it fetches that single conversation — returns its summary (rolling text from compaction:"summarize", null otherwise), summary_updated_at, and the message log in chronological order. By default a fetch returns only live (non-summarized) messages, matching what the model sees on the next call; include_summarized:true also returns rows folded into the summary.',
     inputSchema: {
       type: 'object',
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
-        subject_type: { type: 'string', description: "Conversation owner type. Use 'app_user' for signed-in app users." },
+        subject_type: { type: 'string', description: "Conversation owner type. 'app_user' is for signed-in app users." },
         subject_id: { type: 'string', description: 'Conversation owner id. The server applies this scope to both list and single-conversation reads.' },
-        conversation_id: { type: 'string', description: 'Optional. Pass a saved record id returned by ai_conversation_list to fetch that conversation with its messages. Omit to list all conversations.' },
+        conversation_id: { type: 'string', description: 'Optional. A saved record id returned by ai_conversation_list fetches that conversation with its messages. Omitted: all conversations are listed.' },
         include_summarized: { type: 'boolean', description: 'Optional. Only applies when fetching one conversation: when true, also returns messages folded into the summary (the full transcript). Default false.' },
         limit: { type: 'number', description: 'Optional. Only applies when listing. Max conversations to return. Default 50, max 200.' },
       },
@@ -7806,7 +8248,7 @@ Structured output: pass response_schema as a JSON-stringified JSON Schema, witho
       type: 'object',
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
-        subject_type: { type: 'string', description: "Conversation owner type. Use 'app_user' for signed-in app users." },
+        subject_type: { type: 'string', description: "Conversation owner type. 'app_user' is for signed-in app users." },
         subject_id: { type: 'string', description: 'Conversation owner id.' },
         conversation_id: { type: 'string', description: 'The saved record id returned by ai_conversation_list.' },
       },
@@ -7835,16 +8277,16 @@ Structured output: pass response_schema as a JSON-stringified JSON Schema, witho
   {
     definition: {
     name: 'ai_conversation_fork',
-    description: 'Branch one subject-owned AI conversation under a new id without losing the original. subject_type and subject_id are required and rechecked against the source row. Use for "regenerate from this point" or "what if I asked differently" UIs. Pass up_to_message_id (the numeric id from ai_conversation_list messages[]) to truncate the copy at that message inclusive; omit to copy the full history. Returns 404 if the source is missing or belongs to another subject, 409 if the new id is already in use.',
+    description: 'Branch one subject-owned AI conversation under a new id without losing the original. subject_type and subject_id are required and rechecked against the source row. It backs "regenerate from this point" or "what if I asked differently" UIs. up_to_message_id (the numeric id from ai_conversation_list messages[]) truncates the copy at that message inclusive; omitted, the full history is copied. Returns 404 if the source is missing or belongs to another subject, 409 if the new id is already in use.',
     inputSchema: {
       type: 'object',
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
-        subject_type: { type: 'string', description: "Conversation owner type. Use 'app_user' for signed-in app users." },
+        subject_type: { type: 'string', description: "Conversation owner type. 'app_user' is for signed-in app users." },
         subject_id: { type: 'string', description: 'Conversation owner id.' },
         conversation_id: { type: 'string', description: 'The source record id returned by ai_conversation_list.' },
         new_conversation_id: { type: 'string', description: 'The new id for the forked copy. 1-128 chars; must differ from the source.' },
-        up_to_message_id: { type: 'number', description: 'Optional. Numeric message id (from ai_conversation_list with a conversation_id) to truncate the copy at, inclusive. Omit to copy the full history.' },
+        up_to_message_id: { type: 'number', description: 'Optional. Numeric message id (from ai_conversation_list with a conversation_id) to truncate the copy at, inclusive. Omitted: the full history is copied.' },
       },
       required: ['project_id', 'subject_type', 'subject_id', 'conversation_id', 'new_conversation_id'],
     },
@@ -7874,7 +8316,7 @@ Structured output: pass response_schema as a JSON-stringified JSON Schema, witho
   {
     definition: {
     name: 'ai_embed',
-    description: 'Need custom semantic similarity, clustering, or recommendation math? ai_embed turns text into vectors you control. For a managed FAQ/catalog/RAG index, prefer search_upsert instead — it embeds and indexes content for you. Returns an array of float vectors. Free via provider:"workers-ai" (bge-base-en-v1.5, bge-large-en-v1.5, bge-small-en-v1.5, qwen3-embedding-0.6b, embeddinggemma-300m). Pass one string or up to 100 strings. No activation required for free models. Rate limits: Free tier 10/min and 200/day; Builder tier 200/min and 10,000/day.',
+    description: 'Need custom semantic similarity, clustering, or recommendation math? ai_embed turns text into vectors you control. For a managed FAQ/catalog/RAG index, search_upsert is the managed path — it embeds and indexes content for you. Returns an array of float vectors. Free via provider:"workers-ai" (bge-base-en-v1.5, bge-large-en-v1.5, bge-small-en-v1.5, qwen3-embedding-0.6b, embeddinggemma-300m). It accepts one string or up to 100 strings. No activation required for free models. Rate limits: Free tier 10/min and 200/day; Builder tier 200/min and 10,000/day.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -7921,9 +8363,9 @@ Structured output: pass response_schema as a JSON-stringified JSON Schema, witho
   {
     definition: {
     name: 'job_create',
-    description: `**Will work outlive the user request, need retries, or need a status later?** \`job_create\` queues a durable background job. The platform POSTs the payload to your handler URL and retries on failure (at-least-once, up to 5 attempts with exponential backoff). Make handlers idempotent.
+    description: `**Will work outlive the user request, need retries, or need a status later?** \`job_create\` queues a durable background job. The platform POSTs the payload to your handler URL and retries on failure (at-least-once, up to 5 attempts with exponential backoff). Handlers are expected to be idempotent.
 
-Use this for work that shouldn't block a user request: image processing, report generation, outbound email batches, webhook deliveries.
+It suits work that should not block a user request: image processing, report generation, outbound email batches, webhook deliveries. \`run_at\` with an ISO-8601 time and explicit time zone schedules a future start. The job reports \`scheduled\` while waiting and reserves a slot in the account's job limit; cancel it to free that slot. It starts at or after that time.
 
 **Example:**
 
@@ -7939,12 +8381,13 @@ Use this for work that shouldn't block a user request: image processing, report 
     inputSchema: {
       type: 'object',
       properties: {
-        idempotency_key: { type: 'string', maxLength: 200, description: 'Stable key for one logical creation. Reuse it with identical arguments after a lost response; use a new key for independent work.' },
+        idempotency_key: { type: 'string', maxLength: 200, description: 'Stable key for one logical creation. The same key with identical arguments is safe after a lost response; independent work takes a new key.' },
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
         handler: { type: 'string', description: 'Full https:// URL. The platform POSTs the payload here. Usually one of your own /api/... function routes.' },
         payload: { type: ['string', 'object'], description: 'JSON string or object — becomes the POST body your handler receives.' },
         webhook_url: { type: 'string', description: 'Optional https:// URL — platform POSTs {job_id, status, result} here when the job reaches a terminal state.' },
-        timeout_seconds: { type: 'number', description: 'Max wall-clock seconds per attempt. Default 300. Max 1800.' },
+        timeout_seconds: { type: 'number', description: "How long the platform waits for the handler, in seconds. Default 300, max 1800; a deadline of 271-300 s, or any deadline in a preview run, is waited for at most 270 s. When it passes the job fails with JOB_TIMEOUT and is not sent again; the handler may still have been running." },
+        run_at: { type: 'string', maxLength: 40, description: 'Optional earliest start in ISO-8601 with an explicit time zone, for example 2026-10-05T09:00:00Z. Must be future-dated for a new job. Omitted: starts now.' },
       },
       required: ['project_id', 'handler'],
     },
@@ -7969,6 +8412,7 @@ Use this for work that shouldn't block a user request: image processing, report 
           payload,
           webhook_url: args.webhook_url,
           timeout_seconds: args.timeout_seconds,
+          run_at: args.run_at,
         });
         return result;
 
@@ -7978,7 +8422,7 @@ Use this for work that shouldn't block a user request: image processing, report 
   {
     definition: {
     name: 'job_get',
-    description: `Get background job details. Pass a \`job_id\` to get one job, or pass \`project_id\` (without job_id) to list recent jobs. Optionally filter by status.
+    description: `Get background job details. A \`job_id\` returns one job; \`project_id\` (without job_id) lists recent jobs. Optionally filter by status.
 
 **Example:**
 
@@ -7994,7 +8438,7 @@ Use this for work that shouldn't block a user request: image processing, report 
       properties: {
         job_id: { type: 'string', description: 'The job ID. If provided, returns details for this single job.' },
         project_id: { type: 'string', description: "Optional — filter to one project. Accepts UUID, subdomain, or 'default'." },
-        status: { type: 'string', description: 'Optional — queued | running | complete | failed | cancelled' },
+        status: { type: 'string', description: 'Optional — scheduled | queued | running | completed | failed | cancelled' },
         cron_id: { type: 'string', description: 'Optional — list only the history created by this scheduled task.' },
         limit: { type: 'number', description: 'Max rows when listing (default 20, max 100)' },
       },
@@ -8061,7 +8505,7 @@ Use this for work that shouldn't block a user request: image processing, report 
   {
     definition: {
     name: 'cron_create',
-    description: `Create a scheduled trigger. Schedule is a 5-field cron expression (\`minute hour dom month dow\`). It uses UTC by default; pass an IANA \`timezone\` such as \`America/Los_Angeles\` for local wall-clock scheduling with daylight-saving changes handled automatically. Each fire dispatches a job to your handler (at-least-once delivery — build idempotently). Missed fires during platform downtime are NOT replayed.
+    description: `Create a scheduled trigger. Schedule is a 5-field cron expression (\`minute hour dom month dow\`). It uses UTC by default; an IANA \`timezone\` such as \`America/Los_Angeles\` gives local wall-clock scheduling with daylight-saving changes handled automatically. Each fire dispatches a job to your handler (at-least-once delivery, so handlers are idempotent). Missed fires during platform downtime are NOT replayed.
 
 **Common patterns:**
 
@@ -8134,7 +8578,7 @@ cadence they were created with.
   {
     definition: {
     name: 'cron_list',
-    description: 'List cron triggers for a project (or all your projects). Each row includes timezone, last_run_at, last_run_status, last_run_job_id, bounded last_error_code/last_error diagnostics, and next_run_at. A task that has never run returns null for every last-run field. Use last_run_job_id with job_get for full bounded attempt history. Passing project_id also returns `policy` — the project owner\'s plan name, the smallest interval a new or edited schedule may have, and how many scheduled tasks the project may hold.',
+    description: 'List cron triggers for a project (or all your projects). Each row includes timezone, last_run_at, last_run_status, last_run_job_id, bounded last_error_code/last_error diagnostics, and next_run_at. A task that has never run returns null for every last-run field. job_get with last_run_job_id returns full bounded attempt history. Passing project_id also returns `policy` — the project owner\'s plan name, the smallest interval a new or edited schedule may have, and how many scheduled tasks the project may hold.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -8164,11 +8608,13 @@ cadence they were created with.
   {
     definition: {
       name: 'cron_run',
-      description: 'Run an existing scheduled task once now through the same job handler used by scheduled fires. This does not change its schedule. The run is recorded in job history with trigger `manual`.',
+      description: 'Run an existing scheduled task once now through the same job handler used by scheduled fires. This does not change its schedule. The run is recorded in job history with trigger `manual`. preview_session_id and preview_id from an open preview run its handler path once against that exact preview version, database and files instead of the live app.',
       inputSchema: {
         type: 'object',
         properties: {
           cron_id: { type: 'string', description: 'The cron ID' },
+          preview_session_id: { type: 'string', description: 'Open preview session to run against. Requires preview_id.' },
+          preview_id: { type: 'string', description: 'Exact preview version to run. Requires preview_session_id.' },
         },
         required: ['cron_id'],
       },
@@ -8182,7 +8628,52 @@ cadence they were created with.
     surfaces: ["full"],
     execute: async (runtime, args) => {
       const { fetcher, authHeader } = runtime;
-      return callAPI(fetcher, 'POST', `/v1/cron/${encodeURIComponent(args.cron_id as string)}/run`, authHeader);
+      // A preview run uses its own path, which an older platform answers 404
+      // (never a production run); a live run sends no body.
+      const preview = args.preview_session_id !== undefined || args.preview_id !== undefined
+        ? { preview_session_id: args.preview_session_id, preview_id: args.preview_id } : undefined;
+      return preview
+        ? callAPI(fetcher, 'POST', `/v1/cron/${encodeURIComponent(args.cron_id as string)}/run-preview`, authHeader, preview)
+        : callAPI(fetcher, 'POST', `/v1/cron/${encodeURIComponent(args.cron_id as string)}/run`, authHeader);
+    },
+  },
+  {
+    definition: {
+      name: 'cron_preview_schedule',
+      description: 'Turn a scheduled task\'s schedule on inside one open preview for a limited time, turn it off, or list it. A preview never runs a schedule unless you turn it on here. `enable` needs preview_session_id and preview_id from the open preview; each run uses that preview\'s current version, database and files. It stops by itself at expiry (duration_minutes, default 60, at most 1440, and never past the preview\'s own expiry) or when the preview closes or is promoted. Production\'s schedule is unchanged and nothing is copied on promotion. Stopping prevents new runs; a run already in progress is not cancelled.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          cron_id: { type: 'string', description: 'The cron ID' },
+          action: { type: 'string', enum: ['enable', 'disable', 'list'] as string[], description: 'enable, disable or list this task\'s preview schedules' },
+          preview_session_id: { type: 'string', description: 'Open preview session. Required for enable and disable.' },
+          preview_id: { type: 'string', description: 'Exact current preview version. Required for enable.' },
+          duration_minutes: { type: 'integer', minimum: 1, maximum: 1440, description: 'How long the schedule stays on (default 60).' },
+        },
+        required: ['cron_id', 'action'],
+      },
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    group: 'cron',
+    core: false,
+    visibility: 'authenticated',
+    paid: false,
+    surfaces: ["full"],
+    execute: async (runtime, args) => {
+      const { fetcher, authHeader } = runtime;
+      const cron = encodeURIComponent(args.cron_id as string);
+      if (args.action === 'list') return callAPI(fetcher, 'GET', `/v1/cron/${cron}/preview-schedules`, authHeader);
+      if (args.action === 'disable') {
+        const session = encodeURIComponent(String(args.preview_session_id ?? ''));
+        return callAPI(fetcher, 'DELETE', `/v1/cron/${cron}/preview-schedule?preview_session_id=${session}`, authHeader);
+      }
+      if (args.action === 'enable') {
+        return callAPI(fetcher, 'POST', `/v1/cron/${cron}/preview-schedule`, authHeader, {
+          preview_session_id: args.preview_session_id, preview_id: args.preview_id,
+          ...(args.duration_minutes !== undefined ? { duration_minutes: args.duration_minutes } : {}),
+        });
+      }
+      return { status: 400, data: { ok: false, error: 'VALIDATION_ERROR', message: "action must be 'enable', 'disable' or 'list'." } };
     },
   },
   {
@@ -8222,8 +8713,8 @@ cadence they were created with.
       type: 'object',
       properties: {
         cron_id: { type: 'string', description: 'The cron ID' },
-        schedule: { type: 'string', description: 'New 5-field cron expression. Re-checked against the plan floor; omit it to leave the current schedule untouched.' },
-        timezone: { type: 'string', description: 'New IANA timezone, e.g. America/Los_Angeles. Changing it recomputes next_run_at; omit it to keep the current timezone.' },
+        schedule: { type: 'string', description: 'New 5-field cron expression. Re-checked against the plan floor; omitted, the current schedule is untouched.' },
+        timezone: { type: 'string', description: 'New IANA timezone, e.g. America/Los_Angeles. Changing it recomputes next_run_at; omitted, the current timezone stays.' },
         handler: { type: 'string', description: 'New project-relative /api path or full https:// URL the platform will POST to' },
         payload: { type: ['string', 'object'], description: 'New JSON object or JSON string passed to the handler' },
         name: { type: 'string', description: 'New display name' },
@@ -8277,15 +8768,17 @@ cadence they were created with.
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
         handler: { type: 'string', description: 'Full https:// URL to POST the payload to' },
         payload: { type: ['string', 'object'], description: 'Optional JSON string or object passed to the handler' },
-        delay_seconds: { type: 'number', description: 'Optional delay before processing (max 12h)' },
+        delay_seconds: { type: 'integer', minimum: 0, maximum: 43200, description: 'Optional delay in whole seconds (0–43200). For a later start, use job_create with run_at.' },
       },
       required: ['project_id', 'handler'],
     },
   },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
-    group: 'queue',
-    core: true,
-    coreRank: 63,
+    group: 'jobs',
+    core: false,
+    // Callable for existing callers, not advertised: new background work is
+    // job_create (tsk_4119e709; dashboard/HIDDEN-FEATURES.md).
+    hidden: true,
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full"],
@@ -8309,11 +8802,11 @@ cadence they were created with.
   {
     definition: {
     name: 'project_logs',
-    description: `Tail function logs, read recent runtime output, debug a just-deployed endpoint, see what console.log printed, observability. **After every project_deploy / project_patch, call this with the project_id to see what the new code logged on the first few requests — no need to curl the endpoint and guess.** Also writes logs (provide a message).
+    description: `Tail function logs, read recent runtime output, debug a just-deployed endpoint, see what console.log printed, observability. **After every project_deploy / project_patch, it shows what the new code logged on the first few requests — no need to curl the endpoint and guess.** Also writes logs (with a message).
 
-Read mode (omit message): returns the most recent log lines for the project, newest first. Filter by level, source (server | client | function | job | cron | queue | system | oauth), substring match, or trace ID. Default limit 50, max 500.
+Read mode (no message): returns the most recent log lines for the project, newest first. Filter by level, source (server | client | function | job | cron | queue | system | oauth), substring match, or trace ID. Default limit 50, max 500.
 
-Write mode (include message): records a structured log line. Used by your own monitoring code, or by an agent that wants to mark a checkpoint. Writes are durable but ingested asynchronously — a line you just wrote may take a few seconds to appear in a read. \`queued:true\` confirms acceptance, not immediate readability.
+Write mode (with message): records a structured log line. Used by your own monitoring code, or by an agent that wants to mark a checkpoint. Writes are durable but ingested asynchronously — a line you just wrote may take a few seconds to appear in a read. \`queued:true\` confirms acceptance, not immediate readability.
 
 **Example:**
 
@@ -8334,10 +8827,10 @@ Write mode (include message): records a structured log line. Used by your own mo
       type: 'object',
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
-        message: { type: 'string', description: 'Log message. Omit to read logs instead of writing.' },
+        message: { type: 'string', description: 'Log message. Omitted: logs are read instead of written.' },
         level: { type: 'string', description: 'debug | info | warn | error (default info)' },
         data: { type: 'string', description: 'Optional JSON string of structured data (write mode)' },
-        source: { type: 'string', description: 'Filter to one source: server | client | function | job | cron | queue | system | oauth (read mode)' },
+        source: { type: 'string', description: 'Filter to one source: server | client | function | runtime_console | job | cron | queue | system | oauth (read mode; runtime_console contains production console output)' },
         search: { type: 'string', description: 'Substring match on message (read mode)' },
         trace_id: { type: 'string', description: 'Optional 32-character trace id. Returns only log lines from that distributed request.' },
         limit: { type: 'number', description: 'Max rows (default 50, max 500, read mode)' },
@@ -8352,7 +8845,8 @@ Write mode (include message): records a structured log line. Used by your own mo
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","chatgpt"],
-    protocol: { oauthScopes: ['mcp'] },
+    // ChatGPT reads logs only: message/data are refused there (SURFACE_REFUSED_INPUTS).
+    protocol: { surfaceAnnotations: { chatgpt: { title: 'Read project logs', readOnlyHint: true, openWorldHint: false } }, surfaceDescriptions: { chatgpt: "Read a project's recent function and runtime log lines, newest first. After a project_deploy or project_patch, it shows what the new code logged on its first requests. Filter by level, source (server | client | function | runtime_console | job | cron | queue | system | oauth), substring search, or trace_id. Default limit 50, max 500. This tool only reads logs." }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, authHeader } = runtime;
       let result: ToolUpstreamResult;
@@ -8386,7 +8880,7 @@ Write mode (include message): records a structured log line. Used by your own mo
   {
     definition: {
     name: 'errors',
-    description: `Why is my app broken, exceptions, stack traces, failures, recent errors, crash reports, debugging. Pass one trace_id to get the complete ordered parent/child operation waterfall plus its correlated logs, errors, deploy failures, and journey events. No project lookup is required for that one-id path. Without a trace id, pass project_id to get the last 24h of failures from that project's functions. Each row carries \`kind\`: "exception" means nobody chose the outcome (an uncaught throw, or a 5xx) and "refusal" means a handler answered 4xx on purpose — a 401 from your own auth gate is a refusal, not a bug, so filter on \`kind\` before concluding something is broken.
+    description: `Why is my app broken, exceptions, stack traces, failures, recent errors, crash reports, debugging. One trace_id returns the complete ordered parent/child operation waterfall plus its correlated logs, errors, deploy failures, and journey events. No project lookup is required for that one-id path. Without a trace id, project_id returns the last 24h of failures from that project's functions. Each row carries \`kind\`: "exception" means nobody chose the outcome (an uncaught throw, or a 5xx) and "refusal" means a handler answered 4xx on purpose — a 401 from your own auth gate is a refusal, not a bug, so filter on \`kind\` before concluding something is broken.
 
 **Example:**
 
@@ -8411,7 +8905,7 @@ Write mode (include message): records a structured log line. Used by your own mo
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","chatgpt"],
-    protocol: { oauthScopes: ['mcp'] },
+    protocol: { surfaceAnnotations: { chatgpt: { destructiveHint: false, openWorldHint: false } }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, authHeader } = runtime;
       let result: ToolUpstreamResult;
@@ -8443,18 +8937,16 @@ Write mode (include message): records a structured log line. Used by your own mo
   {
     definition: {
     name: 'usage_summary',
-    description: `Get usage metrics. With no arguments this delegates to the authoritative account-wide \`/v1/usage/summary\` and includes per-project database snapshots, file/artifact storage, combined storage, limits, and 30-day totals. Passing \`project_id\` or \`period\` preserves the narrower historical usage call (deploys, AI calls/costs, emails) and does not claim to include storage.
+    description: `Get account usage totals, owned-project count, limits, and aggregate database/file storage with no arguments. Project AI calls and costs exclude Advisor calls, which are accounted separately. From this change onward, new release-based production publications count once on successful completion, excluding previews, dry runs, unchanged deploys, rollbacks and retries. Historical counters retain their original meaning.
 
-**Example:**
-
-\`\`\`json
-{}
-// Returns the account-wide usage summary including storage and database bytes.
-\`\`\``,
+\`view: "projects"\` returns a bounded page of owned-project details (default 20, maximum 100); the returned \`cursor\` fetches the next page. Account totals remain account-wide. Passing \`project_id\` or \`period\` uses the historical usage call (deploys, project AI calls/costs, emails), without storage or pagination.`,
     inputSchema: {
       type: 'object',
       properties: {
-        project_id: { type: 'string', description: "Optional. Accepts UUID, subdomain, or 'default'. Omit for all projects." },
+        project_id: { type: 'string', description: "Optional. Accepts UUID, subdomain, or 'default'. Omitted: all projects." },
+        view: { type: 'string', enum: ['account', 'projects'], description: 'Default account totals; projects requests a bounded detail page.' },
+        limit: { type: 'integer', minimum: 1, maximum: 100, description: 'Project detail page size (default 20).' },
+        cursor: { type: 'string', description: 'Next project-page cursor returned by usage_summary.' },
         period: { type: 'string', description: 'Time period, e.g. "7d", "30d" (default: 30d)' },
       },
       required: [],
@@ -8475,10 +8967,16 @@ Write mode (include message): records a structured log line. Used by your own mo
         if (args.project_id) params.set('project_id', args.project_id as string);
         if (args.period) params.set('period', args.period as string);
         const hasNarrowFilter = params.toString().length > 0;
+        if (hasNarrowFilter && (args.view !== undefined || args.limit !== undefined || args.cursor !== undefined)) {
+          return { status: 400, data: { ok: false, error: 'INVALID_USAGE_VIEW', message: 'Project/period filters cannot be combined with account view or pagination.' } };
+        }
         if (hasNarrowFilter) {
           result = await callAPI(fetcher, 'GET', `/v1/usage?${params}`, authHeader);
         } else {
-          result = await callAPI(fetcher, 'GET', '/v1/usage/summary', authHeader);
+          params.set('view', typeof args.view === 'string' ? args.view : 'account');
+          if (args.limit !== undefined) params.set('limit', String(args.limit));
+          if (args.cursor !== undefined) params.set('cursor', String(args.cursor));
+          result = await callAPI(fetcher, 'GET', `/v1/usage/summary?${params}`, authHeader);
         }
         return result;
 
@@ -8489,9 +8987,9 @@ Write mode (include message): records a structured log line. Used by your own mo
   {
     definition: {
     name: 'feedback',
-    description: `End-user app feedback sent to the project's private owner inbox (\`destination: "project_owner_inbox"\`) — this does not reach the somewhere.tech platform team. Every successful submission repeats that destination and names the exact platform-support calls. Submit: provide a message about that project's own UI or behavior. List: omit message to see feedback on a project you own. When the project owner resolves one of these reports, the owner-facing project channel can emit a \`feedback_resolved\` event.
+    description: `End-user app feedback sent to the project's private owner inbox (\`destination: "project_owner_inbox"\`) — this does not reach the Somewhere platform team. Every successful submission repeats that destination and names the exact platform-support calls. Submit: provide a message about that project's own UI or behavior. List: without message it returns feedback on a project you own. When the project owner resolves one of these reports, the owner-facing project channel can emit a \`feedback_resolved\` event.
 
-For a somewhere.tech platform bug, missing capability, deploy/API problem, or documentation issue, do not use this tool. Use \`support_ticket({ message: "..." })\`, which sends the report to the platform support queue.
+Platform bugs, missing capabilities, deploy/API problems and documentation issues are out of scope for this tool. \`support_ticket({ message: "..." })\` sends such a report to the platform support queue.
 
 **Example:**
 
@@ -8506,7 +9004,7 @@ For a somewhere.tech platform bug, missing capability, deploy/API problem, or do
       type: 'object',
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
-        message: { type: 'string', description: 'Feedback message. Omit to list feedback instead.' },
+        message: { type: 'string', description: 'Feedback message. Omitted: feedback is listed instead.' },
         page_url: { type: 'string', description: 'Optional page URL the feedback is about (submit mode)' },
       },
       required: ['project_id'],
@@ -8541,13 +9039,13 @@ For a somewhere.tech platform bug, missing capability, deploy/API problem, or do
   {
     definition: {
     name: 'support_ticket',
-    description: `Support tickets for the somewhere.tech platform team — submit, check, list, or resolve your own tickets. Use this when something on the platform itself surprises you, blocks you, or seems wrong: a doc gap, an unexpected error shape, a missing capability, a bug in an MCP tool, or an inconsistency between docs and behavior. **Not** for feedback on a user's own app — that's the \`feedback\` tool.
+    description: `Support tickets for the Somewhere platform team — submit, check, list, or resolve your own tickets. For reports about the platform itself: a doc gap, an unexpected error shape, a missing capability, a bug in an MCP tool, or an inconsistency between docs and behavior. **Not** for feedback on a user's own app — that's the \`feedback\` tool.
 
 **Four modes, by argument:**
-- Pass \`message\` → submit a new support ticket. Returns a durable \`ticket_id\` immediately, stores the raw ticket in the support inbox, and notifies the team. The team replies on that same ticket. When the team records a reply or resolves the ticket, the reporting developer receives an email and a developer-channel \`feedback_resolved\` event automatically. Ticket status remains readable before that notification arrives.
-- Pass \`ticket_id\` and \`action: "resolve"\` → resolve a ticket you submitted. This cannot resolve another submitter's ticket. An authenticated platform admin may also pass \`response\` to write the customer-facing reply and resolve the ticket atomically.
-- Pass \`ticket_id\` (no message) → read that one ticket. Returns its \`status\` (open / investigating / resolved) and \`response\` (the team's reply, once written).
-- Omit both → list your own tickets, most recent first (open and resolved), each with status, response, and resolution timestamp. Add a \`status\` filter to narrow the list.
+- \`message\` → submits a new support ticket. Returns a durable \`ticket_id\` immediately, stores the raw ticket in the support inbox, and notifies the team. The team replies on that same ticket. When the team records a reply or resolves the ticket, the reporting developer receives an email and a developer-channel \`feedback_resolved\` event automatically. Ticket status remains readable before that notification arrives.
+- \`ticket_id\` and \`action: "resolve"\` → resolves a ticket the caller submitted. This cannot resolve another submitter's ticket. An authenticated platform admin may also pass \`response\` to write the customer-facing reply and resolve the ticket atomically.
+- \`ticket_id\` (no message) → reads that one ticket. Returns its \`status\` (open / investigating / resolved) and \`response\` (the team's reply, once written).
+- Neither → lists the tickets the caller submitted, most recent first (open and resolved), each with status, response, and resolution timestamp. A \`status\` filter narrows the list.
 
 **Example:**
 
@@ -8574,10 +9072,10 @@ For a somewhere.tech platform bug, missing capability, deploy/API problem, or do
       type: 'object',
       properties: {
         message: { type: 'string', description: 'Submit mode. The support-ticket details — be specific: what you tried, what you expected, what happened. Up to 8000 chars.' },
-        ticket_id: { type: 'string', description: 'Check or resolve mode. A ticket id returned by a prior submit. Omit message when using this.' },
-        action: { type: 'string', enum: ['resolve'], description: 'Resolve mode. Pass "resolve" with ticket_id to close a support ticket you submitted. Admins may add response to reply and close atomically.' },
+        ticket_id: { type: 'string', description: 'Check or resolve mode. A ticket id returned by a prior submit. Not combined with message.' },
+        action: { type: 'string', enum: ['resolve'], description: 'Resolve mode. "resolve" with ticket_id closes a support ticket the caller submitted. Admins may add response to reply and close atomically.' },
         response: { type: 'string', description: 'Admin resolve mode only. Written customer-facing reply to store and send while resolving the ticket atomically. Regular submitters should omit this and keep using action: "resolve" unchanged.' },
-        status: { type: 'string', description: 'List mode. Optional filter: open, investigating, or resolved. Omit message and ticket_id to list your tickets.' },
+        status: { type: 'string', description: 'List mode. Optional filter: open, investigating, or resolved. Without message and ticket_id, the tickets the caller submitted are listed.' },
         limit: { type: 'number', description: 'List mode. Optional. Max tickets to return (default 50, max 200).' },
         project_id: { type: 'string', description: 'Submit mode. Optional. Project the support ticket relates to (UUID, subdomain, or "default").' },
         context: { type: 'object', description: 'Submit mode. Optional structured context — endpoint, file size, error code, anything reproducible. Free-form JSON, up to 16KB.' },
@@ -8592,8 +9090,9 @@ For a somewhere.tech platform bug, missing capability, deploy/API problem, or do
     coreRank: 4,
     visibility: 'authenticated',
     paid: false,
-    surfaces: ["full","chatgpt"],
-    protocol: { surfaceAnnotations: { chatgpt: { destructiveHint: true, openWorldHint: true } }, oauthScopes: ['mcp'] },
+    // ChatGPT gets one tool per operation: support_ticket_submit/_get/_list/_resolve.
+    surfaces: ["full"],
+    protocol: { oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, env, authHeader, ctx, toolName } = runtime;
       let result: ToolUpstreamResult;
@@ -8626,6 +9125,99 @@ For a somewhere.tech platform bug, missing capability, deploy/API problem, or do
 
       }
     },
+  },
+  // ── support_ticket, one operation per tool (ChatGPT) ─────────────────
+  {
+    definition: {
+    name: 'support_ticket_submit',
+    description: 'Send a new support ticket to the Somewhere platform team about the platform itself: a doc gap, an unexpected error, a missing capability, or a tool bug. The team receives and is notified of the message, and replies on the same ticket; the reply is also emailed to you. Returns a ticket_id. A sent ticket cannot be withdrawn.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        message: { type: 'string', description: 'The ticket details: what you tried, what you expected, what happened. Up to 8000 chars.' },
+        project_id: { type: 'string', description: 'Optional. Project the ticket relates to (UUID, subdomain, or "default").' },
+        context: { type: 'object', description: 'Optional structured context such as endpoint, error code, or reproduction facts. Free-form JSON, up to 16KB.' },
+        parent_id: { type: 'string', description: 'Optional. The one task this ticket is about.' },
+      },
+      required: ['message'],
+    },
+  },
+    annotations: { title: 'Submit a support ticket', readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    group: 'feedback',
+    core: false,
+    visibility: 'authenticated',
+    paid: false,
+    surfaces: ["full","chatgpt"],
+    operationOf: 'support_ticket',
+    protocol: { oauthScopes: ['mcp'] },
+    execute: async (runtime, args) => runToolOperation('support_ticket', runtime, args),
+  },
+  {
+    definition: {
+    name: 'support_ticket_get',
+    description: 'Read one support ticket you submitted: its status (open, investigating or resolved) and the team\'s reply once written.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ticket_id: { type: 'string', description: 'A ticket id returned by support_ticket_submit.' },
+      },
+      required: ['ticket_id'],
+    },
+  },
+    annotations: { title: 'Read a support ticket', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    group: 'feedback',
+    core: false,
+    visibility: 'authenticated',
+    paid: false,
+    surfaces: ["full","chatgpt"],
+    operationOf: 'support_ticket',
+    protocol: { oauthScopes: ['mcp'] },
+    execute: async (runtime, args) => runToolOperation('support_ticket', runtime, args),
+  },
+  {
+    definition: {
+    name: 'support_ticket_list',
+    description: 'List the support tickets you submitted, most recent first, each with status, reply and resolution time.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        status: { type: 'string', description: 'Optional filter: open, investigating, or resolved.' },
+        limit: { type: 'number', description: 'Optional. Max tickets to return (default 50, max 200).' },
+      },
+      required: [],
+    },
+  },
+    annotations: { title: 'List your support tickets', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    group: 'feedback',
+    core: false,
+    visibility: 'authenticated',
+    paid: false,
+    surfaces: ["full","chatgpt"],
+    operationOf: 'support_ticket',
+    protocol: { oauthScopes: ['mcp'] },
+    execute: async (runtime, args) => runToolOperation('support_ticket', runtime, args),
+  },
+  {
+    definition: {
+    name: 'support_ticket_resolve',
+    description: 'Mark a support ticket you submitted as resolved. It cannot resolve another submitter\'s ticket. The ticket\'s current status is replaced.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ticket_id: { type: 'string', description: 'A ticket id you submitted.' },
+      },
+      required: ['ticket_id'],
+    },
+  },
+    annotations: { title: 'Resolve your support ticket', readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    group: 'feedback',
+    core: false,
+    visibility: 'authenticated',
+    paid: false,
+    surfaces: ["full","chatgpt"],
+    operationOf: 'support_ticket',
+    protocol: { oauthScopes: ['mcp'] },
+    execute: async (runtime, args) => runToolOperation('support_ticket', runtime, args, { action: 'resolve' }),
   },
   // ── domains ─────────────────────────────────────────────
   {
@@ -8800,11 +9392,11 @@ For a somewhere.tech platform bug, missing capability, deploy/API problem, or do
     name: 'domain_buy',
     description: `Preview a domain purchase and get a secure checkout link.
 
-Call \`domain_buy\` with project_id + domain. The platform returns the price and a \`dashboard_checkout_url\`. Show the price to the user verbatim, then share that secure checkout link to complete payment.
+\`domain_buy\` takes project_id + domain. The platform returns the price and a \`dashboard_checkout_url\`. The price is quoted verbatim, and the secure checkout link is where payment completes.
 
 Customer purchases cannot be completed through another MCP tool. The user completes payment through the checkout link, and registration begins only after that payment settles.
 
-The domain is registered **in the buyer's name** — they own it outright and can transfer it to any registrar or account whenever they want. Mention this when sharing the checkout link; details: https://somewhere.tech/domain-ownership
+The domain is registered **in the buyer's name** — they own it outright and can transfer it to any registrar or account whenever they want. Mention this when sharing the checkout link; details: https://somewhere.cloud/docs/domain-ownership
 
 **Example:**
 
@@ -8812,7 +9404,7 @@ The domain is registered **in the buyer's name** — they own it outright and ca
 { "project_id": "my-saas", "domain": "acmedash.com" }
 \`\`\`
 
-The response will be an error of type \`PURCHASE_CONFIRMATION_REQUIRED\` carrying the price and checkout URL, e.g. \`{ "ok": false, "error": "PURCHASE_CONFIRMATION_REQUIRED", "domain": "acmedash.com", "price": "$17/year", "confirm_token": "...", "dashboard_checkout_url": "https://somewhere.tech/dashboard/projects/.../?tab=domains&buy=acmedash.com" }\`. Treat this response as a checkout handoff: share the \`dashboard_checkout_url\` and let the user complete payment there.`,
+The response will be an error of type \`PURCHASE_CONFIRMATION_REQUIRED\` carrying the price and checkout URL, e.g. \`{ "ok": false, "error": "PURCHASE_CONFIRMATION_REQUIRED", "domain": "acmedash.com", "price": "$17/year", "confirm_token": "...", "dashboard_checkout_url": "https://somewhere.cloud/dashboard/projects/...?tab=domains&buy=acmedash.com" }\`. This response is a checkout handoff: payment completes at the \`dashboard_checkout_url\`.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -8840,10 +9432,8 @@ The response will be an error of type \`PURCHASE_CONFIRMATION_REQUIRED\` carryin
           domain: args.domain,
         });
         if (result.data && typeof result.data === 'object' && !Array.isArray(result.data)) {
-          const projectIdEnc = encodeURIComponent(String(args.project_id));
-          const domainEnc = encodeURIComponent(String(args.domain));
           (result.data as Record<string, unknown>).dashboard_checkout_url =
-            `https://somewhere.tech/dashboard/projects/${projectIdEnc}?tab=domains&buy=${domainEnc}`;
+            dashboardDomainCheckoutUrl(String(args.project_id), String(args.domain));
         }
         return result;
 
@@ -8857,7 +9447,7 @@ The response will be an error of type \`PURCHASE_CONFIRMATION_REQUIRED\` carryin
 
 This is the recommended path for any domain you control — it covers apex (\`example.com\`), \`www\`, and any subdomain in one move, and unlocks inbox routing on the same domain.
 
-Claims belong to your account, not to a project. Project deletion is not the cleanup path for an unattached or pending claim. To remove one from your account (including a claim created for a temporary test), call \`domain_remove({ domain: "example.com" })\` before deleting the project.
+Claims belong to your account, not to a project. Project deletion is not the cleanup path for an unattached or pending claim. \`domain_remove({ domain: "example.com" })\` removes one from the account (including a claim created for a temporary test), ahead of deleting the project.
 
 **Example:**
 
@@ -8867,7 +9457,7 @@ Claims belong to your account, not to a project. Project deletion is not the cle
 // The actual nameserver hostnames are assigned by the platform and returned by this call.
 \`\`\`
 
-After updating nameservers at your registrar, call \`domain_check_ns\` (or wait for the hourly poll) to flip \`claim_status\` to \`active\`. Then call \`domain_attach\` to bind it to a project.`,
+After a nameserver update at the registrar, \`domain_check_ns\` (or the hourly poll) flips \`claim_status\` to \`active\`. \`domain_attach\` then binds it to a project.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -8897,7 +9487,7 @@ After updating nameservers at your registrar, call \`domain_check_ns\` (or wait 
   {
     definition: {
     name: 'domain_owned',
-    description: 'List every account-level domain claim created via `domain_claim`, regardless of which project (if any) it is currently attached to. Project deletion is not the cleanup path for an unattached claim; use `domain_remove({ domain })` to remove one from your account.',
+    description: 'List every account-level domain claim created via `domain_claim`, regardless of which project (if any) it is currently attached to. Project deletion is not the cleanup path for an unattached claim; `domain_remove({ domain })` removes one from the account.',
     inputSchema: { type: 'object', properties: {}, required: [] },
   },
     annotations: { readOnlyHint: true, idempotentHint: true },
@@ -8919,7 +9509,7 @@ After updating nameservers at your registrar, call \`domain_check_ns\` (or wait 
   {
     definition: {
     name: 'domain_check_ns',
-    description: 'Force an immediate nameserver check for a claimed domain. Returns the new claim_status. The platform also polls hourly in the background — use this when the user just updated their registrar and wants instant feedback.',
+    description: 'Force an immediate nameserver check for a claimed domain. Returns the new claim_status. The platform also polls hourly in the background — it gives instant feedback right after a registrar update.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -8949,7 +9539,7 @@ After updating nameservers at your registrar, call \`domain_check_ns\` (or wait 
     name: 'domain_attach',
     description: `Bind a claimed (active) domain to one of your projects. \`host\` picks the entry point — \`apex\` (\`example.com\`), \`www\` (\`www.example.com\`), or a single subdomain label like \`app\` (→ \`app.example.com\`).
 
-Re-attaching to a different project is a clean swap — no re-verification. To free the binding without unclaiming, call \`domain_detach\`.
+Re-attaching to a different project is a clean swap — no re-verification. \`domain_detach\` frees the binding without unclaiming.
 
 **Example:**
 
@@ -9044,7 +9634,7 @@ Re-attaching to a different project is a clean swap — no re-verification. To f
   {
     definition: {
     name: 'domain_publish',
-    description: `Recovery action for a claimed domain that isn't resolving. Re-asserts the apex + www records and the platform routing — idempotent, so safe to run any time. Use this when \`domain_owned\` shows \`claim_status: active\` and \`zone_status: active\` but \`dig <domain>\` returns NXDOMAIN or empty answers. \`domain_claim\` already runs this once; this is the manual unstick path for the rare case where the initial publish had a partial failure.
+    description: `Recovery action for a claimed domain that isn't resolving. Re-asserts the apex + www records and the platform routing — idempotent, so safe to run any time. It applies when \`domain_owned\` shows \`claim_status: active\` and \`zone_status: active\` but \`dig <domain>\` returns NXDOMAIN or empty answers. \`domain_claim\` already runs this once; this is the manual unstick path for the rare case where the initial publish had a partial failure.
 
 Inbox routing is only re-asserted if it was already enabled on this domain — \`domain_publish\` will never silently overwrite a user's MX records.`,
     inputSchema: {
@@ -9144,7 +9734,7 @@ Inbox routing is only re-asserted if it was already enabled on this domain — \
   {
     definition: {
     name: 'search_delete',
-    description: `Delete from a search index. Pass \`ids\` to remove specific items; omit \`ids\` to delete the entire index and all its items.
+    description: `Delete from a search index. \`ids\` removes specific items; without \`ids\` it deletes the entire index and all its items.
 
 **Example:**
 
@@ -9160,7 +9750,7 @@ Inbox routing is only re-asserted if it was already enabled on this domain — \
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
         index: { type: 'string', description: 'Index name.' },
-        ids: { type: 'string', description: 'Optional. JSON array of item ids to remove. Example: \'["p1","p2"]\'. Omit to delete the entire index.' },
+        ids: { type: 'string', description: 'Optional. JSON array of item ids to remove. Example: \'["p1","p2"]\'. Omitted: the entire index is deleted.' },
       },
       required: ['project_id', 'index'],
     },
@@ -9199,7 +9789,7 @@ Inbox routing is only re-asserted if it was already enabled on this domain — \
   {
     definition: {
     name: 'search_upsert',
-    description: `**Did searchable content get created or edited?** Call \`search_upsert\` with its stable \`id\` and \`content\`; the platform creates the index if needed and generates embeddings for you. Reusing an id updates that item. Pass up to 100 items per call.
+    description: `**Did searchable content get created or edited?** Call \`search_upsert\` with its stable \`id\` and \`content\`; the platform creates the index if needed and generates embeddings for you. Reusing an id updates that item. It takes up to 100 items per call.
 
 **Example:**
 
@@ -9251,7 +9841,7 @@ Inbox routing is only re-asserted if it was already enabled on this domain — \
   {
     definition: {
     name: 'search_query',
-    description: `Search an index. The default \`hybrid\` ranking fuses exact-keyword matching (typo-tolerant, great for SKUs, usernames, IDs, and any literal term) with meaning-based matching — so a document containing the query words ranks first, AND conceptually related documents are still found. Each result has its original content and metadata, a relevance score, a \`snippet\` that highlights the match (wrapped in <mark>…</mark>), and a \`signals\` breakdown of which signal(s) matched. Page through results with \`offset\` — the response carries a \`page\` object with \`total\` and \`has_more\`.
+    description: `Search an index. The default \`hybrid\` ranking fuses exact-keyword matching (typo-tolerant, great for SKUs, usernames, IDs, and any literal term) with meaning-based matching — so a document containing the query words ranks first, AND conceptually related documents are still found. Each result has its original content and metadata, a relevance score, a \`snippet\` that highlights the match (wrapped in <mark>…</mark>), and a \`signals\` breakdown of which signal(s) matched. \`offset\` pages through results — the response carries a \`page\` object with \`total\` and \`has_more\`.
 
 **Example:**
 
@@ -9275,7 +9865,7 @@ Inbox routing is only re-asserted if it was already enabled on this domain — \
         index: { type: 'string', description: 'Index name to search.' },
         query: { type: 'string', description: 'Query text — keywords and/or natural language.' },
         limit: { type: 'number', description: 'Max results per page (default 10, max 100).' },
-        offset: { type: 'number', description: 'Skip this many results for pagination (default 0). Use with limit to page; the response includes page.total and page.has_more. Applies to hybrid and lexical modes.' },
+        offset: { type: 'number', description: 'Skip this many results for pagination (default 0). Pages together with limit; the response includes page.total and page.has_more. Applies to hybrid and lexical modes.' },
         mode: { type: 'string', enum: ['hybrid', 'semantic', 'lexical'], description: "Ranking mode: 'hybrid' (default — keyword + meaning, fused), 'semantic' (meaning only), or 'lexical' (keyword only, with typo-tolerant prefix matching)." },
       },
       required: ['project_id', 'index', 'query'],
@@ -9326,7 +9916,7 @@ Rates by plan at /v1/pricing. Activation required: \`ai_transcribe\`.
       type: 'object',
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
-        audio: { type: 'string', description: 'Base64-encoded audio bytes (mp3/wav/flac/m4a). Use audio_url instead for remote files. Max 25MB.' },
+        audio: { type: 'string', description: 'Base64-encoded audio bytes (mp3/wav/flac/m4a). audio_url covers remote files. Max 25MB.' },
         audio_url: { type: 'string', description: 'Public http(s) URL to the audio file. No private networks.' },
         model: { type: 'string', description: 'Optional. @cf/openai/whisper-large-v3-turbo (default), @cf/openai/whisper, @cf/openai/whisper-tiny-en.' },
       },
@@ -9359,9 +9949,9 @@ Rates by plan at /v1/pricing. Activation required: \`ai_transcribe\`.
     name: 'ai_tts',
     description: `Synthesize speech from text. Returns audio bytes as base64, or saves to a storage path.
 
-Omit \`model\` and you get the free default voice — no activation, no bill, nothing to choose.
+Without \`model\`, the free default voice is used — no activation, no bill, nothing to choose.
 
-- \`hexgrad/Kokoro-82M\` (default) — free: 54 natural voices across 9 languages (American/British English, Mandarin, Japanese, Hindi, Spanish, Brazilian Portuguese, Italian, French). Pass a voice id as \`voice\` (default af_bella); the full id list, grouped by language, is in ai_catalog. First 100,000 chars/month free; rates beyond that by plan at /v1/pricing. Cap 15,000 chars.
+- \`hexgrad/Kokoro-82M\` (default) — free: 54 natural voices across 9 languages (American/British English, Mandarin, Japanese, Hindi, Spanish, Brazilian Portuguese, Italian, French). \`voice\` takes a voice id (default af_bella); the full id list, grouped by language, is in ai_catalog. First 100,000 chars/month free; rates beyond that by plan at /v1/pricing. Cap 15,000 chars.
 
 Activation required: \`ai_tts\`.
 
@@ -9382,7 +9972,7 @@ Activation required: \`ai_tts\`.
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
         text: { type: 'string', description: 'Text to speak. Max 15,000 chars.' },
-        model: { type: 'string', description: 'Optional. Leave it out for the free default voice (hexgrad/Kokoro-82M). Call ai_catalog for every model that can serve today.' },
+        model: { type: 'string', description: 'Optional. Omitted: the free default voice (hexgrad/Kokoro-82M). ai_catalog lists every model that can serve today.' },
         voice: { type: 'string', description: 'Voice id, e.g. af_bella (default), am_michael, bm_george — full list grouped by language in ai_catalog.' },
         lang: { type: 'string', description: 'Language code (en, es, fr, zh, ja, ko, …). Default en.' },
         storage: { type: 'string', description: 'Optional storage path like /audio/greeting.mp3. When set, saves to the project filesystem.' },
@@ -9453,9 +10043,9 @@ Activation required: \`ai_tts\`.
     name: 'ai_generate_image',
     description: `**Need a hero, product image, social card, thumbnail, or draft visual?** \`ai_generate_image\` creates it from a text prompt without wiring a separate image provider. Returns image bytes (base64) or a stored path plus cost.
 
-One managed model: \`@cf/black-forest-labs/flux-1-schnell\` (default) — fast, billed per tile and per step at the rate in /v1/pricing. Earlier premium managed models are retired; a request for one is refused with a message naming the default. For any other model, bring your own provider: store the vendor's key as a project secret and call the vendor from your own function; there is no managed AI charge on that path (the vendor bills you directly; your function's ordinary platform usage still applies).
+Two managed models, priced in \`ai_catalog\`. Which model: omit \`model\` for fast, low-cost drafts (\`@cf/black-forest-labs/flux-1-schnell\`, fixed 1024×1024, billed per tile and step); \`gpt-image-2.5-flare\` suits final assets, legible text, UI mockups or a transparent background (reserves balance up front; a successful call uses reported token usage capped at that reservation, or the calculator estimate when usage is missing). Failed GPT Image calls return the reservation; an unconfirmed return is reported as \`settlement: 'unconfirmed'\`. Earlier retired managed models are refused with a message naming the default. For any other model, bring your own provider: store the vendor's key as a project secret and call the vendor from your own function; there is no managed AI charge on that path (the vendor bills you directly; your function's ordinary platform usage still applies).
 
-**Inline rendering:** Pass \`inline: true\` to get the image as an MCP image content block alongside the JSON result. Claude.ai (and any MCP client that respects image content blocks) renders it directly in the conversation. Default \`inline: false\` keeps the response lightweight (base64 only when not stored).
+**Inline rendering:** Pass \`inline: true\` to get the image as an MCP image content block alongside the JSON result. An MCP client that supports image content blocks can render it directly. Default \`inline: false\` keeps the response lightweight (base64 only when not stored).
 
 **Example:**
 
@@ -9471,12 +10061,14 @@ One managed model: \`@cf/black-forest-labs/flux-1-schnell\` (default) — fast, 
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
         prompt: { type: 'string', description: 'Image description (max 2000 chars).' },
-        model: { type: 'string', description: 'Optional. @cf/black-forest-labs/flux-1-schnell (default and only managed option); retired ids are refused with a typed error.' },
-        width: { type: 'number', description: 'Ignored by the managed model: output is a fixed 1024×1024 square.' },
-        height: { type: 'number', description: 'Ignored by the managed model: output is a fixed 1024×1024 square.' },
-        steps: { type: 'number', description: 'Inference steps, 1-8 (default 4).' },
+        model: { type: 'string', description: 'Optional. @cf/black-forest-labs/flux-1-schnell (default) or gpt-image-2.5-flare; retired ids are refused with a typed error.' },
+        width: { type: 'number', description: 'gpt-image-2.5-flare: with height, picks the shape (wider 1536×1024, taller 1024×1536, else 1024×1024). Ignored by the default model, which renders 1024×1024.' },
+        height: { type: 'number', description: 'gpt-image-2.5-flare: with width, picks the shape. Ignored by the default model.' },
+        steps: { type: 'number', description: 'Default model only: inference steps, 1-8 (default 4).' },
+        quality: { type: 'string', enum: ['low', 'medium', 'high'], description: 'gpt-image-2.5-flare only (default medium). Refused on the default model.' },
+        background: { type: 'string', enum: ['auto', 'opaque', 'transparent'], description: 'gpt-image-2.5-flare only (default auto); transparent returns a PNG with alpha. Refused on the default model.' },
         storage: { type: 'string', description: 'Optional storage path like /images/hero.png. When set, saves to the project filesystem.' },
-        inline: { type: 'boolean', description: 'When true, return the image as an MCP image content block so clients (Claude.ai, etc.) render it inline. Default false.' },
+        inline: { type: 'boolean', description: 'When true, the image comes back as an MCP image content block that supporting clients render inline. Default false.' },
       },
       required: ['project_id', 'prompt'],
     },
@@ -9501,6 +10093,8 @@ One managed model: \`@cf/black-forest-labs/flux-1-schnell\` (default) — fast, 
             width: args.width,
             height: args.height,
             steps: args.steps,
+            quality: args.quality,
+            background: args.background,
             storage: args.storage,
           });
         } else {
@@ -9517,6 +10111,8 @@ One managed model: \`@cf/black-forest-labs/flux-1-schnell\` (default) — fast, 
               width: args.width,
               height: args.height,
               steps: args.steps,
+              quality: args.quality,
+              background: args.background,
               ...(args.storage ? { storage: args.storage } : {}),
             }),
           });
@@ -9548,7 +10144,7 @@ One managed model: \`@cf/black-forest-labs/flux-1-schnell\` (default) — fast, 
   {
     definition: {
     name: 'ai_remove_background',
-    description: `Background removal is not offered as a managed capability: this call is refused with a typed error before anything runs, and nothing is charged. To remove backgrounds, bring your own provider — store its key as a project secret and call it from your own function. A generative image model is not a substitute for background removal, so the platform does not silently swap one in. Kept so older callers get a typed refusal rather than an unknown tool.`,
+    description: `Background removal is not offered as a managed capability: this call is refused with a typed error before anything runs, and nothing is charged. To remove backgrounds, bring your own provider — its key is stored as a project secret and called from an app function. A generative image model is not a substitute for background removal, so the platform does not silently swap one in. Kept so older callers get a typed refusal rather than an unknown tool.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -9556,7 +10152,7 @@ One managed model: \`@cf/black-forest-labs/flux-1-schnell\` (default) — fast, 
         image_url: { type: 'string', description: 'Publicly fetchable http(s) URL to the source image.' },
         model: { type: 'string', description: 'Ignored: no managed background-removal model is offered.' },
         storage: { type: 'string', description: 'Optional storage path like /images/cutout.png. When set, saves to the project filesystem.' },
-        inline: { type: 'boolean', description: 'When true, return the cutout as an MCP image content block so clients render it inline. Default false.' },
+        inline: { type: 'boolean', description: 'When true, the cutout comes back as an MCP image content block for inline rendering. Default false.' },
       },
       required: ['project_id', 'image_url'],
     },
@@ -9617,7 +10213,7 @@ One managed model: \`@cf/black-forest-labs/flux-1-schnell\` (default) — fast, 
   {
     definition: {
     name: 'ai_catalog',
-    description: `List every AI model the platform offers — feature, model id, provider, pricing string, and whether it's free for Builders. Paid-model rates vary by plan; see /v1/pricing. Use this to discover what's available before picking a model for \`ai_complete\`, \`ai_tts\`, \`ai_generate_image\`, \`ai_remove_background\`, or embeddings.
+    description: `List every AI model the platform offers — feature, model id, provider, pricing string, and whether it's free for Builders. Paid-model rates vary by plan and are listed at /v1/pricing. It lists what is available before a model is chosen for \`ai_complete\`, \`ai_tts\`, \`ai_generate_image\`, \`ai_remove_background\`, or embeddings.
 
 Read-only. No activation needed.
 
@@ -9688,7 +10284,7 @@ Read-only. No activation needed.
   {
     definition: {
     name: 'stock_photos_search',
-    description: `Search a free library of royalty-free stock photos by keyword. Use when the user wants real photographs (not AI-generated). Free — no activation required.
+    description: `Search a free library of royalty-free stock photos by keyword. It returns real photographs (not AI-generated). Free — no activation required.
 
 Each photo includes a photographer name and source URL. Display attribution somewhere on the page when you use the image.
 
@@ -9749,7 +10345,7 @@ Each photo includes a photographer name and source URL. Display attribution some
 
 **This is the ONE capture surface.** \`render_screenshot\` and \`render_pdf\` are deprecated aliases of this tool — they still work, but everything they could do lives here, and things neither could do compose freely: a full-page **webp** of a logged-in view saved to a path you choose, or a **PDF invoice**, out of the same call.
 
-**Choose the output, not the tool** — \`capture: { "as": "png" | "jpeg" | "webp" | "pdf" }\`. Printing is an output format, not a different operation:
+**One tool, several outputs** — \`capture: { "as": "png" | "jpeg" | "webp" | "pdf" }\`. Printing is an output format, not a different operation:
 
 \`\`\`json
 { "project_id": "my-saas", "url": "https://my-saas.somewhere.site/pricing",
@@ -9761,25 +10357,25 @@ Each photo includes a photographer name and source URL. Display attribution some
   "capture": { "as": "pdf", "paper": "A4" }, "storage": "/invoices/inv-1234.pdf" }
 \`\`\`
 
-**Pick your mode:**
-- **EYES (perception)** — NO \`project_id\`, any public \`url\` (e.g. \`{ "url": "https://example.com" }\`): look at / inspect / screenshot ANY page. Ephemeral output — the screenshot returns **inline** (auto-downscaled to fit) by default, or pass \`store:true\` for a short-TTL signed scratch URL (\`screenshots[].scratch_url\`, never durable project storage). No-actions inspect includes the bounded clickable-element map. An explicit \`include\` list selects sections; use \`include:["network","dom"]\` for the full network table and the map. No auth, no origin-lock — point it at anything.
-- **VERIFY (project QA)** — pass \`project_id\`: drive + assert YOUR deployed app. Add \`actions\` to click / fill / assert a flow, \`auth:{ "user_id": "…" }\` to run it as a logged-in user (1h audited impersonation), and screenshots store durably to the project filesystem (\`screenshots[].fs_path\`). Origin-locked — a \`url\` must be on the project's own origin.
+**Modes:**
+- **EYES (perception)** — NO \`project_id\`, any public \`url\` (e.g. \`{ "url": "https://example.com" }\`): look at / inspect / screenshot ANY page. Ephemeral output — the screenshot returns **inline** (auto-downscaled to fit) by default; \`store:true\` gives a short-TTL signed scratch URL (\`screenshots[].scratch_url\`, never durable project storage). No-actions inspect includes the bounded clickable-element map. An explicit \`include\` list selects sections; \`include:["network","dom"]\` adds the full network table and the map. No auth, no origin-lock — any public URL.
+- **VERIFY (project QA)** — \`project_id\`: drive + assert the deployed app of that project. \`actions\` clicks / fills / asserts a flow, and \`auth:{ "user_id": "…" }\` runs it as a logged-in user (1h audited impersonation), and screenshots store durably to the project filesystem (\`screenshots[].fs_path\`). Origin-locked — a \`url\` must be on the project's own origin.
 
 Same engine and the same signals-first report either way. Each completed page run also returns one \`accessibility_layout\` line for WCAG AA text contrast, horizontal overflow, and tap targets below 44×44px. Those findings are advisory and never change \`passed\`.
 
-- **Omit \`actions\`** → you get a health snapshot by default: console errors, page errors, failed network requests (the 4xx/5xx + dropped calls — the real signal), the rendered page text (\`rendered_text\` — grep-able structured text beats a screenshot ~80% of the time), \`final_url\`, a small screenshot, and a bounded interactive-element map (\`dom_outline\` + testid handles). An explicit \`include\` list selects optional sections: \`include:["network","dom"]\` retains the map and adds the full per-request \`network\` table + redirect chain; \`include:[]\` omits both. This is the quick "what does my app look like and is it healthy" call (it replaces a standalone screenshot). That page screenshot comes back **inline as an MCP image content block by default** (it renders directly in the conversation) while its file path stays in the output as the durable artifact; pass \`inline:false\` to skip the inline image and keep only the path. An oversized capture on a tall/heavy page is auto-downscaled to fit inline — a no-\`project_id\` call still returns a real image in one shot.
-- **Add \`actions\`** → use the same concise action-sequence JSON as the CLI: \`{click}\`, \`{fill,value}\`, \`{upload,file,name?}\`, \`{select,value}\`, \`{wait}\`, \`{expect}\`, \`{screenshot}\`, and \`{eval}\`. Every item reports ok/fail with a reason, and the first failure stops the sequence.
+- **Without \`actions\`** → a health snapshot by default: console errors, page errors, failed network requests (the 4xx/5xx + dropped calls — the real signal), the rendered page text (\`rendered_text\` — grep-able structured text beats a screenshot ~80% of the time), \`final_url\`, a small screenshot, and a bounded interactive-element map (\`dom_outline\` + testid handles). An explicit \`include\` list selects optional sections: \`include:["network","dom"]\` retains the map and adds the full per-request \`network\` table + redirect chain; \`include:[]\` omits both. This is the quick "what does my app look like and is it healthy" call (it replaces a standalone screenshot). That page screenshot comes back **inline as an MCP image content block by default** (it renders directly in the conversation) while its file path stays in the output as the durable artifact; \`inline:false\` skips the inline image and keeps only the path. An oversized capture on a tall/heavy page is auto-downscaled to fit inline — a no-\`project_id\` call still returns a real image in one shot.
+- **\`actions\`** → the same concise action-sequence JSON as the CLI: \`{click}\`, \`{fill,value}\`, \`{upload,file,name?}\`, \`{select,value}\`, \`{wait}\`, \`{expect}\`, \`{screenshot}\`, \`{eval}\`, and \`{goto}\` (a path on the app, e.g. \`{goto:"/club"}\`). Every item reports ok/fail with a reason, and the first failure stops the sequence.
 - Existing expanded \`steps\` remain accepted for older callers; new flows use the shared \`actions\` shape above.
-- **Pass \`url\` with NO \`project_id\`** → capture/inspect ANY public third-party page (e.g. \`{ "url": "https://example.com" }\`), not just your own app. (When you DO pass \`project_id\`, \`url\` is scoped to that project's origin.) The screenshot comes back inline by default; add \`store:true\` to instead get a short-lived, auto-expiring signed URL to the full-res image (\`screenshots[].scratch_url\`) — handy for a big external capture you'd rather link than inline. It's kept in an ephemeral scratch store and never touches project storage.
-- **Pass \`html\`** → render a raw HTML snippet straight to an image (e.g. an OG card). No page navigation, no steps; returns the image inline, or the stored file path when \`storage\` is set. This is render_screenshot's html niche, folded in.
-- **Pass \`extract:"markdown"\`** (or \`include:["markdown"]\`) → READ the page as clean MARKDOWN (headings, links, lists, main content) in the \`markdown\` field, instead of vision-parsing the screenshot. The cheapest way to actually read a page's content. (The plain rendered text is always in \`rendered_text\`.)
-- **Pass \`session_id\`** → keep ONE live browser page alive ACROSS calls (persistent session). Navigate in call 1; in call 2 (same session_id) wait for a 20s stream and screenshot the SAME page — cookies, current URL, and the in-flight stream all survive. The call returns \`session_id\` + \`session_expires_at\`; a reconnect skips the initial navigation (the page is where you left it — use a \`goto\` step to move). Sessions are yours only, capped per developer, and idle out fast (~3 min, ~10 min hard cap); an expired one transparently restarts (\`session_note\`). OMIT it for the default fresh-per-call browser (cache-safe — use a session only when you need cross-call state).
+- **\`url\` with NO \`project_id\`** → capture/inspection of ANY public third-party page (e.g. \`{ "url": "https://example.com" }\`), not just your own app. (When you DO pass \`project_id\`, \`url\` is scoped to that project's origin.) The screenshot comes back inline by default; \`store:true\` instead returns a short-lived, auto-expiring signed URL to the full-res image (\`screenshots[].scratch_url\`) — handy for a big external capture you'd rather link than inline. It's kept in an ephemeral scratch store and never touches project storage.
+- **\`html\`** → a raw HTML snippet rendered straight to an image (e.g. an OG card). No page navigation, no steps; returns the image inline, or the stored file path when \`storage\` is set. This is render_screenshot's html niche, folded in.
+- **\`extract:"markdown"\`** (or \`include:["markdown"]\`) → the page as clean MARKDOWN (headings, links, lists, main content) in the \`markdown\` field, instead of vision-parsing the screenshot. The cheapest way to actually read a page's content. (The plain rendered text is always in \`rendered_text\`.)
+- **\`session_id\`** → ONE live browser page kept alive ACROSS calls (persistent session). Navigate in call 1; in call 2 (same session_id) wait for a 20s stream and screenshot the SAME page — cookies, current URL, and the in-flight stream all survive. The call returns \`session_id\` + \`session_expires_at\`; a reconnect skips the initial navigation (the page is where you left it — a \`goto\` step moves). Sessions are yours only, capped per developer, and idle out after ${BROWSER_SESSION_IDLE_MINUTES} min (${BROWSER_SESSION_HARD_CAP_MINUTES} min hard cap); a failed step keeps the session, and an expired one restarts signed out and says so (\`session_note\`). Omitted, it is the default fresh-per-call browser (cache-safe — a session is only for cross-call state).
 
-**Shell-having agents:** use \`somewhere browser\` for navigation, waits, evaluation, screenshots, and flow steps. Use this MCP tool when no shell exists or when an inline image/result is materially more useful.
+**With a shell:** \`somewhere browser\` covers navigation, waits, evaluation, screenshots, and flow steps. This MCP tool covers clients without a shell, and cases where an inline image or result is more useful.
 
-Use it to check what your UI looks like AND whether it works — clicks land, the form submits, the modal opens — and to catch the 500-ing API call a screenshot alone would hide. (run_code proves a function's backend; \`browser\` proves the rendered UI.) Signals come FIRST: \`passed\` reflects step outcomes only — always read console_errors / page_errors / failed_requests too (a 500 shows there even when every step "passes").
+It checks what a UI looks like AND whether it works — clicks land, the form submits, the modal opens — and to catch the 500-ing API call a screenshot alone would hide. (run_code proves a function's backend; \`browser\` proves the rendered UI.) Signals come FIRST: \`passed\` reflects step outcomes only — console_errors / page_errors / failed_requests matter too (a 500 shows there even when every step "passes").
 
-You wrote the DOM, so target elements directly by selector — don't guess at pixel coordinates.
+Elements are targeted by selector rather than pixel coordinates.
 
 **Shared action-sequence JSON** (preferred; the CLI's \`--actions\` file uses this exact array):
 
@@ -9796,10 +10392,14 @@ You wrote the DOM, so target elements directly by selector — don't guess at pi
 ]
 \`\`\`
 
+Files over the 10 MB inline limit come from project files via \`{ "upload": "#video", "fs_path": "/uploads/big.mp4" }\` (optional \`name\`, \`type\`; up to 50 MB per call, streamed into the page).
+
 \`wait\` is a CSS selector string or a millisecond number. \`expect\` requires a selector and at least one of \`text\` (substring), \`visible\` (boolean), or \`count\` (exact non-negative integer); conditions may be combined. A failed action stops the sequence and names its zero-based action index.
 
+Native \`alert\`/\`confirm\`/\`prompt\`/\`beforeunload\` dialogs are dismissed by default and listed in the report's \`dialogs\`. \`{ "dialog": "accept" }\` (with \`"text"\` for a prompt) right before the action that opens one accepts it; the answer applies to the next dialog only.
+
 Expanded \`steps\` remain runtime-compatible for older callers, but are not a
-second authoring contract. Use \`actions\` for new flows. A failed action aborts
+second authoring contract. \`actions\` is the form for new flows. A failed action aborts
 the run while preserving console, network, and screenshot state.
 
 **Examples:**
@@ -9825,7 +10425,7 @@ the run while preserving console, network, and screenshot state.
         actions: {
           type: 'array',
           maxItems: 30,
-          description: 'Concise action sequence requiring project_id and a project-owned navigation origin. Each item has one action key: {click:selector}, {fill:selector,value}, {upload:selector,file:data-url-or-base64,name?}, {select:selector,value}, {wait:selector|ms}, {expect:{selector,text?|value?|visible?|count?}}, {screenshot:label}, or {eval:js}. The CLI additionally resolves a local path in upload.file before calling the hosted API. Execution stops on the first failure, and every result includes ok plus an error reason when false.',
+          description: 'Concise action sequence requiring project_id and a project-owned navigation origin. Each item has one action key: {click:selector}, {fill:selector,value}, {upload:selector,file:data-url-or-base64,name?} or {upload:selector,fs_path:"/stored/file",name?,type?} (a project file up to 50 MB per call), {select:selector,value}, {wait:selector|ms}, {expect:{selector,text?|value?|visible?|count?}}, {screenshot:label}, {eval:js}, or {goto:"/path"} (a path on the app; a continued session_id resumes on the page it left, so use goto to move). The CLI additionally resolves a local path in upload.file before calling the hosted API. Execution stops on the first failure, and every result includes ok plus an error reason when false.',
           items: { type: 'object' },
         },
         steps: { type: 'array', description: 'Legacy ordered step objects requiring project_id and a project-owned navigation origin. Each step has an action plus its fields; `frame` targets an iframe. An omitted or empty array performs inspection without driving. Ignored when html is set.', items: { type: 'object' } },
@@ -9845,21 +10445,24 @@ the run while preserving console, network, and screenshot state.
         visible_only: { type: 'boolean', description: 'When true, dom_outline omits hidden controls. Every returned node still carries visible, plus disabled when applicable.' },
         include: { type: 'array', description: 'Opt-in heavy sections for a no-steps inspect call. Values: "network" (full request table and redirect chain), "dom" (interactive-element outline and testid handles), and "markdown" (clean page structure). Example: ["network","dom","markdown"]. console_errors, page_errors, failed_requests, and rendered_text are always returned. On a steps run, "dom" describes the final page; "network" and "markdown" apply to no-steps inspection.', items: { type: 'string', enum: ['network', 'dom', 'markdown'] } },
         extract: { type: 'string', description: 'Structured extraction shortcut for a no-steps inspect call (same as include:["markdown"]). "markdown" (or true) → return the page as clean MARKDOWN in the `markdown` field — headings, links, lists, emphasis, main content only — the cheapest way to READ a page vs vision-parsing a screenshot or grepping rendered_text. "text" is a no-op (the plain rendered text is already returned as `rendered_text`). Bounded.', enum: ['markdown', 'text'] },
-        session_id: { type: 'string', description: 'Opt-in persistent-session handle requiring project_id and a project-owned origin (1–64 letters, digits, dots, dashes, or underscores). Reusing it reconnects to one live page with cookies, current URL, and in-flight requests preserved. The first call returns session_id and session_expires_at; reconnect skips initial navigation. Sessions are caller-scoped, plan-capped, idle about 3 minutes, and have about a 10-minute hard cap. Omission creates a fresh browser for every call.' },
+        session_id: { type: 'string', description: `Opt-in persistent-session handle requiring project_id and a project-owned origin (1–64 letters, digits, dots, dashes, or underscores). Reusing it reconnects to one live page with cookies, current URL, and in-flight requests preserved. The first call returns session_id and session_expires_at; reconnect skips initial navigation. Sessions belong to the authenticated account and to the project they were opened for: the same name in another project is a different session. Live sessions count against one plan limit shared by all of the account's projects; they idle out after ${BROWSER_SESSION_IDLE_MINUTES} minutes and have a ${BROWSER_SESSION_HARD_CAP_MINUTES}-minute hard cap. A project session closes with { project_id, session_id, close: true }. Omission creates a fresh browser for every call.` },
         help: { type: 'boolean', description: 'True returns the full action reference, including action fields, frame targeting, and wait/eval semantics, without running a browser.' },
         viewport: { type: ['string', 'object'], description: "Layout viewport geometry: 'desktop' (1280×800, default), 'mobile' (390×844), or { \"width\": 1600, \"height\": 1200 } within width 100–3840 and height 100–2160. This controls page layout; `capture.width` only shrinks the output image." },
         inline: { type: 'boolean', description: 'Inline MCP image output, default true. Page/steps mode inlines only the final page shot; step screenshots remain stored paths. Html mode inlines the rendered snippet. The durable file path remains in output. Images above about 750KB are not inlined; false disables inline image output.' },
         store: { type: 'boolean', description: 'External inspection without project_id only. True stores the full-resolution screenshot in ephemeral scratch storage and returns a short-lived signed URL instead of inline base64. It never uses project storage. With project_id this field is ignored because screenshots save to project files. Default false.' },
         capture: { type: 'object', description: 'Capture configuration. `as` is png, jpeg, webp, or pdf; `full_page` covers the scrollable page; `width` is output width (default 800) and does not change layout; `quality` is 1–100 for jpeg/webp (default 70). PDF fields are `paper`, `landscape`, and `print_background`. It applies to no-steps capture and screenshot steps.' },
-        screenshot: { type: 'object', description: 'Deprecated spelling of `capture` (same fields; `format` is accepted as an alias of `as`). Kept working for existing callers — new code should use `capture`.' },
+        screenshot: { type: 'object', description: 'Deprecated spelling of `capture` (same fields; `format` is accepted as an alias of `as`). Kept working for existing callers — `capture` supersedes it.' },
         auth: { type: 'object', description: 'Drive as a logged-in user: { "user_id": "..." }. Mints a 1-hour impersonation session for that app user (audited) and injects it before navigation. Requires a project. Ignored when `html` is set.' },
         continue_on_failure: { type: 'boolean', description: 'True continues after failed steps; false (default) aborts at the first failure while preserving captured signals.' },
+        budget_ms: { type: 'integer', minimum: 10000, maximum: 180000, description: 'Execution cap for the whole run in milliseconds (10000–180000, default 60000). An action starts only if its own deadline fits in what is left; otherwise the run stops with `incomplete` and the remaining steps are reported `ran: false` (never passed, never retried).' },
+        close: { type: 'boolean', description: 'True closes the named session instead of running a browser. For a project session, project_id must match the opening project; url, steps and other options are not accepted. A session opened without a project closes with session_id alone.' },
+        require_existing_session: { type: 'boolean', description: 'With session_id: continue ONLY the live session and its recorded page. A missing, expired or lost session is refused with 409 SESSION_EXPIRED / SESSION_TARGET_LOST before anything starts; nothing is launched, seeded or navigated. Not allowed with auth, cookies, local_storage or headers.' },
         storage: { type: 'string', description: 'Project-file path for the final capture, requiring project_id, e.g. "/renders/hero.webp" or "/invoices/inv-1234.pdf". It works with URL capture, html rendering, and steps; the response includes the stored path. Without it, the image is inline. Screenshot steps retain their own labelled files under /_browser_tests/.' },
         local_storage: { type: 'object', description: 'Key/value localStorage session seed requiring url, project_id, and a project-owned origin. The standard auth client uses "sw_auth". Values are never logged. local_storage, cookies, and headers share an 8KB cap. Backend origin policy governs their delivery to owned-app requests and frames.' },
         cookies: { type: 'array', description: 'Array of { name, value } cookies set on the target origin before load. Same origin scoping and size cap as local_storage.', items: { type: 'object' } },
         headers: { type: 'object', description: 'Flat object of extra request headers (e.g. Authorization) sent with page requests. Same origin scoping and size cap as local_storage.' },
-        width: { type: 'number', description: 'Legacy flat alias for viewport width (prefer `viewport: { width, height }`). With `html`, the snippet viewport width (default 1280).' },
-        height: { type: 'number', description: 'Legacy flat alias for viewport height (prefer `viewport: { width, height }`). With `html`, the snippet viewport height (default 800).' },
+        width: { type: 'number', description: 'Legacy flat alias for viewport width (superseded by `viewport: { width, height }`). With `html`, the snippet viewport width (default 1280).' },
+        height: { type: 'number', description: 'Legacy flat alias for viewport height (superseded by `viewport: { width, height }`). With `html`, the snippet viewport height (default 800).' },
         wait_for: { type: ['string', 'object'], description: 'A wait to satisfy BEFORE the capture. A CSS selector string, or ANY wait_for condition object: { "selector": "#status", "contains": "Ready" }, { "text": "All loaded" }, { "text_gone": "Loading…" }, { "settled": true }, { "network_idle": true }, { "url": "/dashboard" }, { "predicate": "window.__ready === true" } — with optional `timeout` / `idle_ms` / `frame`. Same condition engine as a wait_for step, so a rich wait now composes with `storage` in ONE call. On a `steps` run, sequence the wait as a step instead.' },
       },
       required: [],
@@ -9882,12 +10485,13 @@ the run while preserving console, network, and screenshot state.
       inputSchema: {
         type: 'object',
         properties: {
-          project_id: { type: 'string', description: 'Owned project authority. Required for actions, eval, authentication, and session seeds; it also enables screenshots in project files.' },
+          budget_ms: { type: 'integer', minimum: 10000, maximum: 180000, description: 'Execution budget in milliseconds, including startup (default 180000). A transport timeout has an unknown outcome; actions are not replayed automatically.' },
+        project_id: { type: 'string', description: 'Owned project authority. Required for actions, eval, authentication, and session seeds; it also enables screenshots in project files.' },
           url: { type: 'string', description: 'Public live URL. Without project_id, external URLs support inspection and screenshots only. With project_id, navigation and action targets must remain on an authorized origin owned by that project. Normal external assets and APIs loaded by the owned app remain available under backend policy.' },
           actions: {
             type: 'array',
             maxItems: 30,
-            description: 'Concise browser actions requiring project_id and a project-owned navigation origin: {click}, {fill,value}, {upload,file,name?}, {select,value}, {wait}, {expect:{selector,text?|visible?|count?}}, {screenshot}, or {eval}. Execution stops at the first failed action and names its 1-based step in the verdict.',
+            description: 'Concise browser actions requiring project_id and a project-owned navigation origin: {click}, {fill,value}, {upload,file|fs_path,name?,type?} (fs_path: a project file up to 50 MB per call), {select,value}, {wait}, {expect:{selector,text?|visible?|count?}}, {screenshot}, {eval}, or {goto:"/path"}. Execution stops at the first failed action and names its 1-based step in the verdict.',
             items: { type: 'object' },
           },
           auth: {
@@ -10044,15 +10648,15 @@ Note the rename: the paper size is \`capture.paper\`, because \`format\` used to
     name: 'web_scrape',
     description: `Fetch a public web page and return its content as clean markdown (default), with optional html, raw_html, links, and screenshot. Strips nav/footer/sidebar by default so you get the main article body.
 
-Use this when you need to read a page an agent doesn't have local access to — docs, blog posts, marketing pages, articles. The response is page metadata (title, description, language) plus the requested formats. If the page served a bot-challenge interstitial ("verify you are human") instead of real content, the response carries \`challenge_detected: true\` — treat the content as unusable and don't retry in a loop.
+It reads pages that are not otherwise locally accessible — docs, blog posts, marketing pages, articles. The response is page metadata (title, description, language) plus the requested formats. If the page served a bot-challenge interstitial ("verify you are human") instead of real content, the response carries \`challenge_detected: true\` — that content is not the page, and an immediate retry usually returns the same challenge.
 
 **Screenshot format** (\`formats: ["screenshot"]\`) uses the same three-tier answer as \`browser\`: small enough (auto-downscaled) → inline \`data:image/...;base64,...\`; too large with no \`storage\` → a short-TTL \`scratch_url\` you don't have to clean up; \`storage: "/path.jpg"\` set → written permanently to project files, returned as \`{ storage_path, size_bytes }\`.
 
 **Example:**
 
 \`\`\`json
-{ "project_id": "my-saas", "url": "https://docs.somewhere.tech/getting-started" }
-// Returns: { "url": "...", "title": "Getting started", "markdown": "# Getting started\\n...", "status_code": 200 }
+{ "project_id": "my-saas", "url": "https://somewhere.cloud/docs/getting-started.txt" }
+// Returns: { "url": "...", "title": "Start an app", "markdown": "# Start an app\\n...", "status_code": 200 }
 \`\`\`
 
 \`\`\`json
@@ -10069,7 +10673,7 @@ Use this when you need to read a page an agent doesn't have local access to — 
         url: { type: 'string', description: 'http(s) URL to scrape, max 2048 chars.' },
         formats: { type: ['string', 'array'], description: 'Optional array (or JSON-stringified array) of formats to return. Allowed: markdown, html, rawHtml, links, screenshot. Default: ["markdown"]. Example: \'["markdown","links"]\'.' },
         only_main: { type: 'boolean', description: 'Strip nav/footer/sidebar to keep only the main article content. Default true.' },
-        wait_for: { type: 'number', description: 'Optional milliseconds to wait for the page to settle before scraping (max 30000). Use for SPAs that hydrate after load.' },
+        wait_for: { type: 'number', description: 'Optional milliseconds to wait for the page to settle before scraping (max 30000). For SPAs that hydrate after load.' },
         storage: { type: 'string', description: 'Only meaningful with formats:["screenshot"]. A project files path like "/scratch/hero.jpg" to write the shot permanently instead of the default inline/ephemeral behavior. Returns { storage_path, size_bytes } instead of the image bytes.' },
       },
       required: ['project_id', 'url'],
@@ -10103,9 +10707,9 @@ Use this when you need to read a page an agent doesn't have local access to — 
   {
     definition: {
     name: 'web_search',
-    description: `Search the public web by keyword. Returns up to 20 results — each with url, title, description, age, and source — without page bodies. Pair with \`web_scrape\` when you want the full content of a specific result.
+    description: `Search the public web by keyword. Returns up to 20 results — each with url, title, description, age, and source — without page bodies. \`web_scrape\` returns the full content of a specific result.
 
-Use this when an agent needs to find current information it doesn't have — recent news, comparison pages, error references, library docs by name. Results are ranked by the upstream search index, not your project.
+It finds current information — recent news, comparison pages, error references, library docs by name. Results are ranked by the upstream search index, not your project.
 
 **Example:**
 
@@ -10157,7 +10761,7 @@ Use this when an agent needs to find current information it doesn't have — rec
   {
     definition: {
     name: 'ingest',
-    description: `Point an app at a website and it becomes data: crawl a site, land every page as markdown in the project's files, and index it into the project's search — one call instead of wiring up a crawler, a file store, and a search index yourself. Always runs as a background job (crawls take minutes) — this call returns immediately with a \`job_id\`; poll it with \`tasks_get\`-style status via the jobs API, or just call \`search_query\` against the \`"ingest"\` index once you expect it's done.
+    description: `Point an app at a website and it becomes data: crawl a site, land every page as markdown in the project's files, and index it into the project's search — one call instead of wiring up a crawler, a file store, and a search index yourself. Always runs as a background job (crawls take minutes) — this call returns immediately with a \`job_id\`; the jobs API reports its status, and \`search_query\` against the \`"ingest"\` index returns results once it completes.
 
 The crawl never follows a link off the seed URL's exact host — it can't wander onto another site. Re-ingesting the same URL overwrites the same file and search item rather than duplicating it, so re-running ingest after a docs site updates is safe.
 
@@ -10177,7 +10781,7 @@ Then, once the job completes:
     inputSchema: {
       type: 'object',
       properties: {
-        idempotency_key: { type: 'string', maxLength: 200, description: 'Stable key for one logical creation. Reuse it with identical arguments after a lost response; use a new key for independent work.' },
+        idempotency_key: { type: 'string', maxLength: 200, description: 'Stable key for one logical creation. The same key with identical arguments is safe after a lost response; independent work takes a new key.' },
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
         url: { type: 'string', description: 'Seed http(s) URL to start crawling from, max 2048 chars. Only pages on this exact host are ever crawled.' },
         max_pages: { type: 'number', description: 'Maximum pages to crawl (1-200, default 50).' },
@@ -10214,7 +10818,7 @@ Then, once the job completes:
   {
     definition: {
     name: 'push_vapid_key',
-    description: `**Building notifications that must arrive after the app tab closes?** Start by getting the project's VAPID public key, then pass it to \`PushManager.subscribe({ applicationServerKey })\` in the browser. The key is auto-generated and stable for the project's lifetime.
+    description: `**Building notifications that must arrive after the app tab closes?** The flow starts with the VAPID public key of the project, which the browser passes to \`PushManager.subscribe({ applicationServerKey })\`. The key is auto-generated and stable for the project's lifetime.
 
 **Example:**
 
@@ -10252,15 +10856,15 @@ Then, once the job completes:
   {
     definition: {
     name: 'push_subscribe',
-    description: `**After the browser returns a \`PushManager.subscribe()\` result, persist it here** so later \`push_send\` calls can reach that browser or app-user. This is the ONLY registration path today: it needs developer authority (this tool or \`POST /v1/push/subscribe\` with a developer key), an app-user session is not authorized for it, and \`sw.push.subscribe\` inside a deployed function throws \`PUSH_SUBSCRIBE_UNAVAILABLE\` — so an app's visitors cannot register themselves. Idempotent on (project_id, endpoint).
+    description: `**Register your own browser as a developer device** for operator alerts, after it returns a \`PushManager.subscribe()\` result. Developer devices carry no app-user id; reach them with \`push_send({ audience: 'developer' })\`. App users register their own browsers from a signed-in session (\`somewhere:push\` \`enablePush()\` or \`sw.push.subscribe\` in a function), never through this tool. Idempotent on (project_id, endpoint).
 
 **Example:**
 
 \`\`\`json
 {
   "project_id": "my-saas",
-  "subscription": { "endpoint": "https://fcm...", "keys": { "p256dh": "...", "auth": "..." } },
-  "user_id": "u_alice"
+  "subscription": { "endpoint": "https://fcm.googleapis.com/fcm/send/...", "keys": { "p256dh": "...", "auth": "..." } },
+  "label": "My laptop"
 }
 \`\`\``,
     inputSchema: {
@@ -10268,7 +10872,7 @@ Then, once the job completes:
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
         subscription: { type: ['string', 'object'], description: 'JSON object (or stringified) exactly as returned by PushManager.subscribe(). Must contain `endpoint` and `keys.{p256dh, auth}`.' },
-        user_id: { type: 'string', description: 'Optional end-user identifier to attach to the subscription. Used to target sends with `user_id`.' },
+        label: { type: 'string', description: 'Optional device name shown in push history (max 120 characters).' },
       },
       required: ['project_id', 'subscription'],
     },
@@ -10287,7 +10891,7 @@ Then, once the job completes:
         result = await callAPI(fetcher, 'POST', '/v1/push/subscribe', authHeader, {
           project_id: args.project_id,
           subscription,
-          ...(args.user_id !== undefined ? { user_id: args.user_id } : {}),
+          ...(args.label !== undefined ? { label: args.label } : {}),
         });
         return result;
 
@@ -10335,12 +10939,13 @@ Then, once the job completes:
   {
     definition: {
     name: 'push_send',
-    description: `**Need an alert to reach a user even when the app tab is closed?** \`push_send\` sends a web push notification to one endpoint, one app-user's subscriptions, or the whole project.
+    description: `**Need an alert to reach a user even when the app tab is closed?** \`push_send\` sends a web push notification to one device, one app-user's devices, your developer devices, or the whole project.
 
-Recipient targeting (pick one):
-- \`endpoint\`: send to a single subscription (idempotent retry).
-- \`user_id\`: fan out to every subscription registered for that app-user.
-- neither: broadcast to every subscription in the project — use sparingly.
+Recipient targeting (exactly one; a missing, null or empty target is refused):
+- \`user_id\`: every device that signed-in app user registered.
+- \`subscription_id\` or \`endpoint\`: one device. Sending again sends another notification.
+- \`audience: 'developer'\`: devices registered with \`push_subscribe\`.
+- \`audience: 'all'\`: every device in the project (refused whole above 500).
 
 \`payload\` may be a JSON object (recommended — your service worker parses it) or a string. Subscriptions that the push provider reports as gone (404/410) are auto-deleted. Inside a deployed function the equivalent call is \`sw.push.send({ payload, user_id })\` — one object, payload nested; there is no second options argument.
 
@@ -10352,15 +10957,17 @@ Recipient targeting (pick one):
   "user_id": "u_alice",
   "payload": { "title": "New message", "body": "From Bob", "url": "/inbox/123" }
 }
-// Returns: { "sent": 1, "failed": 0, "gone": 0, "recipients": 1 }
+// Returns: { "sent": 1, "failed": 0, "gone": 0, "captured": 0, "recipients": 1, "history_recorded": true, "devices": [{ "subscription_id": "psub_...", "device_label": "Chrome on Android", "outcome": "sent", "http_status": 201, ... }] }
 \`\`\``,
     inputSchema: {
       type: 'object',
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
         payload: { type: ['string', 'object'], description: 'Notification body. JSON object or string. Your service worker reads this in the push event.' },
-        user_id: { type: 'string', description: 'Optional: send to every subscription for this app-user.' },
+        user_id: { type: 'string', description: 'Send to every device this app user registered.' },
         endpoint: { type: 'string', description: 'Optional: send to a single subscription by its endpoint URL.' },
+        subscription_id: { type: 'string', description: 'Optional: send to one device by its id (from push_deliveries).' },
+        audience: { type: 'string', enum: ['developer', 'all'], description: "Optional: 'developer' sends only to devices registered with push_subscribe; 'all' broadcasts to every device in the project." },
         ttl: { type: 'number', description: 'Optional time-to-live in seconds (default 86400). The push service holds the message at most this long if the device is offline.' },
         contact: { type: 'string', description: 'Optional VAPID contact (mailto:you@example.com). Defaults to the platform contact.' },
       },
@@ -10389,6 +10996,8 @@ Recipient targeting (pick one):
           payload,
           ...(args.user_id !== undefined ? { user_id: args.user_id } : {}),
           ...(args.endpoint !== undefined ? { endpoint: args.endpoint } : {}),
+          ...(args.subscription_id !== undefined ? { subscription_id: args.subscription_id } : {}),
+          ...(args.audience !== undefined ? { audience: args.audience } : {}),
           ...(args.ttl !== undefined ? { ttl: Number(args.ttl) } : {}),
           ...(args.contact !== undefined ? { contact: args.contact } : {}),
         });
@@ -10397,13 +11006,51 @@ Recipient targeting (pick one):
       }
     },
   },
+  {
+    definition: {
+    name: 'push_deliveries',
+    description: `**Why didn't a notification arrive?** Read per-device push history, newest first: each send's device, outcome (\`sent\`, \`failed\` with the HTTP status and a reason, \`gone\` when the browser revoked the device, \`captured\` for a test inbox device), title, URL and time. Test-inbox deliveries include the full payload, so a hosted browser can prove a user was notified. Returns the last seven days.
+
+**Example:**
+
+\`\`\`json
+{ "project_id": "my-saas", "user_id": "usr_123", "limit": 10 }
+// Returns: { "deliveries": [{ "device_label": "Chrome on Android", "outcome": "failed", "http_status": 403, "error": "The push service refused the signing key (403). Re-subscribe this device.", "title": "New message", "created_at": "..." }] }
+\`\`\``,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
+        user_id: { type: 'string', description: 'Optional: only deliveries to this app user.' },
+        subscription_id: { type: 'string', description: 'Optional: only deliveries to this device.' },
+        limit: { type: 'number', description: 'Optional: rows to return (default 50, max 200).' },
+      },
+      required: ['project_id'],
+    },
+  },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    group: 'push',
+    core: false,
+    visibility: 'authenticated',
+    paid: false,
+    surfaces: ["full"],
+    execute: async (runtime, args) => {
+      const { fetcher, authHeader } = runtime;
+      const query = new URLSearchParams({ project_id: String(args.project_id) });
+      if (args.user_id !== undefined) query.set('user_id', String(args.user_id));
+      if (args.subscription_id !== undefined) query.set('subscription_id', String(args.subscription_id));
+      if (args.limit !== undefined) query.set('limit', String(args.limit));
+      const result: ToolUpstreamResult = await callAPI(fetcher, 'GET', `/v1/push/deliveries?${query.toString()}`, authHeader);
+      return result;
+    },
+  },
   // ── rate_limit ─────────────────────────────────────────────
   {
     definition: {
     name: 'rate_limit_check',
     description: `Atomically check and increment a rate-limit counter. Each call counts as one hit against \`key\` for the current fixed window. Returns whether this hit is allowed and how many remain.
 
-Use this when you'd otherwise hand-roll per-IP / per-user throttling. Window granularity is per-second; pick \`window_seconds\` based on the cadence you want (60 for per-minute, 3600 for per-hour, etc.). The platform handles atomicity; race-safe for typical throttling use.
+It replaces hand-rolled per-IP / per-user throttling. Window granularity is per-second; \`window_seconds\` sets the cadence (60 for per-minute, 3600 for per-hour, etc.). The platform handles atomicity; race-safe for typical throttling use.
 
 **Example:**
 
@@ -10449,7 +11096,7 @@ Use this when you'd otherwise hand-roll per-IP / per-user throttling. Window gra
     name: 'telegram_link',
     description: `Mint a one-time link code and return a t.me URL the user clicks to connect their Telegram account to the platform. The link expires in 10 minutes. After the user clicks /start in Telegram, the link is finalized server-side.
 
-Use this when you want to offer "Connect Telegram" as a setup step inside an app flow. Once linked, the user can talk to the bot to control their hosted workspace.
+It supports a "Connect Telegram" setup step inside an app flow. Once linked, the user can talk to the bot to control their hosted workspace.
 
 **Example:**
 
@@ -10509,7 +11156,7 @@ Use this when you want to offer "Connect Telegram" as a setup step inside an app
   {
     definition: {
     name: 'analytics_track',
-    description: `**Building anything with users?** \`analytics_track\` gives the app per-event product analytics with one call. Track the moment a user signs up, starts checkout, purchases, publishes, or completes another product action; query it within seconds via \`analytics_query\`. Up to 20 numeric properties are automatically aggregatable (sum/avg).
+    description: `**Building anything with users?** \`analytics_track\` gives the app per-event product analytics with one call. Track the moment a user signs up, starts checkout, purchases, publishes, or completes another product action; \`analytics_query\` returns it within seconds. Up to 20 numeric properties are automatically aggregatable (sum/avg).
 
 **Example:**
 
@@ -10525,7 +11172,7 @@ Use this when you want to offer "Connect Telegram" as a setup step inside an app
       type: 'object',
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
-        event: { type: 'string', description: 'Event name, max 128 chars. Keep it stable — this is what you filter on later (e.g. "signup", "checkout_started").' },
+        event: { type: 'string', description: 'Event name, max 128 chars. A stable name matters — it is the filter key later (e.g. "signup", "checkout_started").' },
         user_id: { type: 'string', description: 'Optional end-user identifier to group events by user.' },
         properties: { type: 'string', description: 'Optional JSON object of custom properties. Numeric values become aggregatable. Max 8KB. Example: \'{"plan":"pro","amount":49,"items":3}\'' },
         page: { type: 'string', description: 'Optional page URL where the event fired.' },
@@ -10593,7 +11240,7 @@ Use this when you want to offer "Connect Telegram" as a setup step inside an app
         event: { type: 'string', description: 'Optional event name to filter on. If omitted, all events match.' },
         from: { type: ['string', 'number'], description: 'Optional start time — ISO-8601 string or unix-ms integer.' },
         to: { type: ['string', 'number'], description: 'Optional end time — ISO-8601 string or unix-ms integer.' },
-        group_by: { type: 'string', description: 'Optional. One of: hour, day, event, user. Omit for raw event rows (most recent first).' },
+        group_by: { type: 'string', description: 'Optional. One of: hour, day, event, user. Omitted: raw event rows (most recent first).' },
         limit: { type: 'number', description: 'Max rows (default 1000, max 10000).' },
       },
       required: ['project_id'],
@@ -10664,7 +11311,7 @@ Use this when you want to offer "Connect Telegram" as a setup step inside an app
   {
     definition: {
     name: 'security_verify',
-    description: `Verify a CAPTCHA token submitted from a form. Call this server-side before trusting the form data.
+    description: `Verify a CAPTCHA token submitted from a form. It runs server-side; form data is untrusted until the token verifies.
 
 **Example:**
 
@@ -10709,7 +11356,7 @@ Tier picks the depth: Free / Builder get a fast, broad-strokes AI review. Pro / 
 
 Advisory only — never blocks anything. The deploy path no longer runs a regex scanner as a blocker; it surfaces hits as warnings and this tool is how you get the deep dive.
 
-project_id is required (returns VALIDATION_ERROR if omitted). Backend failures are distinguishable so you don't retry in vain: a transient outage returns UPSTREAM_DOWN / UPSTREAM_RATE_LIMITED (retryable), while a persistent platform problem returns UPSTREAM_ERROR / CONFIG_ERROR (not retryable — report it instead of looping).
+project_id is required (returns VALIDATION_ERROR if omitted). Backend failures are distinguishable, so a retry is never wasted on a persistent failure: a transient outage returns UPSTREAM_DOWN / UPSTREAM_RATE_LIMITED (retryable), while a persistent platform problem returns UPSTREAM_ERROR / CONFIG_ERROR (not retryable — a retry loop does not clear it).
 
 **Example:**
 
@@ -10751,7 +11398,7 @@ project_id is required (returns VALIDATION_ERROR if omitted). Backend failures a
   {
     definition: {
     name: 'db_bookmark_create',
-    description: `Record a named marker around a database migration. It is operational evidence, not an undo point: restoring a database in place is unavailable and db_restore refuses with \`DATABASE_RESTORE_UNAVAILABLE\`. Use db_dump or db_export to create a recoverable copy. Reusing a label overwrites the previous marker.
+    description: `Record a named marker around a database migration. It is operational evidence, not an undo point: restoring a database in place is unavailable and db_restore refuses with \`DATABASE_RESTORE_UNAVAILABLE\`. db_dump or db_export creates a recoverable copy. Reusing a label overwrites the previous marker.
 
 **Example:**
 
@@ -10789,7 +11436,7 @@ project_id is required (returns VALIDATION_ERROR if omitted). Backend failures a
   {
     definition: {
     name: 'db_bookmarks_list',
-    description: 'List named markers recorded around database migrations. Restoring in place is unavailable; these markers are operational evidence, not undo points. Use db_dump or db_export for a recoverable copy.',
+    description: 'List named markers recorded around database migrations. Restoring in place is unavailable; these markers are operational evidence, not undo points. db_dump or db_export makes a recoverable copy.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -10817,7 +11464,7 @@ project_id is required (returns VALIDATION_ERROR if omitted). Backend failures a
   {
     definition: {
     name: 'db_restore',
-    description: `Restoring a project database in place is not available: this call is refused with \`DATABASE_RESTORE_UNAVAILABLE\` before anything changes, for every project. No restore is admitted, so there is no restore outcome to read. Kept so older callers get a typed refusal rather than an unknown tool. Use db_dump or db_export to create a recoverable copy.`,
+    description: `Restoring a project database in place is not available: this call is refused with \`DATABASE_RESTORE_UNAVAILABLE\` before anything changes, for every project. No restore is admitted, so there is no restore outcome to read. Kept so older callers get a typed refusal rather than an unknown tool. db_dump or db_export creates a recoverable copy.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -10853,7 +11500,7 @@ project_id is required (returns VALIDATION_ERROR if omitted). Backend failures a
     name: 'db_webhook_set',
     description: `Register an HTTPS endpoint to receive database change notifications for this project. Fires after a successful INSERT / UPDATE / UPSERT / DELETE through db_query — one POST per mutation, no row contents.
 
-The first call generates a per-project secret you'll see in the response (\`secret\`). Subsequent calls update the URL or event filter and return the same secret. Verify the incoming \`X-Somewhere-Signature: t={ms},v1={hex}\` header by recomputing \`HMAC-SHA256(secret, "{ms}." + rawBody)\`.
+The first call generates a per-project secret you'll see in the response (\`secret\`). Subsequent calls update the URL or event filter and return the same secret. The incoming \`X-Somewhere-Signature: t={ms},v1={hex}\` header verifies by recomputing \`HMAC-SHA256(secret, "{ms}." + rawBody)\`.
 
 **Example:**
 
@@ -10986,7 +11633,7 @@ The first call generates a per-project secret you'll see in the response (\`secr
   {
     definition: {
     name: 'webhook_delivery_redrive',
-    description: 'Redrive one project outbound webhook delivery using the exact immutable request bytes and the same stable event and delivery ids. The new attempt is appended to delivery history. Use the receiver-facing delivery id for dedupe, especially when the prior outcome is indeterminate.',
+    description: 'Redrive one project outbound webhook delivery using the exact immutable request bytes and the same stable event and delivery ids. The new attempt is appended to delivery history. The receiver-facing delivery id supports dedupe, especially when the prior outcome is indeterminate.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -11019,7 +11666,7 @@ The first call generates a per-project secret you'll see in the response (\`secr
   {
     definition: {
     name: 'connect_stripe_url',
-    description: `Get a link that lets a creator connect their EXISTING Stripe account read-only, so this project can read their subscriber list — the "gated content with your existing subscribers" use case. Returns { url }; send the creator's browser there to authorize. This is the OPPOSITE of payments_* (which is for ACCEPTING money) — connect reads another account's data, it never moves money.
+    description: `Get a link that lets a creator connect their EXISTING Stripe account read-only, so this project can read their subscriber list — the "gated content with your existing subscribers" use case. Returns { url }; the creator's browser authorizes there. This is the OPPOSITE of payments_* (which is for ACCEPTING money) — connect reads another account's data, it never moves money.
 
 **Example:**
 
@@ -11060,7 +11707,7 @@ The first call generates a per-project secret you'll see in the response (\`secr
     definition: {
     name: 'connect_stripe_subscribers',
     description:
-      "List the subscribers of the Stripe account connected to this project. Reads the platform's cached list (kept fresh by the Connect webhook) — fast, no per-call Stripe round-trip. Each row: { email, stripe_customer_id, subscription_id, status, price_id, product_id, tier, current_period_end (Unix seconds), amount, currency }. `tier` is the Stripe Price nickname or lookup_key. Paginated: pass `cursor` (the previous response's next_cursor) to page. Returns 409 CONNECT_NOT_CONNECTED if no Stripe account is connected yet — call connect_stripe_url first.",
+      "List the subscribers of the Stripe account connected to this project. Reads the platform's cached list (kept fresh by the Connect webhook) — fast, no per-call Stripe round-trip. Each row: { email, stripe_customer_id, subscription_id, status, price_id, product_id, tier, current_period_end (Unix seconds), amount, currency }. `tier` is the Stripe Price nickname or lookup_key. Paginated: pass `cursor` (the previous response's next_cursor) to page. Returns 409 CONNECT_NOT_CONNECTED if no Stripe account is connected yet — connect_stripe_url comes first.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -11157,21 +11804,24 @@ The first call generates a per-project secret you'll see in the response (\`secr
   {
     definition: {
     name: 'payments_onboard',
-    description: `Start Stripe Connect onboarding for the developer (per-account, not per-project — onboard once and every project you own uses the same connected account). Returns a URL the developer visits to set up identity, bank, and tax info for live charges. Charges then settle to their connected account with Stripe's standard processing fee deducted; the response carries the current platform fee so the onboarding UI can show it.
+    description: `Start Stripe Connect onboarding for the developer (per-account, not per-project — onboard once and every project you own uses the same connected account). \`mode\` picks which account: \`live\` (the default) returns a URL the developer visits to set up identity, bank, and tax info for live charges, which then settle to their connected account with Stripe's standard processing fee deducted; \`test\` sets up a test-mode connected account (no real charges). The response carries the current platform fee so the onboarding UI can show it.
 
-**You do NOT need this to start building.** Test-mode checkouts work immediately — payments_checkout in dev mode runs on the platform's own Stripe test account (no Connect destination, no fee) until you onboard, so card 4242 4242 4242 4242 succeeds with no setup.
+**Building starts without this.** Test-mode checkouts work immediately — payments_checkout in dev mode runs on the platform's own Stripe test account (no Connect destination, no fee) until you onboard, so card 4242 4242 4242 4242 succeeds with no setup. Test onboarding is only for exercising your own connected test account.
+
+A test response is \`{ mode: 'test', test_only: true, charges_enabled, checkout_ready, onboarding_url, expires_at }\`. When the test account is already ready, \`onboarding_url\` and \`expires_at\` are null and there is nothing to visit; otherwise visit the URL to finish it.
 
 **Example:**
 
 \`\`\`json
-{ "return_url": "https://my-app.somewhere.site/done", "refresh_url": "https://my-app.somewhere.site/retry" }
-// Returns: { "onboarding_url": "https://connect.stripe.com/setup/..." }
+{ "mode": "test", "return_url": "https://my-app.somewhere.site/done", "refresh_url": "https://my-app.somewhere.site/retry" }
+// Returns: { "mode": "test", "test_only": true, "checkout_ready": false, "onboarding_url": "https://connect.stripe.com/setup/...", "expires_at": "..." }
 \`\`\``,
     inputSchema: {
       type: 'object',
       properties: {
         refresh_url: { type: 'string', description: 'URL Stripe bounces the user to if the onboarding link expires.' },
         return_url: { type: 'string', description: 'URL Stripe sends the user to when onboarding completes.' },
+        mode: { type: 'string', enum: ['test', 'live'], description: "Which connected account to set up. Default 'live'; 'test' makes no real charges." },
       },
       required: ['refresh_url', 'return_url'],
     },
@@ -11186,9 +11836,15 @@ The first call generates a per-project secret you'll see in the response (\`secr
       const { fetcher, authHeader } = runtime;
       let result: ToolUpstreamResult;
       {
+        if (args.mode !== undefined && args.mode !== 'test' && args.mode !== 'live') {
+          result = { status: 400, data: { ok: false, error: 'VALIDATION_ERROR', message: "mode must be 'test' or 'live'." } };
+          return result;
+        }
+        // Omitted mode keeps the route's live default.
         result = await callAPI(fetcher, 'POST', '/v1/payments/onboard', authHeader, {
           refresh_url: args.refresh_url,
           return_url: args.return_url,
+          ...(args.mode !== undefined ? { mode: args.mode } : {}),
         });
         return result;
 
@@ -11199,7 +11855,7 @@ The first call generates a per-project secret you'll see in the response (\`secr
     definition: {
     name: 'payments_status',
     description:
-      "Get the caller's Stripe Connect status: connected, onboarded, charges_enabled, payouts_enabled, details_submitted. Per-account (not per-project). Pass refresh=true to force a live Stripe API lookup (otherwise returns the last-cached DB state).",
+      "Get the caller's Stripe Connect status: connected, onboarded, charges_enabled, payouts_enabled, details_submitted. Per-account (not per-project). refresh=true forces a live Stripe API lookup (otherwise returns the last-cached DB state).",
     inputSchema: {
       type: 'object',
       properties: {
@@ -11230,22 +11886,22 @@ The first call generates a per-project secret you'll see in the response (\`secr
     definition: {
     name: 'payments_checkout',
     description:
-      "Create a Stripe Checkout Session for a project. Once the project owner has onboarded, funds settle to their connected account; the response's fee_percent is the platform fee on the session (current rate at /v1/pricing) and Stripe's standard processing fee also applies. Before onboarding, env='dev' checkouts run on the platform's own Stripe test account with no Connect destination — the response includes is_stand_in: true and platform_fee_cents: 0 so card 4242 4242 4242 4242 succeeds end-to-end. env='prod' returns 412 until the owner finishes onboarding. Supports mode='payment' | 'subscription'.\n\nThree payment bases (pass exactly one): line_items (ad-hoc), quote_id (a stored quote from a payments quote — server supplies the amount; one-time only, and may compose with calendar_hold_token + booking_id for an atomic booking checkout), or plan (a catalog plan slug — the <PricingTable>/sw.billing subscribe path).\n\nAutomatic plan tracking: pass metadata={\"app_user_id\":\"<id>\",\"plan\":\"<slug>\"} and the platform will set app_users.plan=<slug>, plan_status='active' on checkout.session.completed, 'past_due' on invoice.payment_failed, and 'canceled' on customer.subscription.deleted — no webhook code required. sw.auth.me() and sw.auth.fromRequest() return the current plan and plan_status on the user object.",
+      "Create a Stripe Checkout Session for a project. Once the project owner has onboarded, funds settle to their connected account; the response's fee_percent is the platform fee on the session (current rate at /v1/pricing) and Stripe's standard processing fee also applies. Before onboarding, env='dev' checkouts run on the platform's own Stripe test account with no Connect destination — the response includes is_stand_in: true and platform_fee_cents: 0 so card 4242 4242 4242 4242 succeeds end-to-end. env='prod' returns 412 until the owner finishes onboarding. Supports mode='payment' | 'subscription'.\n\nThree payment bases (exactly one per call): line_items (ad-hoc), quote_id (a stored quote from a payments quote — server supplies the amount; one-time only, and may compose with calendar_hold_token + booking_id for an atomic booking checkout), or plan (a catalog plan slug — the <PricingTable>/sw.billing subscribe path).\n\nPlan tracking: a developer may pass metadata={\"app_user_id\":\"<id>\",\"plan\":\"<slug>\"}; app functions use sw.payments.checkoutForUser for their verified signed-in user. The platform binds the user, price, payment account and test/live mode before checkout, then verifies the payment before granting the selected plan. Live subscriptions keep access during payment retries and lose it when unpaid, paused, canceled or expired. Test purchases are recorded separately and never unlock live access; auth and billing readers currently show live access only. Redeploy older apps normally to enable the runtime user proof. Historical or unmatched payments require reconciliation; metadata alone never grants a plan.",
     inputSchema: {
       type: 'object',
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
         mode: { type: 'string', description: "'payment' for one-time or 'subscription' for recurring." },
         env: { type: 'string', description: "'dev' (default — test-mode Stripe; works without onboarding) or 'prod' (real Stripe; requires the project owner to have onboarded)." },
-        line_items: { type: ['array', 'string'], description: 'Array of line_items. Prefer a native JSON array; a JSON-stringified array is also accepted. Each item is EITHER {price:"<stripe_price_id>", quantity} OR {amount:<integer cents>, currency:"usd", name:"<label>", quantity}. For an ad-hoc price use the {amount, currency, name} trio — a nested Stripe price object is not accepted.' },
+        line_items: { type: ['array', 'string'], description: 'Array of line_items. Accepts a native JSON array; a JSON-stringified array is also accepted. Each item is EITHER {price:"<stripe_price_id>", quantity} OR {amount:<integer cents>, currency:"usd", name:"<label>", quantity}. For an ad-hoc price use the {amount, currency, name} trio — a nested Stripe price object is not accepted.' },
         success_url: { type: 'string', description: 'Redirect URL on successful payment.' },
         cancel_url: { type: 'string', description: 'Redirect URL on cancellation.' },
         customer_email: { type: 'string', description: 'Optional prefilled email for the Checkout page.' },
-        metadata: { type: ['object', 'string'], description: 'Optional key/value object forwarded to the Checkout Session. Prefer a native object; a JSON-stringified object is also accepted. Pass {"app_user_id":"<id>","plan":"<slug>"} to enable automatic plan tracking on app_users (plan + plan_status are maintained by the Connect webhook).' },
-        quote_id: { type: 'string', description: 'Quote-based checkout: the id from a payments quote. The stored quote supplies the line items and amount (server-authoritative), so DO NOT also pass line_items. One-time payment only (not subscription). May be combined with calendar_hold_token and booking_id for an atomic booking checkout.' },
+        metadata: { type: ['object', 'string'], description: 'Optional key/value object forwarded to the Checkout Session. Accepts a native object; a JSON-stringified object is also accepted. A developer may pass {"app_user_id":"<id>","plan":"<slug>"} to bind a plan checkout. App functions use checkoutForUser with the verified caller. Test purchases never change live access; the stored checkout and confirmed payment control the grant.' },
+        quote_id: { type: 'string', description: 'Quote-based checkout: the id from a payments quote. The stored quote supplies the line items and amount (server-authoritative), so line_items is not accepted alongside it. One-time payment only (not subscription). May be combined with calendar_hold_token and booking_id for an atomic booking checkout.' },
         booking_id: { type: 'string', description: 'Optional booking id to link this checkout to a booking record (composed with quote_id).' },
         calendar_hold_token: { type: 'string', description: 'Optional calendar-hold token to atomically confirm a held time slot on successful payment (composed with quote_id).' },
-        plan: { type: 'string', description: 'Catalog-plan checkout: a catalog plan slug (the <PricingTable> / sw.billing subscribe path). Use instead of line_items to check out a predefined plan.' },
+        plan: { type: 'string', description: 'Catalog-plan checkout: a catalog plan slug (the <PricingTable> / sw.billing subscribe path). It replaces line_items to check out a predefined plan.' },
       },
       // A payment basis (line_items, or quote_id, or plan) is required but is
       // enforced in the handler, since exactly one of the three applies.
@@ -11313,7 +11969,7 @@ The first call generates a per-project secret you'll see in the response (\`secr
     definition: {
     name: 'payments_dashboard_link',
     description:
-      "Create a one-time login link to the developer's Stripe Express dashboard (live mode). Use this for \"View payouts\" or \"Update bank details\" buttons in your UI. 400s if the caller has not onboarded for live payments yet.",
+      "Create a one-time login link to the developer's Stripe Express dashboard (live mode). It backs \"View payouts\" or \"Update bank details\" buttons in an app UI. 400s if the caller has not onboarded for live payments yet.",
     inputSchema: {
       type: 'object',
       properties: {},
@@ -11340,14 +11996,14 @@ The first call generates a per-project secret you'll see in the response (\`secr
     definition: {
     name: 'payments_refund',
     description:
-      "Refund a previous charge on the project owner's connected account. Pass `payment_intent_id` (preferred — what Checkout returns) OR `charge_id`. `amount` is in the smallest currency unit (cents); omit for a full refund. `reason` is `requested_by_customer`, `duplicate`, or `fraudulent`. A full refund returns the amount the customer was charged.",
+      "Refund a previous charge on the project owner's connected account. It takes `payment_intent_id` (preferred — what Checkout returns) OR `charge_id`. `amount` is in the smallest currency unit (cents); omitted, the refund is full. `reason` is `requested_by_customer`, `duplicate`, or `fraudulent`. A full refund returns the amount the customer was charged.",
     inputSchema: {
       type: 'object',
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
         payment_intent_id: { type: 'string', description: 'Stripe PaymentIntent id (pi_...). Preferred over charge_id.' },
         charge_id: { type: 'string', description: 'Stripe Charge id (ch_...). Used if payment_intent_id is not provided.' },
-        amount: { type: 'number', description: 'Amount to refund in cents. Omit for a full refund.' },
+        amount: { type: 'number', description: 'Amount to refund in cents. Omitted: a full refund.' },
         reason: { type: 'string', description: "Optional refund reason: 'requested_by_customer', 'duplicate', or 'fraudulent'." },
         env: { type: 'string', description: "'dev' (default — test-mode) or 'prod' (live mode)." },
       },
@@ -11381,7 +12037,7 @@ The first call generates a per-project secret you'll see in the response (\`secr
     definition: {
     name: 'payments_cancel_subscription',
     description:
-      "Cancel a Stripe subscription on the project owner's connected account. By default the subscription stays active until the end of the current billing period (polite cancel). Pass `immediately: true` to terminate now and stop billing. Plan tracking on `app_users` (plan/plan_status) is updated automatically by the webhook on `customer.subscription.deleted`.",
+      "Cancel a Stripe subscription on the project owner's connected account. By default the subscription stays active until the end of the current billing period (polite cancel). `immediately: true` terminates now and stops billing. For a tracked plan subscription, the platform applies the provider-confirmed status to access. The response carries cancellation and access_sync: a confirmed cancellation with pending access sync is not canceled again. Historical subscriptions without a stored payment binding require reconciliation.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -11418,13 +12074,13 @@ The first call generates a per-project secret you'll see in the response (\`secr
     definition: {
     name: 'payments_transactions',
     description:
-      "List recent charges on the project owner's connected account. Returns Stripe's native cursor pagination — pass `starting_after` from the previous response's `next_cursor` to fetch the next page. Default page size 20, max 100. env=prod lists live-mode charges; default env=dev lists test-mode.",
+      "List recent charges on the project owner's connected account. Returns Stripe's native cursor pagination — `starting_after` set to the previous response's `next_cursor` fetches the next page. Default page size 20, max 100. env=prod lists live-mode charges; default env=dev lists test-mode.",
     inputSchema: {
       type: 'object',
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
         limit: { type: 'number', description: 'Page size (1-100). Default 20.' },
-        starting_after: { type: 'string', description: 'Stripe cursor — pass the previous page\'s `next_cursor`.' },
+        starting_after: { type: 'string', description: 'Stripe cursor — the previous page\'s `next_cursor`.' },
         env: { type: 'string', description: "'dev' (default — test-mode) or 'prod' (live mode)." },
       },
       required: ['project_id'],
@@ -11492,13 +12148,13 @@ The first call generates a per-project secret you'll see in the response (\`secr
     definition: {
     name: 'payments_events',
     description:
-      "Paginated feed of Stripe webhook events the platform received for this project (from the payments_events ledger). Use this to drive an in-product activity feed or to verify webhook reception during integration. The webhook handler is idempotent — duplicate Stripe redeliveries appear once.",
+      "Paginated feed of Stripe webhook events the platform received for this project (from the payments_events ledger). It can drive an in-product activity feed or confirm webhook reception during integration. The webhook handler is idempotent — duplicate Stripe redeliveries appear once.",
     inputSchema: {
       type: 'object',
       properties: {
-        project_id: { type: 'string', description: "Optional project UUID/subdomain filter. Omit to list every event attributed to this developer." },
+        project_id: { type: 'string', description: "Optional project UUID/subdomain filter. Omitted: every event attributed to this developer." },
         limit: { type: 'number', description: 'Page size (1-200). Default 50.' },
-        before: { type: 'number', description: 'Cursor — pass the previous page\'s `next_cursor` (ms epoch).' },
+        before: { type: 'number', description: 'Cursor — the previous page\'s `next_cursor` (ms epoch).' },
         type: { type: 'string', description: 'Optional Stripe event type filter, e.g. `checkout.session.completed`.' },
       },
       required: [],
@@ -11531,7 +12187,7 @@ The first call generates a per-project secret you'll see in the response (\`secr
   {
     definition: {
     name: 'events_subscribe_project',
-    description: `Get the connection recipe for the project's system channel. The platform automatically pushes lifecycle events to this channel — deploys, quota warnings, database health, and auth admin actions. Subscribe once and you get notified the moment any of these happen.
+    description: `Get the connection recipe for the project's system channel. The platform automatically pushes lifecycle events to this channel — deploys, quota warnings, database health, and auth admin actions. Reconnect when the connection closes with code 4001 (reauthorize); each connection rechecks your current access. Resume with the last received sequence in the since query parameter.
 
 Event shapes the channel emits (\`event\` field on the WebSocket envelope):
 
@@ -11547,7 +12203,7 @@ Event shapes the channel emits (\`event\` field on the WebSocket envelope):
 // Returns:
 // {
 //   "channel": "system:project",
-//   "websocket_url": "wss://api.somewhere.tech/v1/events/subscribe?project_id=my-saas&channel=system:project&token=smt_...",
+//   "websocket_url": "wss://api.somewhere.cloud/v1/events/subscribe?project_id=my-saas&channel=system:project&token=smt_...",
 //   "event_types": ["deployed", "patched", "restored", "rolled_back", "db_health", "quota_warning", "auth_event"]
 // }
 \`\`\``,
@@ -11575,7 +12231,6 @@ Event shapes the channel emits (\`event\` field on the WebSocket envelope):
         // `{ ok, data }` directly, which made both `status` and `data`
         // undefined and the tool reply serialized as null. Wrap in the
         // dispatcher's expected shape (audit §"MCP Server Type Errors").
-        const pid = encodeURIComponent(args.project_id as string);
         const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
         result = {
           status: 200,
@@ -11583,7 +12238,7 @@ Event shapes the channel emits (\`event\` field on the WebSocket envelope):
             ok: true,
             data: {
               channel: 'system:project',
-              websocket_url: `wss://api.somewhere.tech/v1/events/subscribe?project_id=${pid}&channel=system:project&token=${encodeURIComponent(token)}`,
+              websocket_url: projectEventsWebSocketUrl(args.project_id as string, token),
               event_types: ['deployed', 'patched', 'restored', 'rolled_back', 'db_health', 'quota_warning', 'auth_event'],
             },
           },
@@ -11598,7 +12253,7 @@ Event shapes the channel emits (\`event\` field on the WebSocket envelope):
     name: 'events_subscribe_user',
     description: `Get the connection recipe for the caller's personal system channel. The platform pushes user-scoped events here that aren't tied to one project — currently \`feedback_resolved\` when the platform team responds to or resolves a \`support_ticket\` ticket.
 
-Auth: developer smt_ key only. The channel is bound to the caller's own user id — there is no cross-user subscribe.
+Auth: developer smt_ key only. The channel is bound to the caller's own user id — there is no cross-user subscribe. Reconnect on close code 4001 (reauthorize), passing the last received sequence in the since query parameter; the new connection checks your current access.
 
 **Example:**
 
@@ -11607,7 +12262,7 @@ Auth: developer smt_ key only. The channel is bound to the caller's own user id 
 // Returns:
 // {
 //   "channel": "system:user",
-//   "websocket_url": "wss://api.somewhere.tech/v1/events/subscribe-user?token=smt_...",
+//   "websocket_url": "wss://api.somewhere.cloud/v1/events/subscribe-user?token=smt_...",
 //   "event_types": ["feedback_resolved"]
 // }
 \`\`\``,
@@ -11634,7 +12289,7 @@ Auth: developer smt_ key only. The channel is bound to the caller's own user id 
             ok: true,
             data: {
               channel: 'system:user',
-              websocket_url: `wss://api.somewhere.tech/v1/events/subscribe-user?token=${encodeURIComponent(token)}`,
+              websocket_url: userEventsWebSocketUrl(token),
               event_types: ['feedback_resolved'],
             },
           },
@@ -11644,164 +12299,11 @@ Auth: developer smt_ key only. The channel is bound to the caller's own user id 
       }
     },
   },
-  // ── video ─────────────────────────────────────────────
-  {
-    definition: {
-    name: 'video_upload_url',
-    description: `Get a one-time direct-upload URL for video. **Starting a new upload is included on Pro and Scale**; on Free and Builder this returns \`VIDEO_NOT_IN_PLAN\` (403) before anything is charged or reserved, and retrying does not change that. Listing, reading and deleting video already uploaded are not gated on any plan. The live per-plan answer is \`limits.video_enabled\` on \`GET /v1/pricing\`. The client POSTs the video bytes directly to this URL — the bytes never touch your server. The platform handles transcoding and global delivery via HLS/DASH. \`max_duration_seconds\` is clamped to 30–21,600 (6 hours) and defaults to 600 (10 minutes); ask for more only when the source really is longer, because the ceiling you name is held against video storage until the upload lands or the link expires. The response carries \`expires_at\` — after that the link stops working and its reservation is released.
-
-**Example:**
-
-\`\`\`json
-{
-  "project_id": "my-saas",
-  "max_duration_seconds": 600,
-  "title": "Demo Recording"
-}
-// Returns: { "upload_url": "https://upload.somewhere.tech/tus/...", "video_id": "v_abc123", "max_duration_seconds": 600, "expires_at": "2026-09-02T11:22:33.000Z" }
-\`\`\`
-
-**Client-side upload:**
-
-\`\`\`javascript
-await fetch(uploadUrl, { method: "POST", body: videoFile });
-\`\`\``,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
-        title: { type: 'string', description: 'Display title.' },
-        max_duration_seconds: { type: 'integer', description: 'Ceiling for source duration. Default 600 (10 min). The ceiling is held against video storage from the moment the link is issued until the upload lands or the link expires, so name only what the source needs.' },
-        require_signed_urls: { type: 'boolean', description: 'If true, playback requires a signed token. Default false.' },
-      },
-      required: ['project_id'],
-    },
-  },
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
-    group: 'video',
-    hidden: true, // founder 2026-08-05: hide video everywhere — callable, not advertised (tsk_9a68e374)
-    core: true,
-    coreRank: 60,
-    visibility: 'authenticated',
-    paid: false,
-    surfaces: ["full"],
-    execute: async (runtime, args) => {
-      const { fetcher, authHeader } = runtime;
-      let result: ToolUpstreamResult;
-      {
-        result = await callAPI(fetcher, 'POST', '/v1/video/upload-url', authHeader, {
-          project_id: args.project_id,
-          title: args.title,
-          max_duration_seconds: args.max_duration_seconds,
-          require_signed_urls: args.require_signed_urls,
-        });
-        return result;
-
-      }
-    },
-  },
-  {
-    definition: {
-    name: 'video_list',
-    description:
-      "List a project's videos with readiness state, playback URLs, thumbnail, duration, and size. Not plan-gated — video already uploaded stays listable on every plan (only new uploads need Pro or Scale).",
-    inputSchema: {
-      type: 'object',
-      properties: {
-        project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
-        limit: { type: 'integer', description: 'Max results, 1–200. Default 50.' },
-      },
-      required: ['project_id'],
-    },
-  },
-    annotations: { readOnlyHint: true, idempotentHint: true },
-    group: 'video',
-    hidden: true, // founder 2026-08-05: hide video everywhere — callable, not advertised (tsk_9a68e374)
-    core: true,
-    coreRank: 101,
-    visibility: 'authenticated',
-    paid: false,
-    surfaces: ["full"],
-    execute: async (runtime, args) => {
-      const { fetcher, authHeader } = runtime;
-      let result: ToolUpstreamResult;
-      {
-        const pid = encodeURIComponent(args.project_id as string);
-        const lim = args.limit ? `&limit=${args.limit}` : '';
-        result = await callAPI(fetcher, 'GET', `/v1/video?project_id=${pid}${lim}`, authHeader);
-        return result;
-
-      }
-    },
-  },
-  {
-    definition: {
-    name: 'video_get',
-    description: `Get metadata and streaming URLs (HLS/DASH) for a single video. Not plan-gated — video already uploaded stays readable on every plan (only new uploads need Pro or Scale). Ownership is verified via the \`user_id\` in metadata.
-
-**Example:**
-
-\`\`\`json
-{ "id": "v_abc123" }
-// Returns: { "id": "v_abc123", "status": "ready", "duration": 124.5, "hls_url": "https://...", "dash_url": "https://...", "thumbnail": "https://..." }
-\`\`\``,
-    inputSchema: {
-      type: 'object',
-      properties: { id: { type: 'string', description: 'Video ID.' } },
-      required: ['id'],
-    },
-  },
-    annotations: { readOnlyHint: true, idempotentHint: true },
-    group: 'video',
-    hidden: true, // founder 2026-08-05: hide video everywhere — callable, not advertised (tsk_9a68e374)
-    core: false,
-    visibility: 'authenticated',
-    paid: false,
-    surfaces: ["full"],
-    execute: async (runtime, args) => {
-      const { fetcher, authHeader } = runtime;
-      let result: ToolUpstreamResult;
-      {
-        const id = encodeURIComponent(args.id as string);
-        result = await callAPI(fetcher, 'GET', `/v1/video/${id}`, authHeader);
-        return result;
-
-      }
-    },
-  },
-  {
-    definition: {
-    name: 'video_delete',
-    description: 'Delete a video. Irreversible. Not plan-gated — an account can always remove video it owns, on every plan.',
-    inputSchema: {
-      type: 'object',
-      properties: { id: { type: 'string', description: 'Video ID.' } },
-      required: ['id'],
-    },
-  },
-    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
-    group: 'video',
-    hidden: true, // founder 2026-08-05: hide video everywhere — callable, not advertised (tsk_9a68e374)
-    core: false,
-    visibility: 'authenticated',
-    paid: false,
-    surfaces: ["full"],
-    execute: async (runtime, args) => {
-      const { fetcher, authHeader } = runtime;
-      let result: ToolUpstreamResult;
-      {
-        const id = encodeURIComponent(args.id as string);
-        result = await callAPI(fetcher, 'DELETE', `/v1/video/${id}`, authHeader);
-        return result;
-
-      }
-    },
-  },
   // ── inbox ─────────────────────────────────────────────
   {
     definition: {
     name: 'inbox_create_address',
-    description: `Create an inbox address on a verified, email-routing-enabled custom domain. Defaults to kind="admin" so the address appears in the project's Email tab in the dashboard. Pass kind="app" when minting per-user mailboxes from app code that shouldn't pollute the admin view. Optional webhook_url receives HMAC-signed inbox.message.received events — the POST body is \`{ schema_version: 2, type: "inbox.message.received", message: {...} }\`, with \`event\`/\`data\` aliases (identical to \`type\`/\`message\`) kept for compatibility with handlers written against the original payload shape; webhook_secret is returned once on creation. Optional forward_to also delivers a copy of every inbound message to an external mailbox (the user's real Gmail/Outlook) — see inbox_forward_set for how confirmation works.
+    description: `Create an inbox address on a verified, email-routing-enabled custom domain. Defaults to kind="admin" so the address appears in the project's Email tab in the dashboard. kind="app" mints per-user mailboxes from app code without polluting the admin view. Optional webhook_url receives HMAC-signed inbox.message.received events — the POST body is \`{ schema_version: 2, type: "inbox.message.received", message: {...} }\`, with \`event\`/\`data\` aliases (identical to \`type\`/\`message\`) kept for compatibility with handlers written against the original payload shape; webhook_secret is returned once on creation. Optional forward_to also delivers a copy of every inbound message to an external mailbox (the user's real Gmail/Outlook) — inbox_forward_set documents how confirmation works.
 
 **Example:**
 
@@ -11817,7 +12319,7 @@ await fetch(uploadUrl, { method: "POST", body: videoFile });
         label: { type: 'string', description: 'Optional display label.' },
         kind: { type: 'string', enum: ['admin', 'app'], description: '"admin" (default) = dashboard-visible mailbox; "app" = runtime-minted, hidden from the dashboard Email tab.' },
         webhook_url: { type: 'string', description: 'Optional https:// endpoint for signed inbound-message webhooks.' },
-        forward_to: { type: 'string', description: 'Optional external mailbox to forward a copy of inbound mail to (e.g. "you@gmail.com"). The project inbox keeps a copy either way.' },
+        forward_to: { type: 'string', description: 'Optional external mailbox to forward a copy of inbound mail to (e.g. "you@gmail.com"). The project inbox also stores the message either way, subject to the project message cap.' },
       },
       required: ['project_id', 'address'],
     },
@@ -11848,7 +12350,7 @@ await fetch(uploadUrl, { method: "POST", body: videoFile });
   {
     definition: {
     name: 'inbox_addresses',
-    description: 'List a project\'s configured inbox addresses. Defaults to kind="admin" (dashboard-managed mailboxes). Pass kind="app" to see runtime-minted ones, or kind="all" for both. Each row includes forward_to + forward_status ("active" | "pending_verification" | null) when forwarding is configured.',
+    description: 'List a project\'s configured inbox addresses. Defaults to kind="admin" (dashboard-managed mailboxes). kind="app" returns runtime-minted ones, and kind="all" both. Each row includes forward_to + forward_status ("active" | "pending_verification" | null) when forwarding is configured.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -11880,7 +12382,7 @@ await fetch(uploadUrl, { method: "POST", body: videoFile });
   {
     definition: {
     name: 'inbox_forward_set',
-    description: `Forward a copy of every inbound message on an inbox address to an external mailbox (the user's real Gmail/Outlook/etc). The project inbox ALWAYS keeps its copy — forwarding is additive, not a redirect.
+    description: `Forward a copy of every inbound message on an inbox address to an external mailbox (the user's real Gmail/Outlook/etc). Forwarding is additive, not a redirect: the project inbox also stores the message, subject to the project's message cap.
 
 Returns status "active" (live now) or "pending_verification" — the destination mailbox received a one-time confirmation email and forwarding starts automatically once its link is clicked. The returned message states the required human verification. Re-call this tool (or inbox_addresses) later to see the status flip to active. Spam-suspect messages are kept in the inbox but never forwarded. Idempotent: call again to change the destination.`,
     inputSchema: {
@@ -11943,7 +12445,7 @@ Returns status "active" (live now) or "pending_verification" — the destination
   {
     definition: {
     name: 'inbox_delete_address',
-    description: 'Delete an inbox address. Past messages to this address remain stored.',
+    description: 'Delete an inbox address. Its past messages are not deleted; they still count toward the project message cap and can be evicted like any other.',
     inputSchema: {
       type: 'object',
       properties: { id: { type: 'string', description: 'inbox_address id from inbox_addresses.' } },
@@ -11970,7 +12472,7 @@ Returns status "active" (live now) or "pending_verification" — the destination
   {
     definition: {
     name: 'inbox_list',
-    description: "List received messages, most recent first. Filter by address_id to scope to one inbox, unread:true to skip already-read messages, or q for free-text search across subject, body preview, and sender. Spam-suspect messages are hidden by default; pass include_spam:true to include them.",
+    description: "List received messages, most recent first, one page at a time (the next_cursor of the response, passed as cursor, returns the next page). Filter by address_id to scope to one inbox, unread:true to skip already-read messages, or q for free-text search across subject, body preview, and sender. Spam-suspect messages are hidden by default; include_spam:true includes them.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -11980,6 +12482,7 @@ Returns status "active" (live now) or "pending_verification" — the destination
         include_spam: { type: 'boolean', description: 'Optional: include messages flagged as spam-suspect.' },
         q: { type: 'string', description: 'Optional: free-text search across subject, body preview, and mail_from. Tokens match as prefixes (typeahead-style).' },
         limit: { type: 'integer', description: '1–200, default 50.' },
+        cursor: { type: 'string', description: 'Optional: next_cursor from the previous page, with the same project_id, address_id, unread, include_spam and q. Omitted: the first page; next_cursor is null on the last.' },
       },
       required: ['project_id'],
     },
@@ -12001,7 +12504,8 @@ Returns status "active" (live now) or "pending_verification" — the destination
         const includeSpam = args.include_spam ? '&include_spam=1' : '';
         const q = args.q ? `&q=${encodeURIComponent(args.q as string)}` : '';
         const lim = args.limit ? `&limit=${args.limit}` : '';
-        result = await callAPI(fetcher, 'GET', `/v1/inbox?project_id=${pid}${aid}${unread}${includeSpam}${q}${lim}`, authHeader);
+        const cursor = args.cursor ? `&cursor=${encodeURIComponent(args.cursor as string)}` : '';
+        result = await callAPI(fetcher, 'GET', `/v1/inbox?project_id=${pid}${aid}${unread}${includeSpam}${q}${lim}${cursor}`, authHeader);
         return result;
 
       }
@@ -12010,7 +12514,7 @@ Returns status "active" (live now) or "pending_verification" — the destination
   {
     definition: {
     name: 'inbox_get',
-    description: `Fetch one received message: headers, preview text, attachments metadata, and URLs to download raw MIME or individual attachments. Pass include_html:true to get the full HTML body alongside the text preview.
+    description: `Fetch one received message: headers, preview text, attachments metadata, and URLs to download raw MIME or individual attachments. include_html:true returns the full HTML body alongside the text preview.
 
 **Example:**
 
@@ -12053,7 +12557,7 @@ Returns status "active" (live now) or "pending_verification" — the destination
       type: 'object',
       properties: {
         id: { type: 'string', description: 'Message id from inbox_list.' },
-        read: { type: 'boolean', description: 'Defaults to true. Pass false to clear the read flag.' },
+        read: { type: 'boolean', description: 'Defaults to true. false clears the read flag.' },
       },
       required: ['id'],
     },
@@ -12079,7 +12583,7 @@ Returns status "active" (live now) or "pending_verification" — the destination
   {
     definition: {
     name: 'inbox_attachment',
-    description: 'Stream a single attachment from a received message. Returns the binary contents with the original content type and filename. Use the index from the `attachments` array on `inbox_get`.',
+    description: 'Stream a single attachment from a received message. Returns the binary contents with the original content type and filename. It takes the index from the `attachments` array on `inbox_get`.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -12142,7 +12646,7 @@ Returns status "active" (live now) or "pending_verification" — the destination
       type: 'object',
       properties: {
         id: { type: 'string', description: 'Inbox message id (from inbox_list).' },
-        body: { type: 'string', description: 'Reply text. Alias for text — pick whichever reads better in your prompt.' },
+        body: { type: 'string', description: 'Reply text. Alias for text.' },
         text: { type: 'string', description: 'Plain-text body. At least one of text/body/html is required.' },
         html: { type: 'string', description: 'HTML body. At least one of text/body/html is required.' },
         subject: { type: 'string', description: 'Override the subject. Default: original prefixed with "Re:".' },
@@ -12175,7 +12679,7 @@ Returns status "active" (live now) or "pending_verification" — the destination
   {
     definition: {
     name: 'inbox_send',
-    description: 'Send a fresh email from an inbox address (compose-new, not a reply). Use this when starting a new conversation from hello@yourdomain.com — sw.inbox.reply is for replies, sw.inbox.send is for new threads. Records a Message-ID so future replies thread back automatically. The address\'s domain must be verified as a sender domain on the project.',
+    description: 'Send a fresh email from an inbox address (compose-new, not a reply). It starts a new conversation from hello@yourdomain.com — sw.inbox.reply is for replies, sw.inbox.send is for new threads. Records a Message-ID so future replies thread back automatically. The address\'s domain must be verified as a sender domain on the project.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -12216,7 +12720,7 @@ Returns status "active" (live now) or "pending_verification" — the destination
   {
     definition: {
     name: 'inbox_threads',
-    description: 'List conversation threads grouped across inbound + outbound mail on the project. Each thread aggregates received messages (from inbox_messages) and sent messages (replies + composed new). Default-hides messages flagged spam_suspect; pass include_spam:true to include them.',
+    description: 'List conversation threads grouped across inbound + outbound mail on the project. Each thread aggregates received messages (from inbox_messages) and sent messages (replies + composed new). Default-hides messages flagged spam_suspect; include_spam:true includes them.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -12224,6 +12728,7 @@ Returns status "active" (live now) or "pending_verification" — the destination
         address_id: { type: 'string', description: 'Optional: scope to threads involving one inbox address.' },
         include_spam: { type: 'boolean', description: 'Include threads whose latest inbound message is spam-suspect.' },
         limit: { type: 'integer', description: '1–200, default 50.' },
+        cursor: { type: 'string', description: 'Optional: next_cursor from the previous page, with the same project_id, address_id and include_spam. Omitted: the first page; next_cursor is null on the last.' },
       },
       required: ['project_id'],
     },
@@ -12242,7 +12747,8 @@ Returns status "active" (live now) or "pending_verification" — the destination
         const aid = args.address_id ? `&address_id=${encodeURIComponent(args.address_id as string)}` : '';
         const spam = args.include_spam ? '&include_spam=1' : '';
         const lim = args.limit ? `&limit=${args.limit}` : '';
-        result = await callAPI(fetcher, 'GET', `/v1/inbox/threads?project_id=${pid}${aid}${spam}${lim}`, authHeader);
+        const cursor = args.cursor ? `&cursor=${encodeURIComponent(args.cursor as string)}` : '';
+        result = await callAPI(fetcher, 'GET', `/v1/inbox/threads?project_id=${pid}${aid}${spam}${lim}${cursor}`, authHeader);
         return result;
 
       }
@@ -12251,7 +12757,7 @@ Returns status "active" (live now) or "pending_verification" — the destination
   {
     definition: {
     name: 'inbox_thread_get',
-    description: 'Fetch every message in one thread — inbound + outbound — in chronological order. Use the `thread_root` returned by inbox_threads or inbox_get.',
+    description: 'Fetch every message in one thread — inbound + outbound — in chronological order. It takes the `thread_root` returned by inbox_threads or inbox_get.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -12318,7 +12824,7 @@ Returns status "active" (live now) or "pending_verification" — the destination
       type: 'object',
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
-        address_id: { type: 'string', description: 'Optional: scope to one inbox address. Omit for project-wide.' },
+        address_id: { type: 'string', description: 'Optional: scope to one inbox address. Omitted: project-wide.' },
         pattern: { type: 'string', description: 'Email address (exact) or domain (suffix match).' },
         action: { type: 'string', description: 'allow whitelists; deny blacklists. Accepted values: "allow", "deny".' },
       },
@@ -12373,47 +12879,6 @@ Returns status "active" (live now) or "pending_verification" — the destination
       }
     },
   },
-  // ── calls ─────────────────────────────────────────────
-  {
-    definition: {
-    name: 'calls_new_session',
-    description: `Create a new voice/video session. Returns a \`session_id\` the client uses for subsequent track operations (add/remove audio and video tracks). Session lifecycle is managed by the platform — store the session_id client-side.
-
-**Example:**
-
-\`\`\`json
-{ "project_id": "my-saas" }
-// Returns: { "session_id": "sess_abc123" }
-\`\`\``,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side, no UUID lookup needed. 'default' also works when the account has exactly one project; multi-project accounts must name one (the error lists them)." },
-        thirdparty: { type: 'boolean', description: 'If true, the session is treated as pure data relay (no platform-originated media tracks).' },
-      },
-      required: ['project_id'],
-    },
-  },
-    annotations: { readOnlyHint: false, openWorldHint: true },
-    group: 'calls',
-    core: true,
-    coreRank: 69,
-    visibility: 'authenticated',
-    paid: false,
-    surfaces: ["full"],
-    execute: async (runtime, args) => {
-      const { fetcher, authHeader } = runtime;
-      let result: ToolUpstreamResult;
-      {
-        result = await callAPI(fetcher, 'POST', '/v1/calls/sessions', authHeader, {
-          project_id: args.project_id,
-          thirdparty: args.thirdparty,
-        });
-        return result;
-
-      }
-    },
-  },
   // ── tasks ─────────────────────────────────────────────
   {
     definition: {
@@ -12436,10 +12901,12 @@ Returns status "active" (live now) or "pending_verification" — the destination
       properties: {
         project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug, resolved server-side. 'default' or 'spine' targets the organization's shared atomic task board used by the platform dogfood and resolution-note workflow." },
         title: { type: 'string', description: 'Short summary, required.' },
+        status_note: { type: 'string', description: 'One plain sentence: what is done, next, and blocked. Shown in compact board reads.' },
+        waiting_on: { type: 'string', enum: ['human', 'product_decision', 'external', ''], description: 'Explicit dependency on input or action; explain what is needed in status_note.' },
         description: { type: 'string', description: 'Long-form body.' },
         status: { type: 'string', enum: ['backlog', 'open', 'in_progress', 'blocked', 'needs_review', 'done', 'archived'], description: "Defaults to 'open'. 'backlog' represents untriaged ideas, 'blocked' represents work awaiting external action, and 'needs_review' represents completed work awaiting sign-off." },
         priority: { type: 'string', enum: ['low', 'normal', 'high', 'urgent'], description: "Defaults to 'normal'." },
-        type: { type: 'string', description: "Defaults to 'task'. Classifies the row across the org spine: philosophy, roadmap, epic, task, bug, directive, report, spec — or whatever fits; type is a filter, not a taxonomy." },
+        type: { type: 'string', description: "Defaults to task. Type is a filter; custom labels are supported.\n" + TASK_TYPE_GUIDANCE },
         assignee: { type: 'string', description: 'Free-form assignee (user ID, email, or label).' },
         reporter: { type: 'string', description: 'Optional reporter override; defaults to the caller.' },
         labels: { type: 'array', items: { type: 'string' }, description: 'Tag labels for filtering. Task OS recognizes explicit opt-ins requires-deployment, requires-smoke-test, and requires-resolution-note as completion guidance. In v1 only requires-deployment has machine-verifiable evidence and blocks close; freeform prose never activates a gate.' },
@@ -12459,7 +12926,7 @@ Returns status "active" (live now) or "pending_verification" — the destination
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","chatgpt","connector"],
-    protocol: { surfaceDescriptions: { connector: "Create a task with its description, metadata, and optional authorized file attachments." }, surfaceAnnotations: { chatgpt: { openWorldHint: true }, connector: {"title":"Tasks Create","readOnlyHint":false,"destructiveHint":true} },  oauthScopes: ['mcp'] },
+    protocol: { surfaceDescriptions: { connector: "Create a task with its description, metadata, and optional authorized file attachments." }, surfaceAnnotations: { chatgpt: { destructiveHint: true, openWorldHint: true }, connector: {"title":"Tasks Create","readOnlyHint":false,"destructiveHint":true} },  oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, authHeader } = runtime;
       let result: ToolUpstreamResult;
@@ -12479,6 +12946,8 @@ Returns status "active" (live now) or "pending_verification" — the destination
           parent_id: args.parent_id,
           attachments: args.attachments,
           template: args.template,
+          status_note: args.status_note,
+          waiting_on: args.waiting_on,
         });
         return result;
 
@@ -12488,7 +12957,7 @@ Returns status "active" (live now) or "pending_verification" — the destination
   {
     definition: {
     name: 'tasks_templates',
-    description: 'List the predefined task templates. Each entry shows the priority / labels / area / description the template would fill in if used. Pass the `key` to `tasks_create` as the `template` arg.',
+    description: 'List the predefined task templates. Each entry shows the priority / labels / area / description the template would fill in if used. The `key` is the `template` arg of `tasks_create`.',
     inputSchema: { type: 'object', properties: {}, required: [] },
   },
     annotations: { readOnlyHint: true, idempotentHint: true },
@@ -12514,7 +12983,7 @@ Returns status "active" (live now) or "pending_verification" — the destination
     inputSchema: {
       type: 'object',
       properties: {
-        project_id: { type: 'string', description: "Project that owns the tasks — UUID, subdomain, or slug. Use 'default' (or 'spine') for the org's shared atomic task board." },
+        project_id: { type: 'string', description: "Project that owns the tasks — UUID, subdomain, or slug. 'default' (or 'spine') is the org's shared atomic task board." },
         task_ids: { type: 'array', items: { type: 'string' }, description: 'Task IDs to update (1–100).' },
         updates: {
           type: 'object',
@@ -12556,11 +13025,11 @@ Returns status "active" (live now) or "pending_verification" — the destination
   {
     definition: {
     name: 'tasks_summary',
-    description: 'At-a-glance ticket counts for a project with ZERO rows returned — total plus counts grouped by status, priority, area, and assignee, plus a stale count (in_progress tasks untouched beyond stale_days). Use this for a dashboard number ("urgent: 3, high: 28, blocked: 5") instead of listing every task; it scales to thousands of tickets. For the rows themselves, use tasks_list.',
+    description: 'At-a-glance ticket counts for a project with ZERO rows returned — total plus counts grouped by status, priority, area, and assignee, plus a stale count (in_progress tasks untouched beyond stale_days). It returns a dashboard number ("urgent: 3, high: 28, blocked: 5") instead of listing every task; it scales to thousands of tickets. tasks_list returns the rows themselves.',
     inputSchema: {
       type: 'object',
       properties: {
-        project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side. Use 'default' (or 'spine') to target the org's shared atomic task board." },
+        project_id: { type: 'string', description: "Project ID (UUID), subdomain, or slug — resolved server-side. 'default' (or 'spine') targets the org's shared atomic task board." },
         stale_days: { type: 'number', description: 'Days without an update after which an in_progress task counts as stale (default 7).' },
       },
       required: ['project_id'],
@@ -12592,7 +13061,7 @@ Returns status "active" (live now) or "pending_verification" — the destination
     inputSchema: {
       type: 'object',
       properties: {
-        project_id: { type: 'string', description: "Project whose task board to inspect. Use 'default' or 'spine' for the org spine." },
+        project_id: { type: 'string', description: "Project whose task board to inspect. 'default' or 'spine' is the org spine." },
       },
       required: ['project_id'],
     },
@@ -12619,7 +13088,7 @@ Returns status "active" (live now) or "pending_verification" — the destination
   {
     definition: {
     name: 'tasks_update',
-    description: "Update a task's fields, append a comment, or upload and attach authorized file references. Supply `comment` to add a comment without changing other fields. Status transitions to 'done' automatically stamp completed_at. **When closing a task (status: 'done'), always pass `resolution_note`** — it's persisted as a comment AND included in the resolution email/webhook so the reporter knows what was done. Omitting it on a task with no prior comments returns a non-blocking `hint` field nudging you to add one.\n\n**To report progress, set `status_note` (and `health`) — do NOT add a comment per step.** The three fields have distinct jobs: `description` is the living document (intent and contract, rewritten as the truth changes), `status_note` is the current state (overwritten each update, so one read tells you where things stand), and comments are append-only EVIDENCE — commit hashes, verification output, links. Appending status as comments is what makes a long-lived task unreadable: the thread renders oldest-first, so a reader meets the superseded version before the live one. Overwriting `status_note` loses nothing; the old value is kept in the activity log.",
+    description: "Update a task's fields, append a comment, or upload and attach authorized file references. `comment` adds a comment without changing other fields. Status transitions to 'done' automatically stamp completed_at. **Closing a task (status: 'done') takes a `resolution_note`** — it's persisted as a comment AND included in the resolution email/webhook so the reporter knows what was done. Omitting it when transitioning to done returns a non-blocking `suggestions` entry asking for a resolution note.\n\n**Progress belongs in `status_note` (and `health`), not a comment per step.** The three fields have distinct jobs: `description` is the living document (intent and contract, rewritten as the truth changes), `status_note` is the current state (overwritten each update, so one read tells you where things stand), and comments are append-only EVIDENCE — commit hashes, verification output, links. Appending status as comments is what makes a long-lived task unreadable: the thread renders oldest-first, so a reader meets the superseded version before the live one. Overwriting `status_note` loses nothing; the old value is kept in the activity log.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -12629,9 +13098,10 @@ Returns status "active" (live now) or "pending_verification" — the destination
         description: { type: 'string', description: 'New description.' },
         status: { type: 'string', enum: ['backlog', 'open', 'in_progress', 'blocked', 'needs_review', 'done', 'archived'], description: "New status. 'blocked' represents work awaiting external action; 'needs_review' represents completed work awaiting sign-off." },
         priority: { type: 'string', enum: ['low', 'normal', 'high', 'urgent'], description: 'New priority.' },
-        type: { type: 'string', description: "New type. House vocab: philosophy, roadmap, epic, task, bug, directive, report, spec — or whatever fits; type is a filter, not a taxonomy. Empty value is a no-op (type can't be cleared)." },
+        type: { type: 'string', description: "New type. Empty value leaves the type unchanged. Custom labels are supported.\n" + TASK_TYPE_GUIDANCE },
         superseded_by: { type: 'string', description: 'Task ID of the row that replaces this one (a newer spec, a corrected directive). Empty string clears it.' },
         shipped_in: { type: 'string', description: 'The deploy/version in which this work shipped, represented by the deploy object tag such as "v7". It exposes child reports for review-for-closure. An empty string clears it.' },
+        waiting_on: { oneOf: [{ type: 'string', enum: ['human', 'product_decision', 'external', ''] }, { type: 'null' }], description: 'Explicitly waiting for human input, a product decision, or an external dependency. status_note records what is needed; clear with null or an empty string when resolved. Does not change assignee or status.' },
         status_note: { type: 'string', description: 'Current state in one short paragraph, overwritten rather than appended as work progresses. Prior values remain in the activity log. The 2000-character cap distinguishes this status line from the living `description`; an empty string clears it.' },
         health: { type: 'string', enum: ['on_track', 'at_risk', 'off_track'], description: 'Structured progress signal independent of `status`; for example, a task can be in_progress and off_track. Omission means nobody has assessed it, while null clears an existing assessment.' },
         assignee: { type: 'string', description: 'New assignee.' },
@@ -12656,6 +13126,23 @@ Returns status "active" (live now) or "pending_verification" — the destination
         },
         comment: { type: 'string', description: 'If supplied, appends a comment with this body.' },
         author: { type: 'string', description: 'Optional display label to attribute the comment to (e.g. "bus", "sw-tasks-dx", "Uzair"). Lets many entities that share one account self-identify on the thread. Only used when `comment` is supplied; defaults to the account.' },
+        guidance_context: {
+          type: 'array', minItems: 1, maxItems: 8,
+          description: 'Optional guidance used or a scoped exception, recorded during a normal task update. Older basis remains visible beside current guidance. Exceptions inherit through parent/child links and need reassessment when guidance changes; they do not rewrite the SOP. Links and activity are recorded automatically.',
+          items: { type: 'object', properties: {
+            guidance_id: { type: 'string', description: 'Exact guidance task ID in this project.' },
+            action: { type: 'string', enum: ['use', 'exception', 'clear_exception'], description: 'Defaults to use. Clearing a local exception leaves ancestor exceptions visible.' },
+            revision_id: { type: 'string', description: 'Saved revision used; may be older than current guidance.' },
+            content_revision: { type: 'string', description: 'For unversioned guidance, its current fingerprint; captures a baseline automatically without approving it.' },
+            reason: { type: 'string', maxLength: 1000, description: 'Required for exception/clear_exception. Explain the limited deviation or why it ended.' },
+            source_task_id: { type: 'string', description: 'Optional supporting decision or evidence record in this project.' },
+          }, required: ['guidance_id'] },
+        },
+        guidance_review: {
+          type: 'object', description: 'Review of the exact current guidance draft, identified by guidance_version.draft.content_revision. Editing and reviewing are separate calls. Records the reviewing account; human approval is separate. Later edits remain drafts against the reviewed version.',
+          properties: { content_revision: { type: 'string', pattern: '^[a-f0-9]{64}$' }, note: { type: 'string', maxLength: 2000 } },
+          required: ['content_revision'],
+        },
         resolution_note: { type: 'string', description: "Short outcome explanation for a task closing with status='done'. It persists as a comment and appears in the resolution notification email and webhook payload." },
         deployment_project_id: { type: 'string', description: "Accessible project whose successful deploy proves the work is live: ID, subdomain, or slug. It may differ from the task-owning project and always does on the deploy-less shared board. The task's project is the default." },
         deployment_version: { type: 'number', description: 'Successful production version number of deployment_project_id, verified before task update or closure and available from project_deploys.' },
@@ -12674,7 +13161,7 @@ Returns status "active" (live now) or "pending_verification" — the destination
     },
     _meta: { 'openai/fileParams': ['upload_attachments'] },
   },
-    annotations: { title: 'Update a task', readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    annotations: { title: 'Update a task', readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     group: 'tasks',
     core: true,
     coreRank: 43,
@@ -12761,6 +13248,7 @@ Returns status "active" (live now) or "pending_verification" — the destination
                 contentType,
                 undefined,
                 mint.max_size,
+                mint.multipart_url,
               );
               if (record.path !== path) {
                 return fileUploadToolError(new FileUploadError(
@@ -12807,18 +13295,21 @@ Returns status "active" (live now) or "pending_verification" — the destination
           didWork = true;
           if (result.status >= 400) return result;
         }
-        if (args.comment) {
+        const hasStateUpdate = Object.keys(args).some(key => !['project_id', 'task_id', 'comment', 'author', 'relationship', 'remove_relationship_id'].includes(key) && args[key] !== undefined);
+        if (args.comment && (!hasStateUpdate || args.resolution_note)) {
           result = await callAPI(fetcher, 'POST', `/v1/tasks/${id}/comments`, authHeader, {
             project_id: args.project_id,
             body: args.comment,
             author: args.author,
           });
           didWork = true;
+          if (result.status >= 400) return result;
         }
         const patchBody: Record<string, unknown> = { project_id: args.project_id };
-        for (const f of ['title', 'description', 'status', 'priority', 'type', 'assignee', 'labels', 'due_at', 'area', 'parent_id', 'superseded_by', 'shipped_in', 'status_note', 'health', 'attachments', 'resolution_note', 'deployment_project_id', 'deployment_version']) {
+        for (const f of ['title', 'description', 'status', 'priority', 'type', 'assignee', 'labels', 'due_at', 'area', 'parent_id', 'superseded_by', 'shipped_in', 'status_note', 'health', 'waiting_on', 'attachments', 'guidance_review', 'guidance_context', 'resolution_note', 'deployment_project_id', 'deployment_version']) {
           if (args[f] !== undefined) patchBody[f] = args[f];
         }
+        if (args.comment && hasStateUpdate && !args.resolution_note) { patchBody.comment = args.comment; patchBody.author = args.author; }
         if (uploadedAttachmentPaths.length > 0) {
           patchBody.append_attachments = uploadedAttachmentPaths;
         }
@@ -12840,6 +13331,128 @@ Returns status "active" (live now) or "pending_verification" — the destination
       }
     },
   },
+  // ── tasks_update comment, upload and relationship operations, one per tool (ChatGPT) ──
+  {
+    definition: {
+    name: 'tasks_comment_add',
+    description: "Append a comment to a task without changing its fields. Each comment is a new entry; it is announced to the project's configured task webhook and notification email when those are set. Progress belongs in tasks_update status_note; a task closes through tasks_update with status 'done' and resolution_note.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string', description: "Project that owns the task: UUID, subdomain, or slug. 'default' or 'spine' selects the organization's shared atomic task board." },
+        task_id: { type: 'string', description: 'The task ID.' },
+        comment: { type: 'string', description: 'The comment body.' },
+        author: { type: 'string', description: 'Optional display label to attribute the comment to; defaults to the account.' },
+      },
+      required: ['project_id', 'task_id', 'comment'],
+    },
+  },
+    annotations: { title: 'Comment on a task', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    group: 'tasks',
+    core: false,
+    visibility: 'authenticated',
+    paid: false,
+    surfaces: ["full","chatgpt"],
+    operationOf: 'tasks_update',
+    // ChatGPT: a comment can fire task.commented to the configured signed
+    // webhook and notification email, a send that cannot be recalled.
+    protocol: { surfaceAnnotations: { chatgpt: { destructiveHint: true } }, oauthScopes: ['mcp'] },
+    execute: async (runtime, args) => runToolOperation('tasks_update', runtime, args),
+  },
+  {
+    definition: {
+    name: 'tasks_attachment_upload',
+    description: "Upload native files and append them to a task's attachments. Each file is stored privately under /tasks/{task_id}/attachments/<name>; a file with the same name as an earlier attachment on that task replaces the stored file (its previous version stays in file history). The saved paths are returned. The change is announced to the project's configured task webhook and notification email when those are set. tasks_update with attachments replaces the attachment list itself.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string', description: "Project that owns the task: UUID, subdomain, or slug. 'default' or 'spine' selects the organization's shared atomic task board." },
+        task_id: { type: 'string', description: 'The task ID.' },
+        upload_attachments: {
+          type: 'array',
+          description: 'Native connector files to upload and append in this call. The top-level array contains authorized file-reference objects identified by openai/fileParams metadata. Each file is stored privately under /tasks/{task_id}/attachments/<name>; saved sw.fs paths are returned and appended. Binary bytes stay outside conversational context, and path/base64 strings are rejected.',
+          items: {
+            type: 'object',
+            properties: {
+              download_url: { type: 'string', description: 'Temporary connector-authorized download URL.' },
+              file_id: { type: 'string', description: 'Connector file identifier.' },
+              mime_type: { type: 'string', description: 'Connector-provided MIME type, when available.' },
+              file_name: { type: 'string', description: 'Original filename, when available.' },
+            },
+            required: ['download_url', 'file_id'],
+          },
+        },
+      },
+      required: ['project_id', 'task_id', 'upload_attachments'],
+    },
+    _meta: { 'openai/fileParams': ['upload_attachments'] },
+  },
+    annotations: { title: 'Attach files to a task', readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    group: 'tasks',
+    core: false,
+    visibility: 'authenticated',
+    paid: false,
+    surfaces: ["full","chatgpt"],
+    operationOf: 'tasks_update',
+    protocol: { oauthScopes: ['mcp'] },
+    execute: async (runtime, args) => runToolOperation('tasks_update', runtime, args),
+  },
+  {
+    definition: {
+    name: 'tasks_relationship_add',
+    description: 'Add one typed relationship from a task to another task in the same project, such as blocked_by or duplicate_of. Adding an existing relationship again changes nothing. This does not change either task\'s fields.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string', description: "Project that owns both tasks: UUID, subdomain, or slug. 'default' or 'spine' selects the organization's shared atomic task board." },
+        task_id: { type: 'string', description: 'The task the relationship starts from.' },
+        relationship: {
+          type: 'object',
+          description: 'The relationship to add.',
+          properties: {
+            type: { type: 'string', enum: ['child_of', 'discovered_by', 'implements', 'blocked_by', 'duplicate_of', 'supersedes'] },
+            task_id: { type: 'string', description: 'Related task id in the same project.' },
+          },
+          required: ['type', 'task_id'],
+        },
+      },
+      required: ['project_id', 'task_id', 'relationship'],
+    },
+  },
+    annotations: { title: 'Link two tasks', readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    group: 'tasks',
+    core: false,
+    visibility: 'authenticated',
+    paid: false,
+    surfaces: ["full","chatgpt"],
+    operationOf: 'tasks_update',
+    protocol: { oauthScopes: ['mcp'] },
+    execute: async (runtime, args) => runToolOperation('tasks_update', runtime, args),
+  },
+  {
+    definition: {
+    name: 'tasks_relationship_remove',
+    description: 'Delete one explicit relationship from a task by its relationship id, as listed in the task\'s relationships. A parent link set through parent_id is removed by clearing parent_id with tasks_update instead. The deletion cannot be undone except by adding the relationship again.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string', description: "Project that owns the task: UUID, subdomain, or slug. 'default' or 'spine' selects the organization's shared atomic task board." },
+        task_id: { type: 'string', description: 'The task the relationship starts from.' },
+        remove_relationship_id: { type: 'string', description: 'Identifier of the explicit relationship to delete.' },
+      },
+      required: ['project_id', 'task_id', 'remove_relationship_id'],
+    },
+  },
+    annotations: { title: 'Unlink two tasks', readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    group: 'tasks',
+    core: false,
+    visibility: 'authenticated',
+    paid: false,
+    surfaces: ["full","chatgpt"],
+    operationOf: 'tasks_update',
+    protocol: { oauthScopes: ['mcp'] },
+    execute: async (runtime, args) => runToolOperation('tasks_update', runtime, args),
+  },
   {
     definition: {
     name: 'tasks_comment_edit',
@@ -12847,7 +13460,7 @@ Returns status "active" (live now) or "pending_verification" — the destination
     inputSchema: {
       type: 'object',
       properties: {
-        project_id: { type: 'string', description: "Project that owns the task — UUID, subdomain, or slug. Use 'default' (or 'spine') for the org's shared atomic task board." },
+        project_id: { type: 'string', description: "Project that owns the task — UUID, subdomain, or slug. 'default' (or 'spine') is the org's shared atomic task board." },
         task_id: { type: 'string', description: 'The task the comment belongs to.' },
         comment_id: { type: 'string', description: 'The comment ID (starts with tcm_).' },
         body: { type: 'string', description: 'New comment body (must be non-empty).' },
@@ -12883,7 +13496,7 @@ Returns status "active" (live now) or "pending_verification" — the destination
     inputSchema: {
       type: 'object',
       properties: {
-        project_id: { type: 'string', description: "Project that owns the task — UUID, subdomain, or slug. Use 'default' (or 'spine') for the org's shared atomic task board." },
+        project_id: { type: 'string', description: "Project that owns the task — UUID, subdomain, or slug. 'default' (or 'spine') is the org's shared atomic task board." },
         task_id: { type: 'string', description: 'The task the comment belongs to.' },
         comment_id: { type: 'string', description: 'The comment ID (starts with tcm_).' },
       },
@@ -12916,7 +13529,7 @@ Returns status "active" (live now) or "pending_verification" — the destination
     inputSchema: {
       type: 'object',
       properties: {
-        project_id: { type: 'string', description: "Project that owns the task — UUID, subdomain, or slug. Use 'default' (or 'spine') for the org's shared atomic task board." },
+        project_id: { type: 'string', description: "Project that owns the task — UUID, subdomain, or slug. 'default' (or 'spine') is the org's shared atomic task board." },
         task_id: { type: 'string', description: 'The task ID.' },
       },
       required: ['project_id', 'task_id'],
@@ -12972,7 +13585,7 @@ Returns status "active" (live now) or "pending_verification" — the destination
   {
     definition: {
     name: 'tasks_settings_update',
-    description: 'Configure where task events are delivered. Set webhook_url to receive signed POSTs (X-Somewhere-Signature: t=<ms>,v1=<hmac-sha256-hex>) and/or notify_email to receive emails. Pass an empty string to clear a field. The first time webhook_url is set, the response includes webhook_secret exactly once — store it server-side to verify the signature.',
+    description: 'Configure where task events are delivered. webhook_url receives signed POSTs (X-Somewhere-Signature: t=<ms>,v1=<hmac-sha256-hex>) and/or notify_email receives emails. An empty string clears a field. The first time webhook_url is set, the response includes webhook_secret exactly once — it is stored server-side to verify the signature.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -13005,14 +13618,14 @@ Returns status "active" (live now) or "pending_verification" — the destination
   {
     definition: {
     name: 'memory_save',
-    description: "Log a principle/SOP/supplier/learning/content idea/vision/spec to the org's memory. Use at close-out when what-we-believe changes. Title states the claim as a sentence.",
+    description: "Log a principle/SOP/supplier/learning/content idea/vision/spec to the org's memory. It records a close-out when what-we-believe changes. Title states the claim as a sentence.",
     inputSchema: {
       type: 'object',
       properties: {
         project_id: { type: 'string', description: "The org-memory project (UUID, subdomain, slug, or 'default'). Resolved server-side." },
         title: { type: 'string', description: 'The claim, stated as a sentence. Required, non-empty.' },
-        body: { type: 'string', description: 'Long-form detail. Reference related rows inline (their task IDs) — refs live in the body, not a separate field.' },
-        type: { type: 'string', description: "Knowledge type. Defaults to 'learning'. Use what fits: philosophy, directive, spec, principle, sop, supplier, vision, content. Type is a filter, not a taxonomy." },
+        body: { type: 'string', description: 'Long-form detail. Related rows are referenced inline (their task IDs) — refs live in the body, not a separate field.' },
+        type: { type: 'string', description: "Knowledge type. Defaults to learning; custom labels are supported.\n" + TASK_TYPE_GUIDANCE },
         area: { type: 'string', description: 'Optional subsystem tag for filtering (free-form).' },
         labels: { type: 'array', items: { type: 'string' }, description: 'Optional tags for filtering.' },
       },
@@ -13054,15 +13667,17 @@ Returns status "active" (live now) or "pending_verification" — the destination
   {
     definition: {
     name: 'memory_search',
-    description: "Search the org's memory before building, when unsure about a past call, or when the founder references something not in context.",
+    description: "Search a bounded page of the org's memory before building, when unsure about a past call, or when the user references something not in context. The same filters with page.next_cursor as cursor continue the page; pages are not drained automatically. Expand omitted fields with tasks_get view=field.",
     inputSchema: {
       type: 'object',
       properties: {
         project_id: { type: 'string', description: "The org-memory project (UUID, subdomain, slug, or 'default'). Resolved server-side." },
-        q: { type: 'string', description: 'Text to search over title + description. Omit to list the whole memory.' },
-        type: { type: 'string', description: 'Narrow to one knowledge type (e.g. "directive"). Omit to search across the durable knowledge types (philosophy, directive, spec, learning, principle, sop, supplier, vision, content, roadmap, epic).' },
-        include_archived: { type: 'boolean', description: 'Default false — superseded/archived rows are hidden. Pass true to include them.' },
-        limit: { type: 'number', description: 'Max rows to return (default 100, cap 500).' },
+        q: { type: 'string', description: 'Text to search over title + description. Omitted: the whole memory is listed.' },
+        type: { type: 'string', description: 'Narrow to one knowledge type (e.g. "directive"). Omitted: search covers the durable knowledge types (philosophy, directive, spec, learning, principle, sop, supplier, vision, content, roadmap, epic).' },
+        include_archived: { type: 'boolean', description: 'Default false — superseded/archived rows are hidden. true includes them.' },
+        limit: { type: 'number', description: 'Max rows to return (default 10). Compact pages return at most 20 rows; the response budget may return fewer. page.limit is the effective cap.' },
+        cursor: { type: 'string', description: 'Opaque page.next_cursor from the previous memory search. Its filters are repeated. Cannot be combined with offset.' },
+        offset: { type: 'number', description: 'Fresh row offset; cursor is the continuation path. Cannot be combined with cursor.' },
       },
       required: ['project_id'],
     },
@@ -13089,7 +13704,10 @@ Returns status "active" (live now) or "pending_verification" — the destination
         q.set('type', typeArg || KNOWLEDGE_TYPES.join(','));
         if (args.q) q.set('q', String(args.q));
         if (args.include_archived === true) q.set('include_archived', 'true');
+        else q.set('include_superseded', 'false');
         if (args.limit !== undefined) q.set('limit', String(args.limit));
+        if (args.cursor !== undefined) q.set('cursor', String(args.cursor));
+        if (args.offset !== undefined) q.set('offset', String(args.offset));
         result = await callAPI(fetcher, 'GET', `/v1/tasks?${q.toString()}`, authHeader);
         return result;
 
@@ -13104,9 +13722,9 @@ Returns status "active" (live now) or "pending_verification" — the destination
 
 A file path is mutable: a later write replaces the bytes and old versions get trimmed. Publishing freezes "the file at /specs/plan.md right now" into a fact — the bytes are copied to the artifact's own storage and the row records who produced it. It never changes; a new version is a new artifact whose \`supersedes\` points at the old one.
 
-Returns \`{ id, uri, ... }\` where \`uri\` is \`sw://{project}/artifact/{id}\` — hand THAT to the next agent. They call \`artifact_get\` on it and see the title + summary + schema (enough to decide read-or-skip) and, on request, the exact frozen bytes.
+Returns \`{ id, uri, ... }\` where \`uri\` is \`sw://{project}/artifact/{id}\`, a stable reference for a later reader. They call \`artifact_get\` on it and see the title + summary + schema (enough to decide read-or-skip) and, on request, the exact frozen bytes.
 
-Publishes an EXISTING file — write it first (fs_write / fs_upload), then publish.
+Publishes an EXISTING file — it is written first (fs_write / fs_upload), then published.
 
 **Example:**
 \`\`\`json
@@ -13166,7 +13784,7 @@ Publishes an EXISTING file — write it first (fs_write / fs_upload), then publi
     name: 'artifact_get',
     description: `Fetch a published artifact by its id or \`sw://…\` URI — metadata + provenance by default, or the exact immutable bytes with \`include_content: true\`.
 
-This is the consume side of a handoff: another agent published a file and handed you \`sw://{project}/artifact/{id}\`. You get the title, summary, schema, size, and who produced it (\`agent\` + \`derived_from\`/\`supersedes\`) — enough to decide read-or-skip WITHOUT the producer re-describing it. Pass \`include_content: true\` to also pull the frozen bytes (text is inlined; the bytes are the exact ones from publish time, even if the source file has since changed).
+This is the consume side of a handoff: another agent published a file and handed you \`sw://{project}/artifact/{id}\`. You get the title, summary, schema, size, and who produced it (\`agent\` + \`derived_from\`/\`supersedes\`) — enough to decide read-or-skip WITHOUT the producer re-describing it. \`include_content: true\` also returns the frozen bytes (text is inlined; the bytes are the exact ones from publish time, even if the source file has since changed).
 
 Resolves across projects: any principal with access to the artifact's OWN project can fetch it, which raw file paths can never do.
 
@@ -13175,7 +13793,7 @@ Resolves across projects: any principal with access to the artifact's OWN projec
       type: 'object',
       properties: {
         id: { type: 'string', description: 'Artifact id (art_…) or a full sw://{project}/artifact/{id} URI.' },
-        include_content: { type: 'boolean', description: 'Default false (metadata + provenance only — cheap). Pass true to also fetch the frozen bytes; text content is inlined (truncated past ~50k chars).' },
+        include_content: { type: 'boolean', description: 'Default false (metadata + provenance only — cheap). true also fetches the frozen bytes; text content is inlined (truncated past ~50k chars).' },
       },
       required: ['id'],
     },
@@ -13215,10 +13833,11 @@ Resolves across projects: any principal with access to the artifact's OWN projec
             const mediaType = typeof meta.media_type === 'string' ? meta.media_type : '';
             const isText = /^text\//i.test(mediaType)
               || /(json|markdown|xml|javascript|typescript|yaml|csv|html|svg)/i.test(mediaType);
-            const cresp = await fetcher.fetch(
-              `https://api-internal/v1/artifacts/${encodeURIComponent(artId)}/content`,
-              { method: 'GET', headers: { 'Authorization': authHeader } },
-            );
+            let contentUrl: string | null = null;
+            try { contentUrl = internalApiUrl(`/v1/artifacts/${encodeURIComponent(artId)}/content`, '/v1/artifacts/'); } catch { contentUrl = null; }
+            const cresp = contentUrl
+              ? await fetcher.fetch(contentUrl, { method: 'GET', headers: { 'Authorization': authHeader } })
+              : new Response(null, { status: 400 });
             if (!cresp.ok) {
               meta.content_error = `Could not fetch content (status ${cresp.status}).`;
             } else if (isText) {
@@ -13281,7 +13900,7 @@ Resolves across projects: any principal with access to the artifact's OWN projec
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","chatgpt","connector"],
-    protocol: { surfaceDescriptions: { connector: "Read a project’s site-check configuration and latest results." }, surfaceAnnotations: { connector: {"title":"Site Check Status","readOnlyHint":true} },  oauthScopes: ['mcp'] },
+    protocol: { surfaceDescriptions: { connector: "Read a project’s site-check configuration and latest results." }, surfaceAnnotations: { chatgpt: { destructiveHint: false, openWorldHint: false }, connector: {"title":"Site Check Status","readOnlyHint":true} },  oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, authHeader } = runtime;
       let result: ToolUpstreamResult;
@@ -13295,7 +13914,7 @@ Resolves across projects: any principal with access to the artifact's OWN projec
   {
     definition: {
     name: 'site_check',
-    description: `Trigger an on-demand site check for a project. Usually returns the finished run with per-target details within ~10s; if probes are still executing it returns { run: { id, status: "running" } } — re-read with site_check_status a moment later. Use for "is it back yet" after a fix, or for a post-deploy check.`,
+    description: `Trigger an on-demand site check for a project. Usually returns the finished run with per-target details within ~10s; if probes are still executing it returns { run: { id, status: "running" } } — site_check_status has the result a moment later. It answers "is it back yet" after a fix, and serves as a post-deploy check.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -13353,7 +13972,7 @@ Resolves across projects: any principal with access to the artifact's OWN projec
   {
     definition: {
     name: 'smoke_config_update',
-    description: `Update the per-project smoke configuration. Set enabled=false to opt the project out of probes entirely. Set extra_checks to a JSON-stringified array of checks to probe specific paths in addition to the homepage — each check supports {name, path, method?, expect_status?, headers?, body?, auth?, expect_json_path?, expect_contains?, expect_not_contains?}: body (object→JSON or raw string) and headers ride the request; auth:"test_user" makes the platform mint a session for the project's designated test user at probe time (no credentials stored — set test_user_email first); expect_json_path (dot-path like "data.reply", must resolve non-null), expect_contains / expect_not_contains (substrings of the response) assert on CONTENT, not just status. The same fields work in a deployed /_smoke_tests.json.`,
+    description: `Update the per-project smoke configuration. enabled=false opts the project out of probes entirely. extra_checks, a JSON-stringified array of checks, probes specific paths in addition to the homepage — each check supports {name, path, method?, expect_status?, headers?, body?, auth?, expect_json_path?, expect_contains?, expect_not_contains?}: body (object→JSON or raw string) and headers ride the request; auth:"test_user" makes the platform mint a session for the project's designated test user at probe time (no credentials stored — test_user_email is set first); expect_json_path (dot-path like "data.reply", must resolve non-null), expect_contains / expect_not_contains (substrings of the response) assert on CONTENT, not just status. The same fields work in a deployed /_smoke_tests.json.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -13401,7 +14020,7 @@ Resolves across projects: any principal with access to the artifact's OWN projec
 
 Identifier can be an email, user_id, site_id, or subdomain slug.
 
-**Note:** This is for the somewhere.site product, NOT somewhere.tech projects. Use debug_project for somewhere.tech.
+**Note:** This is for the somewhere.site product, NOT somewhere.cloud projects. Use debug_project for somewhere.cloud.
 
 **Example:**
 
@@ -13477,9 +14096,9 @@ Identifier can be an email, user_id, site_id, or subdomain slug.
   {
     definition: {
     name: 'debug_project',
-    description: `Debug a somewhere.tech project. Resolves any of: an API-key prefix (e.g. \`"smt_FVa..."\`), a project_id (UUID), a subdomain (e.g. \`"myapp"\`), or a platform-user email. Returns the owner, all their projects, recent error logs, env-var key names, and a 7-day usage rollup. Optionally pass a catalog-discovered \`symptom\` id to return every registered, already-project-scoped signal and its honest instrumentation gaps in the same call.
+    description: `Debug a somewhere.cloud project. Resolves any of: an API-key prefix (e.g. \`"smt_FVa..."\`), a project_id (UUID), a subdomain (e.g. \`"myapp"\`), or a platform-user email. Returns the owner, all their projects, recent error logs, env-var key names, and a 7-day usage rollup. Optionally pass a catalog-discovered \`symptom\` id to return every registered, already-project-scoped signal and its honest instrumentation gaps in the same call.
 
-**Note:** This is for somewhere.tech projects, NOT somewhere.site sites — use debug_site for those.
+**Note:** This is for somewhere.cloud projects, NOT somewhere.site sites — use debug_site for those.
 
 **Example:**
 
@@ -13510,7 +14129,7 @@ Identifier can be an email, user_id, site_id, or subdomain slug.
     },
   },
     annotations: { readOnlyHint: true, idempotentHint: true },
-    group: 'other',
+    group: 'admin',
     core: false,
     visibility: 'admin',
     paid: false,
@@ -13534,7 +14153,7 @@ Identifier can be an email, user_id, site_id, or subdomain slug.
     definition: {
     name: 'somewhere_tech_stats',
     description:
-      'Get the somewhere.tech platform truth surface. With no metric_id, preserves the existing health snapshot. With a catalog-discovered metric_id, evaluates that named/versioned metric and returns value, exact SQL, source table, authority note, computed_at, and durable-history status.',
+      'Get the Somewhere platform truth surface. With no metric_id, preserves the existing health snapshot. With a catalog-discovered metric_id, evaluates that named/versioned metric and returns value, exact SQL, source table, authority note, computed_at, and durable-history status.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -13579,7 +14198,10 @@ const TOOL_SPECS: readonly CanonicalToolSpec[] = [
   ...MIGRATED_TOOL_SPECS,
   ...connectorApiToolSpecs(validateApiToolPath),
   ...ACCOUNT_TOOL_SPECS,
+  ...ADMIN_PROJECT_TOOL_SPECS,
   ...GROUP_TOOL_SPECS,
+  ...POSTGRES_TOOL_SPECS,
+  ...PROJECT_HANDOFF_TOOL_SPECS,
 ];
 
 function constructCanonicalToolRegistry(specs: readonly CanonicalToolSpec[]): {
@@ -13636,6 +14258,7 @@ const CATALOG_CATEGORIES: Array<{
   aliases: string[];
   searchAliases?: string[];
 }> = [
+  { key: 'admin', summary: 'Operator project inspection, audited display-name changes and existing support action paths', aliases: ['operator', 'admin tools', 'customer support', 'repair project'] },
   { key: 'project', summary: 'Projects, tags, deploys, source maps, collaborators, version history, rollback, transfer, isolated dev environments', aliases: ['apps', 'sites', 'workspaces', 'tags', 'labels', 'organize', 'deployment', 'dev environment', 'sandbox', 'dev database', 'docs query', 'source map'] },
   { key: 'account', summary: 'Your own developer/connector account — save an anonymous MCP-connector session to a real, email-verified account', aliases: ['connector', 'session', 'save session', 'claim account', 'anonymous'] },
   { key: 'groups', summary: 'Project groups — organize projects under one group with shared members and a shared design theme; create/list/inspect groups, move projects in and out', aliases: ['group', 'team', 'teams', 'organize', 'folders', 'collections'] },
@@ -13648,13 +14271,13 @@ const CATALOG_CATEGORIES: Array<{
   { key: 'email', summary: 'Outbound email — send transactional or managed batch mail, manage sender domains, view bounces/events', aliases: ['mail', 'send', 'smtp', 'transactional', 'marketing', 'segments', 'bounces'] },
   { key: 'inbox', summary: 'Inbound email — receive mail, parse, threads, reply/send, routing rules', aliases: ['receive', 'inbound', 'incoming', 'parse', 'threads'] },
   { key: 'ai', summary: 'AI — chat completion, embeddings, transcription, TTS, image generation, background removal', aliases: ['llm', 'claude', 'gpt', 'whisper', 'speech', 'embeddings', 'vision', 'image'] },
-  { key: 'jobs', summary: 'Background jobs — fire-and-forget tasks with retries and status polling', aliases: ['async', 'background', 'task', 'worker'] },
+  { key: 'agent', summary: 'Agents and chatbots — bounded inline or durable model-and-tool runs; docs and linked recipes', aliases: ['agents', 'chatbot', 'assistant', 'tool use', 'agent loop', 'scaffold'] },
+  { key: 'jobs', summary: 'Background jobs — fire-and-forget tasks with retries and status polling', aliases: ['async', 'background', 'task', 'worker', 'queue', 'enqueue', 'delayed'] },
   { key: 'cron', summary: 'Scheduled tasks — recurring cron jobs that hit your functions on a timer', aliases: ['schedule', 'recurring', 'timer', 'periodic'] },
-  { key: 'queue', summary: 'Queue — send messages for async processing', aliases: ['pubsub', 'messaging', 'async'] },
   { key: 'logs', summary: 'Logs and errors — recent runtime logs and the last 24h of errors', aliases: ['observability', 'monitoring', 'debugging', 'traces'] },
   { key: 'smoke', summary: 'Site checks — health probes for your deployed app: latest status + history, on-demand run, per-project config and extra checks. Auto-run after every deploy and every ~20 min.', aliases: ['health', 'healthcheck', 'monitor', 'uptime', 'probe', 'smoke test', 'post-deploy check', 'is it up'] },
   { key: 'usage', summary: 'Usage summary — current-month AI/storage/email consumption and quota', aliases: ['billing', 'quota', 'limits', 'consumption', 'metering'] },
-  { key: 'feedback', summary: 'User feedback (project) and support tickets (developer → somewhere.tech team)', aliases: ['support', 'tickets', 'bugs', 'reports'] },
+  { key: 'feedback', summary: 'User feedback (project) and support tickets (developer → Somewhere team)', aliases: ['support', 'tickets', 'bugs', 'reports'] },
   { key: 'tasks', summary: 'Tasks — per-project ticket/issue tracker: create, list, get one by ID with comments/activity (tasks_get), update, comment, bulk-update, templates, settings. Also the org spine: memory_save/memory_search = the durable memory layer (principles, specs, decisions). The most-used surface; how chat coordinates with code.', aliases: ['tickets', 'issues', 'todos', 'task tracker', 'kanban', 'project tasks', 'backlog', 'memory', 'knowledge', 'org memory'] },
   { key: 'artifacts', summary: 'Artifacts — publish a project file as an immutable, addressable snapshot with typed metadata (title/summary/schema/provenance), then fetch it by id or sw:// URI. The durable, replayable handoff between agents (Cursor → Claude → human) without re-describing files through a context window.', aliases: ['artifact', 'handoff', 'interchange', 'snapshot', 'publish', 'provenance', 'cross-agent', 'sw uri'] },
   { key: 'domains', summary: 'Custom domains — attach, verify DNS, buy/claim/transfer, single-tenant + multi-tenant', aliases: ['dns', 'hostnames', 'cname', 'apex', 'custom domain', 'register'] },
@@ -13673,8 +14296,6 @@ const CATALOG_CATEGORIES: Array<{
   { key: 'payments', summary: 'Payments (Stripe Connect) — onboard, checkout, refund, transactions, subscription portal', aliases: ['stripe', 'checkout', 'subscription', 'invoice', 'billing customer'] },
   { key: 'connect', summary: 'Connected accounts — a customer\'s linked Stripe account: connect link, status, subscribers, disconnect', aliases: ['stripe connect', 'oauth connections', 'linked accounts', 'connected account'] },
   { key: 'live', summary: 'Live updates — subscribe to the signed platform system channels (deploys, quota, auth admin, support replies). Browser live data comes from a declared sw.db.live view, not a caller-named channel.', aliases: ['websocket', 'live updates', 'system channel', 'deploy events', 'subscribe'] },
-  { key: 'video', summary: 'Video streaming — upload videos, list, get playback info, delete', aliases: ['stream', 'mux', 'hls', 'playback'] },
-  { key: 'calls', summary: 'Voice/video calls — WebRTC SFU session tokens for Zoom/Twilio-style calls', aliases: ['webrtc', 'sfu', 'voip', 'twilio', 'zoom', 'meet'] },
   { key: 'api', summary: 'Generic platform API calls — use /v1 endpoints that do not have a dedicated MCP tool yet', aliases: ['rest', 'endpoint', 'long tail', 'generic api', 'v1'] },
   { key: 'help', summary: 'Discovery + reference — catalog (this tool), docs (topic prose), advisor (open-ended Q&A)', aliases: ['docs', 'reference', 'manual', 'faq', 'guide'] },
 ];
@@ -13686,6 +14307,13 @@ const CATALOG_RUNTIME_CAPABILITIES = [{
   description: 'Fetch a public outbound HTTP or HTTPS URL from server-side function code with timeout, retry, redirect safety, structured errors, and telemetry.',
   docs_topic: 'sw.fetch',
   usage: 'await sw.fetch(url, options)',
+}, {
+  name: 'sw.agent',
+  group: 'agent',
+  title: 'sw.agent — bounded inline and durable agents',
+  description: 'Build an agent, chatbot, or assistant with bounded tool use, spend checks, step hooks, durable status/cancel and stable toolCallId. Start with docs sw.agent and linked recipe-ai-agent, recipe-escalation, recipe-multi-chat.',
+  docs_topic: 'sw.agent',
+  usage: 'await sw.agent.run(options); docs({ topic: "recipe-ai-agent" })',
 }] as const;
 
 function runtimeCapability(name: string): (typeof CATALOG_RUNTIME_CAPABILITIES)[number] | undefined {
@@ -13701,7 +14329,10 @@ function advertisedNamesForSurface(surface: ToolSurface): Set<string> {
     // A deprecated alias (spec.aliasOf) or hidden spec (spec.hidden) is
     // CALLABLE but not advertised — see executableNamesForSurface. Hiding the
     // surface must never break a caller that already uses the name (rule 9).
-    .filter((spec) => spec.visibility !== 'admin' && !spec.aliasOf && !spec.hidden && spec.surfaces.includes(surface))
+    // A fixed operation (spec.operationOf) is advertised everywhere it is
+    // listed except `full`, which advertises the original tool instead.
+    .filter((spec) => spec.visibility !== 'admin' && !spec.aliasOf && !spec.hidden
+      && !(spec.operationOf && surface === 'full') && spec.surfaces.includes(surface))
     .map((spec) => spec.definition.name));
 }
 
@@ -13718,9 +14349,9 @@ function availableNamesForSurface(surface: ToolSurface, includeAdmin = false): S
 function executableNamesForSurface(surface: ToolSurface): Set<string> {
   const names = advertisedNamesForSurface(surface);
   // Deprecated aliases and hidden specs stay executable so already-deployed
-  // callers keep working.
+  // callers keep working; a fixed operation stays executable on `full`.
   for (const spec of TOOL_SPECS) {
-    if ((spec.aliasOf || spec.hidden) && spec.visibility !== 'admin' && spec.surfaces.includes(surface)) {
+    if ((spec.aliasOf || spec.hidden || spec.operationOf) && spec.visibility !== 'admin' && spec.surfaces.includes(surface)) {
       names.add(spec.definition.name);
     }
   }
@@ -13731,9 +14362,26 @@ function surfaceAllowsCanonicalTool(surface: ToolSurface, toolName: string): boo
   return executableNamesForSurface(surface).has(toolName);
 }
 
+/** On a surface that advertises a multi-operation tool as fixed operations,
+ *  a reference to the original names the operation that text asks for. */
+const SPLIT_TOOL_REFERENCES: readonly { tool: string; operation: string; pattern: RegExp }[] = [
+  { tool: 'support_ticket', operation: 'support_ticket_submit', pattern: /\bsupport_ticket\b(?!_)/g },
+  { tool: 'advisor', operation: 'advisor_start', pattern: /(?<=`|\b)advisor(?=`|\()/g },
+];
+
+function renameSplitToolReferences(text: string, surface: ToolSurface): string {
+  let renamed = text;
+  for (const { tool, operation, pattern } of SPLIT_TOOL_REFERENCES) {
+    if (!surfaceAllowsCanonicalTool(surface, tool) && surfaceAllowsCanonicalTool(surface, operation)) {
+      renamed = renamed.replace(pattern, operation);
+    }
+  }
+  return renamed;
+}
+
 function constrainCanonicalText(text: string, surface: ToolSurface): string {
   return constrainTextToSurface(
-    text,
+    renameSplitToolReferences(text, surface),
     surface,
     registeredProductToolNames(),
     executableNamesForSurface(surface),
@@ -13899,18 +14547,30 @@ function withChatgptToolMetadata(t: MCPTool): MCPTool & {
 }
 
 function constrainToolDefinitionToSurface(t: MCPTool, surface: ToolSurface): MCPTool {
-  const inputSchema = surface !== 'full' && t.name === 'project_grep'
+  const refused = new Set(SURFACE_REFUSED_INPUTS[surface]?.[t.name] ?? []);
+  if (surface !== 'full' && t.name === 'project_grep') refused.add('scope');
+  const inputSchema = refused.size > 0
     ? {
         ...t.inputSchema,
         properties: Object.fromEntries(
-          Object.entries(t.inputSchema.properties).filter(([name]) => name !== 'scope'),
+          Object.entries(t.inputSchema.properties).filter(([name]) => !refused.has(name)),
         ),
       }
     : t.inputSchema;
+  // File-parameter metadata names only inputs this surface still advertises.
+  const fileParams = t._meta?.['openai/fileParams'];
+  const meta = refused.size > 0 && Array.isArray(fileParams) && fileParams.some((name) => refused.has(name))
+    ? (() => {
+        const kept = fileParams.filter((name) => !refused.has(name));
+        const { 'openai/fileParams': _dropped, ...rest } = t._meta ?? {};
+        return kept.length > 0 ? { ...rest, 'openai/fileParams': kept } : rest;
+      })()
+    : t._meta;
   return {
     ...t,
     description: constrainCanonicalText(TOOL_SPEC_BY_NAME.get(t.name)?.protocol?.surfaceDescriptions?.[surface] ?? t.description, surface),
     inputSchema,
+    ...(meta === undefined ? {} : { _meta: meta }),
   };
 }
 
@@ -13969,12 +14629,14 @@ function detectToolSurface(opts: {
   return 'full';
 }
 
-/** One-block guidance banner prepended to the getting-started / setup / cli /
- *  local-dev help topics, tailored to the caller. Pure presentation — the
+/** One-block guidance banner prepended to the getting-started and setup
+ *  help topics only, tailored to the caller. Pure presentation — the
  *  topic body underneath is unchanged, so nothing existing breaks (rule 9).
  *  Returns '' for topics that aren't path-sensitive. */
+// Said once, where an agent starts: the shell-vs-MCP choice is not repeated
+// on every topic that mentions deploying.
 const CALLER_TAILORED_TOPICS = new Set([
-  'getting-started', 'setup', 'cli', 'local-dev', 'dev-prod', 'deploy',
+  'getting-started', 'setup',
 ]);
 
 function callerHelpBanner(topic: string, kind: CallerKind): string {
@@ -14091,7 +14753,9 @@ async function callSomewhereTechAdmin(
       },
     };
   }
-  const req = new Request(`https://api-internal${path}`, {
+  let url: string;
+  try { url = internalApiUrl(path); } catch (err) { return invalidInternalPath(err); }
+  const req = new Request(url, {
     method: 'GET',
     headers: { 'X-Admin-Key': env.SOMEWHERE_TECH_ADMIN_KEY },
   });
@@ -14273,44 +14937,60 @@ class CallerAuthBoundary {
 }
 
 /**
- * Published protected-resource URLs → the surface each names. Must stay in step
- * with the metadata documents served below and with the worker's
- * utils/mcp-token-audience.ts. Exact match only — an audience is an identity,
- * never a prefix.
- */
-const RESOURCE_SURFACES: Readonly<Record<string, 'full' | 'connector' | 'chatgpt'>> = Object.freeze({
-  'https://mcp.somewhere.tech/mcp': 'full',
-  'https://mcp.somewhere.tech/mcp/connector': 'connector',
-  'https://mcp.somewhere.tech/mcp/chatgpt': 'chatgpt',
-});
-
-/**
- * Read the `aud` claim off a connector bearer WITHOUT verifying the signature.
+ * The connector (mcp_oauth) audience on a bearer, read WITHOUT verifying the
+ * signature (tsk_2019e832). `null` means the bearer is not a connector token
+ * (a developer key, or another token type the platform verifies on its own).
  *
- * Unverified is sound here, and deliberately so. Widening the claim buys an
- * attacker nothing: the signature is still checked upstream on every REST call
- * this worker makes, so reaching the full surface requires a token that BOTH
- * claims `aud: <full surface>` AND verifies — which only the authorization
- * server can produce. Narrowing it only costs the holder access. So this check
- * can never be the sole thing standing between a forged token and authority; it
- * exists to stop a GENUINE curated-surface token from being spent on a surface
- * the user never approved.
- *
- * Returns null for absent, malformed, or unrecognized audiences — i.e. a
- * pre-cutover token, which is accepted everywhere exactly as before (rule 9).
+ * Unverified is sound here: this check only ever REFUSES. Every call this
+ * worker makes still has the platform verify the signature, so claiming a
+ * wider audience on a forged token buys nothing.
  */
-function tokenAudienceSurface(authHeader: string): 'full' | 'connector' | 'chatgpt' | null {
+function connectorTokenAudience(authHeader: string): { surface: McpSurface | null; resource: unknown } | null {
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
   const parts = token.split('.');
   if (parts.length !== 3) return null;
   try {
-    const json = atob(parts[1].replace(/-/g, '+').replace(/_/g, '/'));
-    const payload = JSON.parse(json) as { aud?: unknown };
-    if (typeof payload.aud !== 'string') return null;
-    return RESOURCE_SURFACES[payload.aud] ?? null;
+    const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/'))) as { type?: unknown; aud?: unknown };
+    if (payload.type !== 'mcp_oauth') return null;
+    return { surface: surfaceForResource(payload.aud), resource: payload.aud };
   } catch {
     return null;
   }
+}
+
+/**
+ * Refuse a connector token that may not reach this route: one without a
+ * recognized audience must authorize again (401, pointing at the discovery
+ * document), and one whose surface does not grant the route is refused (403).
+ */
+function connectorAudienceRefusal(
+  authHeader: string,
+  allowed: (surface: McpSurface) => boolean,
+  resourceMetadataUrl: string,
+  route: string,
+): Response | null {
+  const audience = connectorTokenAudience(authHeader);
+  if (!audience) return null;
+  if (audience.surface === null || mcpIdentityForResource(audience.resource)?.issuer !== new URL(resourceMetadataUrl).origin) {
+    console.error(JSON.stringify({ at: 'mcp.audience', error: 'TOKEN_AUDIENCE_MISSING', endpoint: route }));
+    return new Response(
+      JSON.stringify(rpcError(null, -32000, 'This connection must be authorized again. Reconnect it to continue.')),
+      {
+        status: 401,
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'WWW-Authenticate': `Bearer realm="${mcpRealm(resourceMetadataUrl)}", error="invalid_token", resource_metadata="${resourceMetadataUrl}"`,
+        },
+      },
+    );
+  }
+  if (allowed(audience.surface)) return null;
+  console.error(JSON.stringify({ at: 'mcp.audience', error: 'TOKEN_SURFACE_MISMATCH', endpoint: route, token_surface: audience.surface }));
+  return new Response(
+    JSON.stringify(rpcError(null, -32000, 'This connection was authorized for a different toolset. Reconnect from this endpoint to authorize it.')),
+    { status: 403, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } },
+  );
 }
 
 /**
@@ -14348,7 +15028,7 @@ async function callRunner(
       const guardedRunner = authAwareFetcher(env.RUNNER_SERVICE, authHeader);
       resp = await guardedRunner.fetch(new Request(`https://runner-internal${path}`, init));
     } else {
-      const base = env.RUNNER_BASE_URL || 'https://runner.somewhere.tech';
+      const base = runnerBaseUrl(env.RUNNER_BASE_URL);
       const publicRunner = {
         fetch: (...args: Parameters<typeof fetch>) => fetch(...args),
       } as Fetcher;
@@ -14378,6 +15058,12 @@ async function callRunner(
   return { status: resp.status, data: await resp.json() };
 }
 
+/** A tool argument would have moved an internal API request off its route (see internal-api-url.ts). */
+function invalidInternalPath(err: unknown): { status: number; data: unknown } {
+  if (!(err instanceof InternalApiPathError)) throw err;
+  return { status: 400, data: { ok: false, error: err.code, message: err.message } };
+}
+
 async function callAPI(
   fetcher: Fetcher,
   method: string,
@@ -14385,7 +15071,7 @@ async function callAPI(
   authHeader: string,
   body?: unknown,
   extraHeaders?: Record<string, string>
-): Promise<{ status: number; data: unknown }> {
+): Promise<ToolUpstreamResult> {
   const headers = new Headers({
     'Authorization': authHeader,
     'Content-Type': 'application/json',
@@ -14398,7 +15084,9 @@ async function callAPI(
   const init: RequestInit = { method, headers };
   if (body && method !== 'GET' && method !== 'HEAD') init.body = JSON.stringify(body);
 
-  const req = new Request(`https://api-internal${path}`, init);
+  let url: string;
+  try { url = internalApiUrl(path); } catch (err) { return invalidInternalPath(err); }
+  const req = new Request(url, init);
   const resp = await fetcher.fetch(req);
 
   if (method === 'HEAD' || resp.status === 204 || resp.status === 205) {
@@ -14421,7 +15109,7 @@ async function callAPI(
     if (resp.status === 401 && bearerLooksLikeApiKey(authHeader)) {
       throw new UpstreamApiKeyRejectedError('Upstream rejected the API key.', 'INVALID_API_KEY');
     }
-    return { status: resp.status, data: { ok: false, error: 'UPSTREAM_ERROR', message: text.slice(0, 500) } };
+    return { status: resp.status, data: { ok: false, error: 'UPSTREAM_ERROR', message: text.slice(0, 500) }, ...failureCorrelation(resp) };
   }
 
   const data = await resp.json();
@@ -14440,7 +15128,40 @@ async function callAPI(
       : 'Upstream rejected the API key.';
     throw new UpstreamApiKeyRejectedError(msg, apiKeyRejection);
   }
-  return { status: resp.status, data };
+  return { status: resp.status, data, ...failureCorrelation(resp) };
+}
+
+/** A failed call's correlation headers, carried on the result (never into its body) so the
+ *  tool-error repro packet can name them (tsk_da2dba3d). Validated by the packet builder. */
+function failureCorrelation(resp: Response): { requestId?: string; traceId?: string } {
+  if (resp.status < 400) return {};
+  const requestId = resp.headers.get('x-request-id') ?? undefined;
+  const traceId = resp.headers.get('x-trace-id') ?? undefined;
+  return { ...(requestId ? { requestId } : {}), ...(traceId ? { traceId } : {}) };
+}
+
+/** The shell-less repro packet for a failed tool call: the same `somewhere.repro/1` schema and
+ *  validators the CLI uses (shared/repro-guidance.ts). Built only from typed fields of the
+ *  upstream envelope and the call; never its message, hint, data (beyond the validated
+ *  `invalid` location) or arguments. Omitted when the defence-in-depth scrub refuses. */
+function toolReproPacket(toolName: string, result: ToolUpstreamResult, envelope: Record<string, unknown>, args: Record<string, unknown>): unknown {
+  try {
+    const data = envelope.data && typeof envelope.data === 'object' ? envelope.data as Record<string, unknown> : {};
+    return buildPacket(buildRecordFromFields({
+      platform: true,
+      code: canonicalErrorCode(envelope) ?? undefined,
+      status: result.status,
+      tool: toolName,
+      requestId: result.requestId,
+      traceId: result.traceId,
+      projectId: args.project_id,
+      retry: envelope.retry,
+      retryAfterMs: envelope.retry_after_ms,
+      invalid: data.invalid,
+    }, { client: { kind: 'mcp', version: MCP_SERVER_VERSION } }));
+  } catch {
+    return undefined;
+  }
 }
 
 type ApiToolMethod = 'GET' | 'HEAD' | 'POST' | 'PATCH' | 'PUT' | 'DELETE';
@@ -14687,10 +15408,11 @@ function normalizeToolArgAliases(toolName: string, input: Record<string, unknown
     if (typeof args.include === 'string') {
       args.include = args.include.split(',').map((s) => s.trim()).filter(Boolean);
     }
-    for (const boolKey of ['inline', 'continue_on_failure'] as const) {
+    for (const boolKey of ['inline', 'continue_on_failure', 'require_existing_session', 'close'] as const) {
       if (args[boolKey] === 'true') args[boolKey] = true;
       if (args[boolKey] === 'false') args[boolKey] = false;
     }
+    if (typeof args.budget_ms === 'string' && /^\d+$/.test(args.budget_ms)) args.budget_ms = Number(args.budget_ms);
     if (typeof args.steps === 'string') {
       try { args.steps = JSON.parse(args.steps); } catch { /* validated later */ }
     }
@@ -14921,11 +15643,51 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 interface ProjectListItem { id: string; subdomain: string; name?: string }
 
 function formatProjectSuggestions(projects: ProjectListItem[]): string {
-  const listed = projects.slice(0, 10).map((p) => `  ${p.subdomain} → ${p.id}`).join('\n') || '  (none)';
+  const listed = projects.slice(0, 10).map((p) => (p.subdomain ? `  ${p.subdomain} → ${p.id}` : `  ${p.id}`)).join('\n') || '  (none)';
   const remaining = projects.length - 10;
   return remaining > 0
     ? `${listed}\n  …and ${remaining} more; call project_list for the rest.`
     : listed;
+}
+
+/** A project reference that cannot be resolved, with a machine-readable code
+ *  and the ids the caller may pass instead (pfb_ca1d666fa102). */
+class ProjectResolutionError extends Error {
+  constructor(readonly code: string, message: string, readonly projects?: ProjectListItem[]) {
+    super(message);
+    this.name = 'ProjectResolutionError';
+  }
+}
+
+/** The projects a scope-limited CLI session may touch, from /v1/auth/whoami
+ *  (always callable by a scoped key). Null = not a scoped session. */
+async function sessionScopeProjects(fetcher: Fetcher, authHeader: string): Promise<string[] | null> {
+  const who = await callAPI(fetcher, 'GET', '/v1/auth/whoami', authHeader);
+  if (who.status !== 200) return null;
+  const projects = (who.data as { data?: { session?: { scope?: { projects?: unknown } | null } | null } })
+    ?.data?.session?.scope?.projects;
+  return Array.isArray(projects) && projects.every((id) => typeof id === 'string') ? projects as string[] : null;
+}
+
+function resolveDefaultFrom(projects: ProjectListItem[], owner: 'account' | 'session'): string {
+  if (projects.length === 1) return projects[0].id;
+  if (projects.length === 0) {
+    throw new ProjectResolutionError(
+      'NO_PROJECTS',
+      owner === 'session'
+        ? 'This CLI session has no project in its scope. Run `somewhere login` and choose the project to work on.'
+        : 'No projects found on this account. Create one first using the create_project tool or POST /v1/projects.',
+      [],
+    );
+  }
+  const listed = formatProjectSuggestions(projects);
+  throw new ProjectResolutionError(
+    'PROJECT_ID_REQUIRED',
+    owner === 'session'
+      ? `This CLI session covers ${projects.length} projects — pass project_id as one of:\n${listed}`
+      : `Multiple projects on this account — pass a specific subdomain or UUID instead of "default":\n${listed}`,
+    projects,
+  );
 }
 
 async function resolveProjectId(
@@ -14940,6 +15702,12 @@ async function resolveProjectId(
   //    this to the caller — we never see other users' projects.
   const list = await callAPI(fetcher, 'GET', '/v1/projects', authHeader);
   if (list.status !== 200) {
+    // A project-only CLI session may not list the account's projects, but it
+    // knows its own: "default" (or no project_id) is the session's project.
+    if ((!rawId || rawId === 'default') && list.status === 403) {
+      const scoped = await sessionScopeProjects(fetcher, authHeader);
+      if (scoped) return resolveDefaultFrom(scoped.map((id) => ({ id, subdomain: '' })), 'session');
+    }
     throw new Error(`Could not list projects to resolve "${rawId}" (HTTP ${list.status}).`);
   }
   const payload = list.data as { ok?: boolean; data?: { projects?: ProjectListItem[] } };
@@ -14947,14 +15715,7 @@ async function resolveProjectId(
 
   // 3. "default" or empty — return the only project, OR error if there
   //    are zero or multiple.
-  if (!rawId || rawId === 'default') {
-    if (projects.length === 0) {
-      throw new Error('No projects found on this account. Create one first using the create_project tool or POST /v1/projects.');
-    }
-    if (projects.length === 1) return projects[0].id;
-    const listed = formatProjectSuggestions(projects);
-    throw new Error(`Multiple projects on this account — pass a specific subdomain or UUID instead of "default":\n${listed}`);
-  }
+  if (!rawId || rawId === 'default') return resolveDefaultFrom(projects, 'account');
 
   // 4. Subdomain match.
   const match = projects.find((p) => p.subdomain === rawId);
@@ -14963,11 +15724,11 @@ async function resolveProjectId(
   // 5. Nothing matched — error with the available list so Claude can
   //    correct itself on the next call.
   const listed = formatProjectSuggestions(projects);
-  throw new Error(`Project "${rawId}" not found. Your projects:\n${listed}`);
+  throw new ProjectResolutionError('PROJECT_NOT_FOUND', `Project "${rawId}" not found. Your projects:\n${listed}`, projects);
 }
 
 const TASK_NOTICE_SENTINEL_TOOLS = new Set([
-  'tasks_get', 'tasks_list', 'tasks_create', 'tasks_update', 'tasks_summary',
+  'tasks_get', 'tasks_list', 'tasks_create', 'tasks_update', 'tasks_summary', 'tasks_overview',
   'tasks_delete', 'tasks_bulk_update', 'tasks_settings_get', 'tasks_reconcile',
   'tasks_settings_update', 'tasks_comment_edit', 'tasks_comment_delete',
   'memory_save', 'memory_search', 'record', 'recall',
@@ -15021,7 +15782,7 @@ async function maybeInjectProjectNoticeContext(
   const args = normalizeToolArgAliases(toolName, rawArgs);
   const projectRef = typeof args.project_id === 'string' ? args.project_id.trim() : '';
   if (!projectRef) return result;
-  if ((projectRef === 'default' || projectRef === 'spine') && TASK_NOTICE_SENTINEL_TOOLS.has(toolName)) {
+  if ((projectRef === 'default' || projectRef === 'spine') && TASK_NOTICE_SENTINEL_TOOLS.has(policyToolName(toolName))) {
     return result;
   }
   try {
@@ -15099,10 +15860,11 @@ async function authorizeAdvisorCall(
   request: Request,
   authHeader: string,
   source: AdvisorSource,
+  receiptRecoveryOnly=false,
 ): Promise<AdvisorAccess | null> {
   if (!authHeader) {
     const [gate, telemetry] = await Promise.all([
-      checkAnonymousAdvisorRateLimit(env, request, source),
+      receiptRecoveryOnly?Promise.resolve({allowed:true,retryAfterS:0}):checkAnonymousAdvisorRateLimit(env, request, source),
       advisorCallerTelemetry(env, request, ''),
     ]);
     return gate.allowed
@@ -15110,120 +15872,11 @@ async function authorizeAdvisorCall(
       : { mode: 'anonymous', serviceTier: 'flex', retryAfterS: gate.retryAfterS, telemetry };
   }
   if (!(await verifyBearerUpstream(env, authHeader))) return null;
-  const rate = await checkAdvisorRateLimit(env, request, authHeader);
+  const rate = receiptRecoveryOnly?{allowed:true,retryAfterS:0}:await checkAdvisorRateLimit(env, request, authHeader);
   const telemetry = await advisorCallerTelemetry(env, request, authHeader);
   return rate.allowed
     ? { mode: 'authenticated', serviceTier: 'default', retryAfterS: 0, telemetry }
     : { mode: 'authenticated', serviceTier: 'default', retryAfterS: rate.retryAfterS, telemetry };
-}
-
-/** Load authorized project facts under a shared deadline. Failed reads are
- * unknown facts, never evidence that a feature is absent or broken. */
-async function loadProjectContextForAdvisor(
-  env: Env,
-  authHeader: string,
-  projectIdArg: string,
-  diagnostics: AdvisorDiagnostics,
-): Promise<string | null> {
-  const fetcher = advisorContextFetcher(env.API_SERVICE, diagnostics);
-  let projectId = projectIdArg;
-  try {
-    projectId = await resolveProjectId(projectIdArg, fetcher, authHeader);
-  } catch {
-    return `## PROJECT CONTEXT (requested but unresolvable)\n\nThe developer passed \`project_id: ${JSON.stringify(projectIdArg)}\`, but this developer key cannot resolve it to an owned or shared project. Project-specific guidance is unavailable until a valid accessible id or subdomain is supplied. A generic project must not be inferred.`;
-  }
-
-  // Unwrap the `{ ok, data }` envelope returned by callAPI. Returns the
-  // inner `data` object on 2xx, or null on any non-2xx / parse failure.
-  const factStatuses: AdvisorFactRead[] = [];
-  const fetchData = async <T,>(path: string): Promise<T | null> => {
-    const fact = { source: path.split('?')[0], scope: (path === '/v1/payments/status' || path === '/v1/hosted/status' || path === '/v1/domains/owned' ? 'caller' : 'project') as 'caller' | 'project', status: 'unavailable' as 'available' | 'denied' | 'unavailable', observed_at: new Date().toISOString() };
-    factStatuses.push(fact);
-    try {
-      const res = await callAPI(fetcher, 'GET', path, authHeader);
-      if (res.status === 401 || res.status === 403) fact.status = 'denied';
-      if (res.status < 200 || res.status >= 300) return null;
-      const env = res.data as { ok?: boolean; data?: unknown };
-      if (env && env.ok && env.data !== undefined && env.data !== null) { fact.status = 'available'; return env.data as T; }
-      return null;
-    } catch {
-      return null;
-    }
-  };
-
-  const [
-    project,
-    customDomainsResp,
-    ownedDomainsResp,
-    envResp,
-    deployResp,
-    paymentsResp,
-    errorsResp,
-    authUsersResp,
-    dbTablesResp,
-    cronsResp,
-    inboxResp,
-    searchResp,
-    hostedResp,
-  ] = await Promise.all([
-    fetchData<Record<string, unknown>>(`/v1/projects/${encodeURIComponent(projectId)}`),
-    fetchData<{ domains: Array<Record<string, unknown>> }>(`/v1/domains?project_id=${encodeURIComponent(projectId)}`),
-    fetchData<{ domains: Array<Record<string, unknown>> }>(`/v1/domains/owned`),
-    fetchData<{ keys: Array<{ key: string }> }>(`/v1/env?project_id=${encodeURIComponent(projectId)}`),
-    fetchData<{
-      dev_updated_at: string | null;
-      prod_updated_at: string | null;
-      in_sync: boolean;
-      dev_ahead: boolean;
-      files_changed: number;
-    }>(`/v1/deploy/status?project_id=${encodeURIComponent(projectId)}`),
-    fetchData<{
-      connected: boolean;
-      onboarded: boolean;
-      charges_enabled: boolean;
-      payouts_enabled?: boolean;
-      country?: string | null;
-    }>(`/v1/payments/status`),
-    fetchData<{ total: number; by_code: Array<{ error_code: string; count: number }> }>(
-      `/v1/errors/stats?project_id=${encodeURIComponent(projectId)}&period=24h`,
-    ),
-    fetchData<{ users: Array<unknown>; next_cursor: string | null; count: number }>(
-      `/v1/auth/users?project_id=${encodeURIComponent(projectId)}&limit=1`,
-    ),
-    fetchData<{ tables: string[] }>(`/v1/db/tables?project_id=${encodeURIComponent(projectId)}`),
-    fetchData<{ crons: Array<{ id: string; schedule: string; handler: string; enabled: boolean; name?: string | null }> }>(
-      `/v1/cron?project_id=${encodeURIComponent(projectId)}`,
-    ),
-    fetchData<{ addresses: Array<{ address: string; label: string | null }> }>(
-      `/v1/inbox/addresses?project_id=${encodeURIComponent(projectId)}`,
-    ),
-    fetchData<{ indexes: Array<{ name: string; item_count: number }> }>(
-      `/v1/search/index?project_id=${encodeURIComponent(projectId)}`,
-    ),
-    fetchData<{ status: string; instance_id: string | null }>(`/v1/hosted/status`),
-  ]);
-
-  if (!project || typeof project !== 'object') {
-    return `## PROJECT CONTEXT (requested but project record not returned)\n\nproject_id ${JSON.stringify(projectIdArg)} resolved to ${JSON.stringify(projectId)}, but the project record could not be loaded. Only general guidance is supported until a readable project record is available.`;
-  }
-
-  const read = (source: string): AdvisorFactRead => factStatuses.find(fact => fact.source === source)
-    ?? { source, scope: 'project', status: 'unavailable', observed_at: new Date().toISOString() };
-  return formatAdvisorProjectFacts(projectId, {
-    project: { read: read(`/v1/projects/${encodeURIComponent(projectId)}`), data: project, fields: ['id', 'subdomain', 'name', 'description', 'plan', 'tier', 'status'] },
-    custom_domains: { read: read('/v1/domains'), data: customDomainsResp, list: { field: 'domains', fields: ['domain', 'verified', 'purchased', 'ssl_active'] } },
-    owned_domains: { read: read('/v1/domains/owned'), data: ownedDomainsResp, list: { field: 'domains', fields: ['domain', 'attached_host', 'claim_status'], projectId } },
-    environment: { read: read('/v1/env'), data: envResp, list: { field: 'keys', fields: ['key'] } },
-    deploy: { read: read('/v1/deploy/status'), data: deployResp, fields: ['dev_updated_at', 'prod_updated_at', 'in_sync', 'dev_ahead', 'files_changed'] },
-    payments: { read: read('/v1/payments/status'), data: paymentsResp, fields: ['connected', 'onboarded', 'charges_enabled', 'payouts_enabled', 'country'] },
-    errors: { read: read('/v1/errors/stats'), data: errorsResp, fields: ['total'], list: { field: 'by_code', fields: ['error_code', 'count'] } },
-    auth: { read: read('/v1/auth/users'), data: authUsersResp ? { count: authUsersResp.count, returned_count: Array.isArray(authUsersResp.users) ? authUsersResp.users.length : undefined, has_more: typeof authUsersResp.next_cursor === 'string' ? true : authUsersResp.next_cursor === null ? false : undefined } : null, fields: ['count', 'returned_count', 'has_more'] },
-    database: { read: read('/v1/db/tables'), data: dbTablesResp, list: { field: 'tables' } },
-    cron: { read: read('/v1/cron'), data: cronsResp, list: { field: 'crons', fields: ['id', 'schedule', 'handler', 'enabled', 'name'] } },
-    inbox: { read: read('/v1/inbox/addresses'), data: inboxResp, list: { field: 'addresses', fields: ['address', 'label'] } },
-    search: { read: read('/v1/search/index'), data: searchResp, list: { field: 'indexes', fields: ['name', 'item_count'] } },
-    workspace: { read: read('/v1/hosted/status'), data: hostedResp, fields: ['status', 'instance_id'] },
-  });
 }
 
 /** Shared evidence and output policy. Relevant canonical documentation and
@@ -15245,6 +15898,7 @@ function buildStaticSystemPrompt(surface: ToolSurface): string {
     '# PLATFORM DOCUMENTATION',
     '',
     'Relevant documentation is supplied below. A missing excerpt means unknown, not unsupported. Use docs for the full named topic.',
+    'Name a docs topic only as it appears after `## Topic:` or `## Required reference:` in the supplied documentation; a command or error code is not a topic.',
     '',
     '---',
     '',
@@ -15260,10 +15914,17 @@ function buildStaticSystemPrompt(surface: ToolSurface): string {
   return system;
 }
 
-/** Context-only, bounded advice using the configured model and caller authority. */
+const ADVISOR_PROJECT_CONTEXT_MESSAGE = 'Advisor cannot read projects. Omit project_id and context.project_ref; send the needed facts explicitly in context.';
+
+function advisorProjectInputError(input: { project_id?: unknown; context?: unknown }): string | null {
+  const context = input.context && typeof input.context === 'object' && !Array.isArray(input.context)
+    ? input.context as Record<string, unknown> : null;
+  return input.project_id != null || context?.project_ref != null ? ADVISOR_PROJECT_CONTEXT_MESSAGE : null;
+}
+
+/** Context-only, bounded advice from explicit input and bundled public contracts. */
 async function callPlatformAdvisor(
   env: Env,
-  authHeader: string,
   question: string,
   projectIdArg: string | null,
   surface: ToolSurface,
@@ -15272,14 +15933,11 @@ async function callPlatformAdvisor(
   serviceTier: 'flex' | 'default' = 'default',
   clientContext: string | null = null,
 ): Promise<AdvisorAnswer> {
+  if (projectIdArg !== null) throw new Error(ADVISOR_PROJECT_CONTEXT_MESSAGE);
   const startedAt = Date.now();
   const diagnostics: AdvisorDiagnostics = { context_ms: 0, context_reads: [], prompt_chars: 0, topics: [], attempts: [] };
   const contractAnswer = advisorWebhookContractAnswer(question) ?? (!projectIdArg && !clientContext ? advisorContractAnswer(question) : null);
   if (contractAnswer) {
-    if (projectIdArg && authMode === 'authenticated') {
-      await loadProjectContextForAdvisor(env, authHeader, projectIdArg, diagnostics);
-      diagnostics.context_ms = Date.now() - startedAt;
-    }
     return {
       text: contractAnswer,
       model: 'static-contract',
@@ -15301,27 +15959,23 @@ async function callPlatformAdvisor(
   }
 
   const systemParts = [buildStaticSystemPrompt(surface)];
-  let projectContext: string | null = null;
   systemParts.push('');
+  systemParts.push('ADVISOR ACCESS: You have no access to projects, account data, history, URLs or tools. Supplied facts are caller-provided, never platform-verified.');
   systemParts.push(authMode === 'anonymous'
     ? 'AUTH CONTEXT: This is an anonymous top-of-funnel question. Give a useful docs-grounded answer, but clearly mark any account-scoped tool or live-project step as requiring login. You have no live project state.'
-    : 'AUTH CONTEXT: This caller is verified. Account-scoped tools are available, and a live project snapshot follows only when project_id was supplied.');
+    : 'AUTH CONTEXT: The transport verified this caller; it supplies no account or project facts.');
   // State which execution surfaces the caller actually has.
   if (caller === 'cli') {
     systemParts.push('');
-    systemParts.push("CALLER CONTEXT: This caller has a shell. Use `somewhere call <tool> '<json>'` with the provided tool argument schemas for operations. Do not invent subcommands or flags. `somewhere docs <topic>`, `somewhere dev`, and `somewhere deploy` are also valid. Cron handler is a /api URL path or full HTTPS URL, never a source filename.");
+    systemParts.push("CALLER CONTEXT: This caller has a shell. Use `somewhere call <tool> '<json>'` with the provided tool argument schemas for operations. Do not invent subcommands or flags. `somewhere docs <topic>` and `somewhere deploy` are also valid. `somewhere dev` serves only the frontend and runs no backend code, so never offer it to test a handler: `somewhere deploy-check --run /api/<path>` runs one handler before deploying, on every plan. Cron handler is a /api URL path or full HTTPS URL, never a source filename.");
   } else if (caller === 'connector') {
     systemParts.push('');
     systemParts.push('CALLER CONTEXT: This is a connector client. Describe actions using the tools advertised on this connection. Do not assume a terminal is available; if the caller states that it has one, CLI commands are an alternative.');
   }
-  if (authMode === 'authenticated' && projectIdArg) {
-    const contextStartedAt = Date.now();
-    projectContext = await loadProjectContextForAdvisor(env, authHeader, projectIdArg, diagnostics);
-    diagnostics.context_ms = Date.now() - contextStartedAt;
-  }
+  systemParts.push('For prices and plan limits, use the bundled public pricing contracts. Personalized plan, usage and locked-plan facts require explicitly supplied caller context; missing facts are unknown.');
   const advertised = advertisedNamesForSurface(surface);
   const advertisedTools = TOOL_DEFINITIONS.filter((tool) => advertised.has(tool.name));
-  const knowledge = selectAdvisorKnowledge(question, PLATFORM_HELP_TOPICS, advertisedTools, { caller });
+  const knowledge = selectAdvisorRequestKnowledge(question, PLATFORM_HELP_TOPICS, advertisedTools, { caller });
   diagnostics.topics = knowledge.topics;
   diagnostics.knowledge = knowledge.selection;
   systemParts.push(constrainCanonicalText(knowledge.text, surface), advisorIntegrationContext(question));
@@ -15330,10 +15984,7 @@ async function callPlatformAdvisor(
   systemParts.push(ADVISOR_COMPOSITION_PROMPT);
   const system = systemParts.join('\n');
   diagnostics.prompt_chars = system.length;
-  const untrustedContext = [
-    projectContext ? `LIVE PROJECT SNAPSHOT:\n${projectContext}` : null,
-    clientContext ? `CLIENT-SUPPLIED DIAGNOSTIC CONTEXT:\n${clientContext}` : null,
-  ].filter((part): part is string => part !== null).join('\n\n') || null;
+  const untrustedContext = clientContext ? `CLIENT-SUPPLIED DIAGNOSTIC CONTEXT:\n${clientContext}` : null;
 
   const model = advisorModel(env.ADVISOR_MODEL);
   diagnostics.requested_model = model;
@@ -15342,16 +15993,7 @@ async function callPlatformAdvisor(
     return { text: advisorFallbackText('ADVISOR_UPSTREAM_FAILURE', diagnostics.topics, 'invalid_parameter'), model, cost_cents: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, latency_ms: Date.now() - startedAt, service_tier: serviceTier, failure_code: 'ADVISOR_UPSTREAM_FAILURE', diagnostics };
   }
   const promptCacheKey = `advisor:${surface}:${(await sha256Hex(system)).slice(0, 32)}`;
-  const requestBody = JSON.stringify({
-    model,
-    reasoning: { effort: 'none' },
-    text: { verbosity: 'low', format: ADVISOR_COMPOSITION_FORMAT },
-    input: buildAdvisorInput(system, question, untrustedContext),
-    prompt_cache_key: promptCacheKey,
-    service_tier: serviceTier,
-    store: false,
-    max_output_tokens: ADVISOR_MAX_OUTPUT_TOKENS,
-  });
+  const requestBody = JSON.stringify({ ...buildAdvisorRequestBody(model, system, question, untrustedContext, promptCacheKey, serviceTier), store: false });
   let failureCode: AdvisorAnswer['failure_code'] = null;
   let usage = { model, cost_cents: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, service_tier: serviceTier };
   diagnostics.usage_status = 'unconfirmed';
@@ -15436,6 +16078,11 @@ async function callPlatformAdvisor(
         diagnostic.outcome = payload.incomplete_details?.reason ?? payload.status;
         break;
       }
+      if (payload.output?.some(item => item.type === 'function_call')) {
+        failureCode = 'ADVISOR_INCORRECT_ANSWER';
+        diagnostic.outcome = 'unexpected_function_call';
+        break;
+      }
       let text = '';
       for (const item of payload.output || []) {
         if (item.type === 'message') {
@@ -15447,7 +16094,7 @@ async function callPlatformAdvisor(
       if (!text.trim()) { failureCode = 'ADVISOR_EMPTY_RESPONSE'; diagnostic.outcome = 'empty_response'; break; }
       const composition = parseAdvisorComposition(text);
       if (!composition) { failureCode = 'ADVISOR_INCORRECT_ANSWER'; diagnostic.outcome = 'composition_invalid'; break; }
-      const rendered = renderAdvisorComposition(composition, { tools: advertisedTools, projectId: advisorAuthorizedProjectId(projectContext), caller });
+      const rendered = renderAdvisorComposition(composition, { tools: advertisedTools, projectId: null, caller, question });
       const constrainedText = constrainCanonicalText(rendered.text, surface);
       if (!constrainedText.trim()) {
         failureCode = 'ADVISOR_EMPTY_RESPONSE';
@@ -15455,8 +16102,11 @@ async function callPlatformAdvisor(
         continue;
       }
       const commands = checkAdvisorCommands(rendered.text, advertisedTools);
-      const commandFailure = commands.ok ? null : 'ADVISOR_INCORRECT_ANSWER';
-      diagnostic.outcome = commands.ok ? (rendered.omissions.length ? 'completed_with_omissions' : commands.unvalidated ? 'completed_commands_unvalidated' : 'completed') : commands.reason;
+      const docsTopics = checkAdvisorDocsTopics(rendered.text, platformHelpTopicNamed);
+      const commandFailure = commands.ok && docsTopics.ok ? null : 'ADVISOR_INCORRECT_ANSWER';
+      if (!docsTopics.ok) diagnostics.unknown_docs_topics = docsTopics.topics;
+      diagnostic.outcome = !commands.ok ? commands.reason : !docsTopics.ok ? docsTopics.reason
+        : rendered.omissions.length ? 'completed_with_omissions' : commands.unvalidated ? 'completed_commands_unvalidated' : 'completed';
       return {
         text: commandFailure ? advisorFallbackText(commandFailure, diagnostics.topics) : constrainedText,
         ...usage,
@@ -15508,9 +16158,33 @@ function queueHelpCall(
   if (ctx) ctx.waitUntil(promise); else void promise;
 }
 
-/** The audit log is intentionally one row per call. It stores the exact
- * request and response for a human or agent to read; it never aggregates or
- * compares calls beyond the exact-repeat bit calculated by the API. */
+const ADVISOR_AUDIT_OUTCOMES = new Set(['completed', 'completed_with_omissions', 'completed_commands_unvalidated',
+  'not_configured', 'invalid_parameter', 'upstream_failure', 'unexpected_function_call', 'empty_response',
+  'composition_invalid', 'max_output_tokens', 'incomplete', 'failed', 'command_unstructured', 'command_syntax',
+  'command_tool', 'command_json', 'command_required_args', 'docs_topic_unknown',
+  'ADVISOR_TIMEOUT', 'ADVISOR_UPSTREAM_FAILURE', 'ADVISOR_INCOMPLETE_RESPONSE', 'ADVISOR_EMPTY_RESPONSE', 'ADVISOR_INCORRECT_ANSWER']);
+const ADVISOR_AUDIT_SURFACES = new Set(['mcp:full', 'mcp:chatgpt', 'mcp:connector', 'advisor:mcp', 'advisor:cli', 'advisor:http', 'advisor:docs-warm']);
+const advisorAuditNumber = (value: unknown): number => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
+function advisorAuditMetadata(diagnostics?: AdvisorDiagnostics) {
+  return {
+    context_ms: advisorAuditNumber(diagnostics?.context_ms),
+    prompt_chars: advisorAuditNumber(diagnostics?.prompt_chars),
+    usage_status: ['unconfirmed', 'token_estimate', 'unpriced_model'].includes(diagnostics?.usage_status ?? '') ? diagnostics?.usage_status : 'unconfirmed',
+    usage: diagnostics?.usage ? {
+      input_tokens: advisorAuditNumber(diagnostics.usage.input_tokens),
+      output_tokens: advisorAuditNumber(diagnostics.usage.output_tokens),
+      cached_input_tokens: advisorAuditNumber(diagnostics.usage.cached_input_tokens),
+      cache_write_input_tokens: advisorAuditNumber(diagnostics.usage.cache_write_input_tokens),
+    } : undefined,
+    attempts: diagnostics?.attempts.slice(0, 1).map(attempt => ({
+      duration_ms: advisorAuditNumber(attempt.duration_ms),
+      status: Number.isInteger(attempt.status) && attempt.status! >= 100 && attempt.status! <= 599 ? attempt.status : null,
+      outcome: ADVISOR_AUDIT_OUTCOMES.has(attempt.outcome) ? attempt.outcome : 'upstream_failure',
+    })) ?? [],
+  };
+}
+
+/** Docs retain their existing content audit; new Advisor calls record metadata only. */
 async function logHelpCall(env: Env, authHeader: string, record: HelpCallRecord): Promise<void> {
   if (!env.SOMEWHERE_TECH_ADMIN_KEY) return;
   try {
@@ -15520,17 +16194,18 @@ async function logHelpCall(env: Env, authHeader: string, record: HelpCallRecord)
         'X-Admin-Key': env.SOMEWHERE_TECH_ADMIN_KEY,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        kind: record.kind,
-        request: record.requestText,
-        answer: record.answerText,
-        surface: record.surface,
-        session_id: record.sessionId,
-        project_id: record.projectId,
-        latency_ms: record.latencyMs,
-        context_attached: record.contextAttached === true,
-        context_text: record.contextText ?? null,
-        diagnostics: record.diagnostics ?? null,
+      body: JSON.stringify(record.kind === 'advisor' ? {
+        contract_version: 2,
+        kind: 'advisor',
+        answer_present: record.answerText.trim().length > 0,
+        surface: ADVISOR_AUDIT_SURFACES.has(record.surface.split(':').slice(0, 2).join(':')) ? record.surface.split(':').slice(0, 2).join(':') : 'advisor:mcp',
+        latency_ms: advisorAuditNumber(record.latencyMs),
+        diagnostics: advisorAuditMetadata(record.diagnostics),
+      } : {
+        kind: record.kind, request: record.requestText, answer: record.answerText,
+        surface: record.surface, session_id: record.sessionId, project_id: record.projectId,
+        latency_ms: record.latencyMs, context_attached: record.contextAttached === true,
+        context_text: record.contextText ?? null, diagnostics: record.diagnostics ?? null,
       }),
     });
     await env.API_SERVICE.fetch(req);
@@ -15539,8 +16214,7 @@ async function logHelpCall(env: Env, authHeader: string, record: HelpCallRecord)
   }
 }
 
-/** Keep the existing advisor cost ledger while writing the canonical per-call
- * audit row used to review both docs and advisor responses. */
+/** Keep Advisor cost accounting and per-call metadata without retaining content. */
 async function logAdvisorQuery(
   env: Env,
   authHeader: string,
@@ -15566,9 +16240,6 @@ async function logAdvisorQuery(
     ...audit,
     diagnostics: answer.diagnostics,
   });
-  const callerKeyPrefix = authHeader.startsWith('Bearer ')
-    ? authHeader.slice(7, 7 + 12)
-    : '';
   try {
     const req = new Request('https://api-internal/v1/sys/advisor-log', {
       method: 'POST',
@@ -15577,15 +16248,13 @@ async function logAdvisorQuery(
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        question,
-        answer: answer.text,
-        model: answer.model,
+        contract_version: 2,
+        model: advisorModelSupported(answer.model) || answer.model === 'static-contract' ? answer.model : 'unavailable',
         cost_cents: answer.cost_cents,
         input_tokens: answer.input_tokens,
         output_tokens: answer.output_tokens,
         cached_input_tokens: answer.cached_input_tokens,
         latency_ms: answer.latency_ms,
-        caller_key_prefix: callerKeyPrefix || null,
         auth_mode: authMode,
         source,
         service_tier: answer.service_tier,
@@ -15647,11 +16316,11 @@ async function handlePublicAdvisor(
       message: 'question is required and must be at most 6000 characters.',
     }, 400);
   }
+  const inputError = advisorProjectInputError(body);
+  if (inputError) return jsonResponse({ ok: false, error: 'ADVISOR_PROJECT_CONTEXT_UNSUPPORTED', message: inputError }, 400);
   const clientContext = sanitizeAdvisorContext(body.context);
   const contextText = formatAdvisorContext(clientContext);
-  const projectId = typeof body.project_id === 'string' && body.project_id.trim()
-    ? body.project_id.trim()
-    : clientContext?.project_ref ?? null;
+  const projectId = null;
   const source = advisorSourceForRequest(request);
   let access: AdvisorAccess | null;
   try {
@@ -15679,19 +16348,10 @@ async function handlePublicAdvisor(
       retry_after_seconds: access.retryAfterS,
     }, 429);
   }
-  if (access.mode === 'anonymous' && projectId) {
-    return jsonResponse({
-      ok: false,
-      error: 'AUTH_REQUIRED_FOR_PROJECT_CONTEXT',
-      message: 'Live project context requires login. Omit --project to ask anonymously, or run `somewhere login`.',
-    }, 401);
-  }
-
   const caller: CallerKind = source === 'cli' || source === 'docs-warm' ? 'cli' : 'unknown';
   try {
     const answer = await callPlatformAdvisor(
       env,
-      authHeader,
       question,
       projectId,
       'full',
@@ -15788,6 +16448,7 @@ function jsonSafeToolError(result: ToolExecutionResult): ToolExecutionResult {
 
 interface UploadMintRecord {
   url: string;
+  multipart_url?: string;
   path: string;
   expires_at: string;
   max_size: number;
@@ -15846,6 +16507,7 @@ async function mintUploadRelay(
   }
   return {
     url: data.url,
+    ...(typeof data.multipart_url === 'string' ? { multipart_url: data.multipart_url } : {}),
     path: data.path,
     expires_at: data.expires_at,
     max_size: data.max_size,
@@ -16016,6 +16678,7 @@ function catalogNextCall(search: string): NextCallRecommendation {
 const SAFETY_ARGUMENT_NAMES = [
   'expected_version',
   'base_version',
+  'base_release_id',
   'base_live_version',
   'confirm',
   'code',
@@ -16131,6 +16794,11 @@ function constrainNextCallToSurface(
       one_line_why: 'The connector support route is POST /v1/platform-feedback through api_write; its response contains the ticket_id.',
     };
   }
+  if (nextCall.tool === 'support_ticket'
+    && !surfaceAllowsCanonicalTool(surface, 'support_ticket')
+    && surfaceAllowsCanonicalTool(surface, 'support_ticket_submit')) {
+    return { ...nextCall, tool: 'support_ticket_submit', args_skeleton: { message: '...' } };
+  }
   if (!surfaceAllowsCanonicalTool(surface, nextCall.tool)) {
     return catalogNextCall(nextCall.tool);
   }
@@ -16193,6 +16861,8 @@ function constrainResponseGuidance(
       && typeof record.hint === 'string'
       && record.hint.includes('support_ticket')) {
       record.hint = 'Platform support submissions are available through api_write with POST /v1/platform-feedback and a JSON body containing message; the response contains ticket_id. Ticket status is available through api_read with GET /v1/platform-feedback/:ticket_id.';
+    } else if (typeof record.hint === 'string') {
+      record.hint = renameSplitToolReferences(record.hint, surface);
     }
   };
   projectConnectorSupportHint(out, isFailure);
@@ -16260,14 +16930,14 @@ function deterministicSuggestion(name: string): { text: string; source: 'determi
   const nextCall = deterministicUnknownToolNextCall(name);
   if (!nextCall) return null;
   const safeName = sanitizeAgentText(name, 120);
-  return { text: `Unknown tool "${safeName}". Use ${formatNextCall(nextCall)}.`, source: 'deterministic', next_call: nextCall };
+  return { text: `Unknown tool "${safeName}". Closest match: ${formatNextCall(nextCall)}.`, source: 'deterministic', next_call: nextCall };
 }
 
 /** Actionable replacement for a bare "Unknown tool: X". */
 function unknownToolMessage(name: string): string {
   const nextCall = deterministicUnknownToolNextCall(name) ?? catalogNextCall(name);
   const safeName = sanitizeAgentText(name, 120);
-  return deterministicSuggestion(name)?.text ?? `Unknown tool "${safeName}". Use ${formatNextCall(nextCall)}.`;
+  return deterministicSuggestion(name)?.text ?? `Unknown tool "${safeName}". Closest match: ${formatNextCall(nextCall)}.`;
 }
 
 /** Deterministic agent-facing correction for a known error code — the right
@@ -16277,37 +16947,37 @@ function unknownToolMessage(name: string): string {
 function deterministicErrorCorrection(code: string | undefined, surface: ToolSurface = 'full'): string | null {
   switch (code) {
     case 'ROUTE_FORBIDDEN':
-      return "This endpoint is developer-only, or your principal can't call it. From a deployed function use the matching sw.* method instead of the REST route; for a developer action use your smt_ developer key.";
+      return "This endpoint is developer-only, or this principal cannot call it. A deployed function reaches it through the matching sw.* method rather than the REST route; developer actions take an smt_ developer key.";
     case 'SCOPE_VIOLATION':
-      return "A scoped query used an unsupported shape. Use the structured builder (sw.db.from / count / insert / update / remove) on the scoped table — the platform scopes it to the signed-in user. Raw sw.db.query is never auto-scoped; passing { user } to it throws RAW_SQL_CANNOT_BE_PLATFORM_SCOPED, so write the ownership filter (WHERE user_id = ?) into your raw SQL yourself.";
+      return "A scoped query used an unsupported shape. The structured builder (sw.db.from / count / insert / update / remove) on the scoped table is scoped to the signed-in user by the platform. Raw sw.db.query is never auto-scoped; passing { user } to it throws RAW_SQL_CANNOT_BE_PLATFORM_SCOPED, so raw SQL carries its own ownership filter (WHERE user_id = ?).";
     case 'BUNDLED_DEPLOY_REJECTED':
-      return "Deploy raw source, not built output. Drop the `npm run build` / `vite build` step and deploy src/, index.html, and package.json directly — the platform compiles on deploy.";
+      return "Deploys take raw source, not built output: src/, index.html and package.json, with no `npm run build` / `vite build` step. The platform compiles on deploy.";
     case 'DEPLOY_BLANK_PAGE':
-      return "The deployed page rendered blank — data.bundle_error (or the message) names the root cause, usually a compile error or bad import in your source. Fix that file and redeploy the same raw source. Do NOT switch to deploying compiled/bundled output; the platform builds from raw source.";
+      return "The deployed page rendered blank — data.bundle_error (or the message) names the root cause, usually a compile error or bad import in the source. The fix is in that file, redeployed as raw source; compiled/bundled output is not an accepted deploy.";
     case 'DEPLOY_INCOMPLETE_UPLOAD':
-      return "Some compiled chunks didn't finish uploading — almost always transient. Redeploy the exact same raw source files. Do NOT hand-author files under /_compiled; the platform generates those.";
+      return "Some compiled chunks didn't finish uploading — usually transient. The deploy takes the exact same raw source files again; files under /_compiled are generated by the platform, not authored.";
     case 'JSX_COMPILE_ERROR':
-      return "Fix the compile error at the file:line named in the message, then redeploy the raw source file. Don't pre-compile locally to work around it — the platform compiles on deploy.";
+      return "The compile error is at the file:line named in the message; the fixed raw source file redeploys normally. The platform compiles on deploy, so local pre-compilation is not part of the contract.";
     case 'BUNDLE_VERIFICATION_FAILED':
-      return "The build failed a final sanity check — data.issues lists each problem with the source pattern that caused it. Fix the named source files and redeploy raw source.";
+      return "The build failed a final sanity check — data.issues lists each problem with the source pattern that caused it, in the named source files.";
     case 'PAID_API_NOT_ACTIVATED':
-      return "Enable this paid API for the project owner first at the dashboard billing/AI page (see activation_url in this response), then retry.";
+      return "This paid API is not enabled for the project owner. It is enabled on the dashboard billing/AI page (activation_url in this response).";
     case 'VERSION_CONFLICT':
-      return "Another deploy landed since your last read. Re-read the current version with project_get, review the new state, then retry with expected_version set to that version. Never omit the concurrency guard when recovering from this conflict.";
+      return "Another deploy landed since the last read. project_get returns the current version; a retry needs expected_version matching that current state, and the concurrency guard stays required for it.";
     case 'STALE_BASE':
       return surfaceAllowsCanonicalTool(surface, 'project_diff_versions')
-        ? "The project changed elsewhere since your base version. Call project_diff_versions({ project_id, from: base_version, to: data.current_version }) (or use base_live_version as from when this came from project_promote), review data.changed_files and the diff, then retry with force:true only if overwriting is intentional."
-        : "The project changed elsewhere since your base version. Re-read the current source with project_export, review data.changed_files from this response, then retry with the new base_version. Use force:true only after verifying that overwriting is intentional.";
+        ? "The project changed elsewhere since the base version. project_diff_versions({ project_id, from: base_version, to: data.current_version }) shows the change (base_live_version is the from value when this came from project_promote), alongside data.changed_files. force:true overwrites that change."
+        : "The project changed elsewhere since the base version. project_export returns the current source and data.changed_files lists what changed; a retry needs the new base_version. force:true overwrites that change.";
     case 'CONFIRMATION_REQUIRED':
-      return "Two-step action: call the matching *_confirm tool with the 6-digit code returned in this response.";
+      return "Two-step action: the matching *_confirm tool completes it with the 6-digit code returned in this response.";
     case 'PURCHASE_CONFIRMATION_REQUIRED':
       // Checkout handoff — deterministic so the nano fallback cannot invent a
       // dead direct-confirmation step (audit 2026-06-16 #12 / tsk_418fb446).
-      return "This response is a checkout handoff. Show the user the price and get their explicit approval before sharing dashboard_checkout_url so they can complete secure payment. Never auto-confirm a purchase or attempt to finalize it through another MCP tool; registration begins only after checkout reports settled payment.";
+      return "This response is a checkout handoff: the price is quoted and dashboard_checkout_url is where the buyer completes secure payment. No MCP tool confirms or finalizes the purchase; registration begins only after checkout reports settled payment.";
     case 'UNSUPPORTED_SQL':
-      return "The message already names the supported form — rewrite the statement that way (e.g. datetime() for INTERVAL, sw.db.batch for BEGIN/COMMIT, JSON text + json_each for arrays).";
+      return "The message names the supported form of the statement (e.g. datetime() for INTERVAL, sw.db.batch for BEGIN/COMMIT, JSON text + json_each for arrays).";
     case 'INVALID_API_KEY':
-      return "Your developer key was rejected. If this is a long-running `somewhere mcp` stdio session, the most common cause is an expired 24h cli_pair key — run `somewhere login` in the terminal (persists a refresh token so future sessions auto-renew) or `auth_cli_pair` again for a fresh key. If you're on the Claude.ai/ChatGPT web connector, just reconnect via /mcp. Otherwise the key may be wrong or revoked — verify it in the dashboard.";
+      return "The developer key was rejected. In a long-running `somewhere mcp` stdio session the most common cause is an expired 24h cli_pair key; `somewhere login` stores a refresh token so sessions renew, and `auth_cli_pair` mints a fresh key. A web connector renews by reconnecting. Otherwise the key is wrong or revoked; the dashboard lists active keys.";
     default:
       return null;
   }
@@ -16348,6 +17018,7 @@ async function reportMiss(
   env: Env,
   authHeader: string,
   payload: {
+    failure_shape?:FailureShape|null;
     miss_type: 'unknown_tool' | 'bad_args' | 'catalog_search' | 'docs_topic';
     tool_attempted: string;
     arg_keys: string[];
@@ -16364,7 +17035,7 @@ async function reportMiss(
 ): Promise<{ ai_suggestion?: string | null; next_call?: NextCallRecommendation | null; suggestion_source?: string | null } | null> {
   if (!authHeader) return null;
   try {
-    const call = callAPI(env.API_SERVICE, 'POST', '/v1/mcp-miss', authHeader, payload);
+    const call = callAPI(env.API_SERVICE, 'POST', '/v1/mcp-miss', authHeader, {miss_type:payload.miss_type,tool_attempted:MCP_TOOL_SCHEMA_SHAPES[payload.tool_attempted]?payload.tool_attempted:'[unknown_tool]',arg_keys:payload.failure_shape?.known_args.map(arg=>arg.key)??[],...(payload.project_id&&/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(payload.project_id)?{project_id:payload.project_id}:{}),failure_shape:payload.failure_shape??null,want_ai:payload.want_ai===true,candidates:payload.candidates?.filter(name=>Object.hasOwn(MCP_TOOL_SCHEMA_SHAPES,name))});
     const timeout = new Promise<null>((r) => setTimeout(() => r(null), timeoutMs));
     const res = await Promise.race([call, timeout]);
     if (!res) return null;
@@ -16398,6 +17069,12 @@ const DETERMINISTIC_BAD_ARGS_TOOLS = new Set([
   'email_send',
   'payments_checkout',
 ]);
+
+function schemaFailureFor(toolName:string,args:Record<string,unknown>):FailureShape|null {
+  const tool=TOOL_DEFINITIONS.find(candidate=>candidate.name===toolName);if(!tool)return null;
+  const properties:Record<string,string[]>={};for(const [key,property] of Object.entries(tool.inputSchema.properties)){properties[key]=Array.isArray(property.type)?property.type:typeof property.type==='string'?[property.type]:[];}
+  return describeMcpFailure(toolName,{properties,required:tool.inputSchema.required??[],additionalProperties:tool.inputSchema.additionalProperties,version:MCP_TOOL_SCHEMA_SHAPES[toolName]?.version},args);
+}
 
 function deterministicBadArgsNextCall(attemptedTool: string, args: Record<string, unknown>): NextCallRecommendation {
   const project_id = projectRefForSkeleton(args);
@@ -16469,7 +17146,7 @@ function deterministicBadArgsNextCall(attemptedTool: string, args: Record<string
       return {
         tool: attemptedTool,
         args_skeleton: toolSkeleton(attemptedTool),
-        one_line_why: 'The tool exists; fix the argument shape to match its schema.',
+        one_line_why: 'Inspect the original error and current tool contract before retrying; the advertised top-level shape alone does not explain this failure.',
       };
   }
 }
@@ -16538,7 +17215,7 @@ function staleToolListAdvice(
   }
   if (unknownFields.length > 0) {
     parts.push(
-      `The current ${toolName} schema does not declare ${unknownFields.map((field) => `\`${field}\``).join(', ')}; ${unknownFields.length === 1 ? 'it was' : 'they were'} ignored. That usually means your tool list is stale or the field was renamed.`,
+      `The current ${toolName} schema does not declare ${unknownFields.map((field) => `\`${field}\``).join(', ')}; extra fields are permitted unless the advertised schema explicitly forbids them. This alone does not explain the runtime error.`,
     );
   }
   parts.push(refresh);
@@ -16559,8 +17236,9 @@ function badArgsToolResult(
   message: string,
   nextCall = deterministicBadArgsNextCall(toolName, args),
 ): { content: McpContentBlock[]; isError: true } {
+  const failure=schemaFailureFor(toolName,args),correction=failure?schemaCorrection(failure):null;if(correction)nextCall={...nextCall,one_line_why:correction};
   queueMissReport(env, authHeader, ctx, {
-    miss_type: 'bad_args',
+    miss_type: 'bad_args', failure_shape:schemaFailureFor(toolName,args),
     tool_attempted: toolName,
     arg_keys: Object.keys(args),
     suggestion: formatNextCall(nextCall),
@@ -16599,6 +17277,8 @@ const TOOL_USAGE_MAX_BUFFERED = 200;
 const toolUsageBuffer = new Map<string, number>(); // `${day}|${tool}` → count
 let toolUsageBuffered = 0;
 let toolUsageLastFlush = 0;
+
+const signalDeployIntent = createDeployIntentSignal();
 
 function projectRefFromToolArgs(args: Record<string, unknown>): string | null {
   for (const key of ['project_id', 'project', 'identifier', 'subdomain', 'slug']) {
@@ -16640,7 +17320,9 @@ function mcpTelemetryHeaders(env: Env, client: string): Record<string, string> {
 /** Record the privacy-limited initialize signal exactly once per accepted
  *  MCP connection. The caller owns the idempotency id and retries the awaited
  *  service-binding write with that same id, so an ambiguous response cannot
- *  duplicate the durable event. */
+ *  duplicate the durable event. A write that still fails is logged loudly and
+ *  the connection proceeds: telemetry never takes down a customer's tool call.
+ *  The API also records the refused response in its own error log. */
 async function recordClientSession(
   env: Env,
   authHeader: string,
@@ -16654,7 +17336,7 @@ async function recordClientSession(
   const clientName = normalizeClientInfoValue(clientInfo?.name, 'unknown', true, 64) ?? 'unknown';
   const clientVersion = normalizeClientInfoValue(clientInfo?.version, 'unknown', false, 80) ?? 'unknown';
   const connectionEventId = crypto.randomUUID();
-  await deliverClientSession(
+  const failure = await deliverClientSession(
     () => callAPI(
       env.API_SERVICE,
       'POST',
@@ -16664,6 +17346,17 @@ async function recordClientSession(
       mcpTelemetryHeaders(env, `${clientName}/${clientVersion}`),
     ),
   );
+  if (failure) {
+    console.error(JSON.stringify({
+      at: 'mcp-client-session',
+      event: 'record_failed',
+      failure,
+      connection_event_id: connectionEventId,
+      client_name: clientName,
+      client_version: clientVersion,
+      surface,
+    }));
+  }
 }
 
 function recordToolUsage(env: Env, ctx: ExecutionContext, authHeader: string, toolName: string, args: Record<string, unknown>): void {
@@ -16720,6 +17413,10 @@ async function executeTool(
   const fetcher = guardedEnv.API_SERVICE;
   try {
     args = normalizeToolArgAliases(toolName, args);
+    if (policyToolName(toolName) === 'advisor') {
+      const inputError = advisorProjectInputError(args);
+      if (inputError) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'ADVISOR_PROJECT_CONTEXT_UNSUPPORTED', message: inputError }) }], isError: true };
+    }
     // Resolve project_id BEFORE the switch dispatch so every tool
     // case gets the canonical UUID without per-case wiring. Tools
     // that don't take a project_id are unaffected. Tools that take
@@ -16727,7 +17424,7 @@ async function executeTool(
     // skip resolution when the field is omitted.
     //
     // Exception — the tasks tools' spine sentinel: `project_id` of
-    // `'default'` / `'spine'` for a tasks_* tool means "the org spine",
+    // `'default'` / `'spine'` for a tasks_* or memory tool means "the org spine",
     // which the worker resolves
     // server-side from SPINE_PROJECT_ID. We must NOT pre-resolve it here:
     // this MCP resolver only knows the CALLER's own projects, so it would
@@ -16735,25 +17432,80 @@ async function executeTool(
     // "Multiple projects") and could never reach the platform-owned spine.
     // Pass the sentinel through untouched; the worker maps it and still
     // runs assertProjectAccess on the resolved id, so auth is unchanged.
+    const sentinelTool = policyToolName(toolName);
     const spineSentinel = (args.project_id === 'default' || args.project_id === 'spine')
-      && (toolName === 'tasks_get' || toolName === 'tasks_list' || toolName === 'tasks_create' || toolName === 'tasks_update'
-        || toolName === 'tasks_summary' || toolName === 'tasks_delete' || toolName === 'tasks_bulk_update'
-        || toolName === 'tasks_reconcile'
-        || toolName === 'tasks_settings_get' || toolName === 'tasks_settings_update'
-        || toolName === 'tasks_comment_edit' || toolName === 'tasks_comment_delete');
+      && (sentinelTool === 'tasks_get' || sentinelTool === 'tasks_list' || sentinelTool === 'tasks_create' || sentinelTool === 'tasks_update'
+        || sentinelTool === 'tasks_summary' || sentinelTool === 'tasks_overview' || sentinelTool === 'tasks_delete' || sentinelTool === 'tasks_bulk_update'
+        || sentinelTool === 'tasks_reconcile'
+        || sentinelTool === 'memory_search' || sentinelTool === 'memory_save'
+        || sentinelTool === 'tasks_settings_get' || sentinelTool === 'tasks_settings_update'
+        || sentinelTool === 'tasks_comment_edit' || sentinelTool === 'tasks_comment_delete');
+    const spec = TOOL_SPEC_BY_NAME.get(toolName);
+    // A tool that requires project_id, called without one, never reaches
+    // /v1/projects/undefined (pfb_ca1d666fa102). A read-only tool resolves it
+    // exactly as "default" does: the session's or account's only project, or a
+    // typed PROJECT_ID_REQUIRED listing what to pass. A tool that changes
+    // anything is not pointed at a project nobody named. The tasks tools keep
+    // their own spine default.
+    const projectIdMissing = args.project_id === undefined || args.project_id === null || args.project_id === '';
+    const requiredArgs = (spec?.definition.inputSchema as { required?: unknown } | undefined)?.required;
+    if (projectIdMissing && !toolName.startsWith('tasks_')
+        && Array.isArray(requiredArgs) && requiredArgs.includes('project_id')) {
+      if (spec?.annotations?.readOnlyHint !== true) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              ok: false,
+              error: 'PROJECT_ID_REQUIRED',
+              message: `${toolName} needs project_id: the project's id or subdomain, or "default" for the only project this session or account can reach.`,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+      args.project_id = 'default';
+    }
     if (!spineSentinel && typeof args.project_id === 'string' && args.project_id.length > 0) {
       try {
         args.project_id = await resolveProjectId(args.project_id, fetcher, authHeader);
       } catch (err) {
+        if (err instanceof ProjectResolutionError) {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                ok: false,
+                error: err.code,
+                message: err.message,
+                ...(err.projects ? { data: { projects: err.projects.map((p) => ({ id: p.id, subdomain: p.subdomain || null })) } } : {}),
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        }
         return {
           content: [{ type: 'text', text: err instanceof Error ? err.message : 'Project resolution failed' }],
           isError: true,
         };
       }
     }
-    const spec = TOOL_SPEC_BY_NAME.get(toolName);
     if (!spec) {
       return { content: [{ type: 'text', text: unknownToolMessage(toolName) }], isError: true };
+    }
+    const refusedInputs = (SURFACE_REFUSED_INPUTS[surface]?.[toolName] ?? []).filter((key) => args[key] !== undefined);
+    if (refusedInputs.length > 0) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            ok: false,
+            error: 'INPUT_NOT_AVAILABLE',
+            message: `${toolName} does not accept ${refusedInputs.join(', ')} on the ${surface} surface.`,
+          }, null, 2),
+        }],
+        isError: true,
+      };
     }
     const outcome = await spec.execute({
       callApi: (method, path, body) => callAPI(fetcher, method, path, authHeader, body),
@@ -16772,6 +17524,18 @@ async function executeTool(
     const result = outcome;
 
     const isError = result.status >= 400;
+    // Deploy-intent signal: only after the tool's own call succeeded, so an
+    // expired credential or a refused call never costs a second request.
+    if (!isError && !spineSentinel && ctx && authHeader && env.SOMEWHERE_TECH_ADMIN_KEY
+        && typeof args.project_id === 'string') {
+      const waitCtx = ctx;
+      signalDeployIntent(args.project_id, {
+        post: (projectId) => callAPI(fetcher, 'POST', '/v1/mcp-usage/deploy-intent', authHeader,
+          { project_id: projectId }, mcpTelemetryHeaders(env, 'mcp-deploy-intent')),
+        waitUntil: (promise) => waitCtx.waitUntil(promise),
+        log: (message) => console.warn(message),
+      });
+    }
     // Piggyback unread platform notifications (tsk_6d0f) — trial
     // expiry, smoke fails, feedback responses, etc. Reads from
     // /v1/notifications/inbox-pull which de-dupes via read_at, so
@@ -16795,6 +17559,10 @@ async function executeTool(
         (enriched as Record<string, unknown>)._correction = correction;
       }
     }
+    if (isError && enriched && typeof enriched === 'object' && !Array.isArray(enriched) && !('_repro' in enriched)) {
+      const packet = toolReproPacket(toolName, result, enriched as Record<string, unknown>, args);
+      if (packet) (enriched as Record<string, unknown>)._repro = packet;
+    }
     if (isError && enriched && typeof enriched === 'object' && [400, 409, 422].includes(result.status)
       && canonicalErrorCode(enriched) !== 'SCOPE_ACTIVATION_STALE'
       // A terminal draft session must NOT get a same-tool retry skeleton that
@@ -16806,8 +17574,19 @@ async function executeTool(
       const out = enriched as Record<string, unknown>;
       const missProjectId = projectIdFromToolArgs(args);
       const errorCode = canonicalErrorCode(enriched);
+      const managedSchemaRefusal = errorCode === 'SCHEMA_LOCKED'
+        && out.message === 'Schema changes for this managed project must come from db/schema.ts. Edit the declaration and deploy. No SQL was applied.';
       const confirmationCode = confirmationCodeFromError(enriched);
-      const deterministicNextCall = errorCode === 'CONFIRMATION_REQUIRED'
+      // A rejected cursor is restarted with the same read arguments, not
+      // redirected to a different tool (pfb_5d67f674e540).
+      const { cursor: rejectedCursor, ...restartArgs } = args;
+      const deterministicNextCall = managedSchemaRefusal
+        ? { tool: 'docs', args_skeleton: { topic: 'declared-data', section: 'declare-a-table-and-use-it' },
+            one_line_why: 'Define tables and access rules in db/schema.ts, then deploy raw source. Retrying db_migrate cannot change this managed project.' }
+        : errorCode === 'INVALID_CURSOR' && typeof rejectedCursor === 'string'
+        ? { tool: toolName, args_skeleton: restartArgs,
+            one_line_why: 'Repeat the same arguments without cursor to restart; on later pages pass page.next_cursor exactly as returned.' }
+        : errorCode === 'CONFIRMATION_REQUIRED'
         && toolName === 'project_delete'
         && confirmationCode
         ? {
@@ -16830,7 +17609,7 @@ async function executeTool(
       let missReported = false;
       if (!DETERMINISTIC_BAD_ARGS_TOOLS.has(toolName)) {
         queueMissReport(env, authHeader, ctx, {
-          miss_type: 'bad_args',
+          miss_type: 'bad_args', failure_shape:schemaFailureFor(toolName,args),
           tool_attempted: toolName,
           arg_keys: Object.keys(args),
           ...(missProjectId ? { project_id: missProjectId } : {}),
@@ -16844,6 +17623,10 @@ async function executeTool(
         });
         missReported = true;
       }
+      if (managedSchemaRefusal) {
+        out.hint = "See docs({ topic: 'declared-data', section: 'declare-a-table-and-use-it' }) for a complete schema and its generated client.";
+        out._correction = deterministicNextCall.one_line_why;
+      }
       if (!('next_call' in out)) out.next_call = nextCall;
       if (!('next_call_source' in out)) out.next_call_source = nextCallSource;
       if (!('_correction' in out)) out._correction = nextCall.one_line_why;
@@ -16855,7 +17638,7 @@ async function executeTool(
       }
       if (!missReported) {
         queueMissReport(env, authHeader, ctx, {
-          miss_type: 'bad_args',
+          miss_type: 'bad_args', failure_shape:schemaFailureFor(toolName,args),
           tool_attempted: toolName,
           arg_keys: Object.keys(args),
           ...(missProjectId ? { project_id: missProjectId } : {}),
@@ -16867,6 +17650,7 @@ async function executeTool(
         });
       }
     }
+    if(isError&&enriched&&typeof enriched==='object'){const failure=schemaFailureFor(toolName,args),correction=failure?schemaCorrection(failure):null;if(correction){const out=enriched as Record<string,unknown>;out._correction=correction;if(out.next_call&&typeof out.next_call==='object')out.next_call={...out.next_call as Record<string,unknown>,one_line_why:correction};}}
     constrainResponseGuidance(enriched, toolName, args, surface, result.status);
     // Control-your-app link (tsk_0db88d0d) — a user who launches an app via
     // the connector otherwise gets NO path to log in and manage it. On a
@@ -16879,7 +17663,7 @@ async function executeTool(
       ? `\n\n💾 Account recovery is available: connector_link_email requires an email supplied by the user and sends a verification link. The work stays in this guest session until the human verifies that email.`
       : '';
     if (!isError && (toolName === 'project_create' || toolName === 'project_deploy')) {
-      const DASH = 'https://somewhere.tech/dashboard';
+      const DASH = DASHBOARD_URL;
       // Resolve a project identifier without trusting any single field name:
       // prefer the response, fall back to the caller's args, finally the
       // deploy URL's subdomain. Never a token — only a public route segment.
@@ -17063,18 +17847,36 @@ async function handleMCPRequest(request: Request, env: Env, ctx: ExecutionContex
   }
 
   const url = new URL(request.url);
+  const identity = mcpIdentityForIssuer(url.origin);
   const authHeader = request.headers.get('Authorization') || '';
 
   // Service liveness only; advisor quality is reviewed from actual query records.
   if (url.pathname === '/health') {
     return jsonResponse({ ok: true, service: 'somewhere-tech-mcp', version: '1.0.0' });
   }
+  if (!identity) return new Response('Unknown MCP host.', { status: 404 });
 
   // Public top-of-funnel advisor. Credentials are optional: anonymous calls
   // use Flex + the atomic per-IP gate; verified calls use standard processing
-  // and may inject live project context. The model receives context only — no
-  // tools are declared or executable on this route.
+  // with caller-supplied context and public docs only. No model tools execute.
+  const asyncAdvisorBridge=():Parameters<typeof handleAsyncAdvisorHttp>[1]=>({env,ctx,topics:PLATFORM_HELP_TOPICS,
+      tools:TOOL_DEFINITIONS.filter(tool=>advertisedNamesForSurface('full').has(tool.name)),
+      authorize:(req,auth)=>authorizeAdvisorCall(env,req,auth,advisorSourceForRequest(req),env.ADVISOR_ASYNC_ENABLED!=='true'),
+      staticAnswer:req=>handlePublicAdvisor(req,env,ctx,req.headers.get('Authorization')??''),
+      isStatic:(question,project,hasContext)=>Boolean(advisorWebhookContractAnswer(question)??(!project&&!hasContext?advisorContractAnswer(question):null))});
+  // The advisor's HTTP routes are a second door for a connector token: it may
+  // use them only if its surface lists the advisor tool (canonical registry),
+  // either whole or as its fixed operations.
+  if (url.pathname === '/advisor' || url.pathname.startsWith('/advisor/') || url.pathname === '/internal/advisor-observe') {
+    const advisorRefusal = connectorAudienceRefusal(
+      authHeader, (surface) => surfaceAllowsCanonicalTool(surface, 'advisor') || surfaceAllowsCanonicalTool(surface, 'advisor_start'),
+      `${identity.issuer}/.well-known/oauth-protected-resource/mcp`, url.pathname,
+    );
+    if (advisorRefusal) return advisorRefusal;
+  }
+  if (url.pathname.startsWith('/advisor/runs') || url.pathname === '/internal/advisor-observe') return handleAsyncAdvisorHttp(request,asyncAdvisorBridge());
   if (url.pathname === '/advisor' && request.method === 'POST') {
+    if(env.ADVISOR_ASYNC_ENABLED==='true')return handleLegacyAsyncAdvisorHttp(request,asyncAdvisorBridge());
     return handlePublicAdvisor(request, env, ctx, authHeader);
   }
 
@@ -17127,10 +17929,6 @@ async function handleMCPRequest(request: Request, env: Env, ctx: ExecutionContex
   // client talks to — anything else and the client refuses to walk
   // the flow.
   //
-  // We expose two protected resources today:
-  //   /mcp         — full 220+ tool surface (Claude Code, power users)
-  //   /mcp/chatgpt — curated app-builder surface (ChatGPT Apps)
-  //
   // Per RFC 9728 each protected resource has its own metadata doc, so
   // we serve three discovery paths:
   //   /.well-known/oauth-protected-resource          → /mcp (legacy)
@@ -17141,14 +17939,14 @@ async function handleMCPRequest(request: Request, env: Env, ctx: ExecutionContex
   if (url.pathname === '/.well-known/oauth-protected-resource'
       || url.pathname === '/.well-known/oauth-protected-resource/mcp') {
     return jsonResponse({
-      resource: 'https://mcp.somewhere.tech/mcp',
-      authorization_servers: ['https://mcp.somewhere.tech'],
+      resource: identity.fullResource,
+      authorization_servers: [identity.issuer],
     });
   }
   if (url.pathname === '/.well-known/oauth-protected-resource/mcp/chatgpt') {
     return jsonResponse({
-      resource: 'https://mcp.somewhere.tech/mcp/chatgpt',
-      authorization_servers: ['https://mcp.somewhere.tech'],
+      resource: `${identity.issuer}/mcp/chatgpt`,
+      authorization_servers: [identity.issuer],
     });
   }
   // Connector resource doc (tsk_7e6100a5). A fresh client discovers this from
@@ -17158,8 +17956,8 @@ async function handleMCPRequest(request: Request, env: Env, ctx: ExecutionContex
   // /mcp so the MAIN surface keeps its full-login default.
   if (url.pathname === '/.well-known/oauth-protected-resource/mcp/connector') {
     return jsonResponse({
-      resource: 'https://mcp.somewhere.tech/mcp/connector',
-      authorization_servers: ['https://mcp.somewhere.tech'],
+      resource: `${identity.issuer}/mcp/connector`,
+      authorization_servers: [identity.issuer],
     });
   }
 
@@ -17168,10 +17966,10 @@ async function handleMCPRequest(request: Request, env: Env, ctx: ExecutionContex
   // client where to find them.
   if (url.pathname === '/.well-known/oauth-authorization-server') {
     return jsonResponse({
-      issuer: 'https://mcp.somewhere.tech',
-      authorization_endpoint: 'https://api.somewhere.tech/v1/oauth/authorize',
-      token_endpoint: 'https://api.somewhere.tech/v1/oauth/token',
-      registration_endpoint: 'https://api.somewhere.tech/v1/oauth/register',
+      issuer: identity.issuer,
+      authorization_endpoint: `${identity.apiOrigin}/v1/oauth/authorize`,
+      token_endpoint: `${identity.apiOrigin}/v1/oauth/token`,
+      registration_endpoint: `${identity.apiOrigin}/v1/oauth/register`,
       scopes_supported: ['mcp'],
       response_types_supported: ['code'],
       grant_types_supported: ['authorization_code', 'refresh_token'],
@@ -17222,10 +18020,10 @@ async function handleMCPRequest(request: Request, env: Env, ctx: ExecutionContex
     // metadata is per-resource; pointing all 401s at the generic
     // discovery doc would break OAuth for the /mcp/chatgpt endpoint.
     const resourceMetadataUrl = isChatgptMode
-      ? 'https://mcp.somewhere.tech/.well-known/oauth-protected-resource/mcp/chatgpt'
+      ? `${identity.issuer}/.well-known/oauth-protected-resource/mcp/chatgpt`
       : isConnectorMode
-      ? 'https://mcp.somewhere.tech/.well-known/oauth-protected-resource/mcp/connector'
-      : 'https://mcp.somewhere.tech/.well-known/oauth-protected-resource/mcp';
+      ? `${identity.issuer}/.well-known/oauth-protected-resource/mcp/connector`
+      : `${identity.issuer}/.well-known/oauth-protected-resource/mcp`;
 
     if (!isAuthed) {
       return new Response(
@@ -17235,47 +18033,20 @@ async function handleMCPRequest(request: Request, env: Env, ctx: ExecutionContex
           headers: {
             'Content-Type': 'application/json',
             'Access-Control-Allow-Origin': '*',
-            'WWW-Authenticate': `Bearer realm="somewhere.tech", resource_metadata="${resourceMetadataUrl}"`,
+            'WWW-Authenticate': `Bearer realm="${mcpRealm(resourceMetadataUrl)}", resource_metadata="${resourceMetadataUrl}"`,
           },
         },
       );
     }
 
-    // AUDIENCE. A token minted while authorizing ONE surface must not be
-    // spendable on another. The curated surfaces advertise a few dozen tools;
-    // the full surface advertises hundreds, including project deletion,
-    // database restore, impersonation and refunds. Without this, a user who
-    // approved the curated connector had in fact handed over everything.
-    //
-    // A pre-cutover token carries no `aud` and is accepted on every surface
-    // exactly as before, so nothing already connected breaks (rule 9). There is
-    // no legitimate cross-surface use of an audience-bound token: a client
-    // discovers one resource from the 401 it received and authorizes against
-    // that one, so this is on by default rather than warn-first.
-    const tokenSurface = tokenAudienceSurface(authHeader);
-    if (tokenSurface !== null && tokenSurface !== activeSurface) {
-      console.error(JSON.stringify({
-        at: 'mcp.audience',
-        error: 'TOKEN_SURFACE_MISMATCH',
-        endpoint: url.pathname,
-        token_surface: tokenSurface,
-        requested_surface: activeSurface,
-      }));
-      return new Response(
-        JSON.stringify(rpcError(
-          null,
-          -32000,
-          'This connection was authorized for a different toolset. Reconnect from this endpoint to authorize it.',
-        )),
-        {
-          status: 403,
-          headers: {
-            'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*',
-          },
-        },
-      );
-    }
+    // AUDIENCE (tsk_2019e832). A connector token is spendable only on the one
+    // surface its grant names; one with no recognized audience reconnects.
+    // There is no legitimate cross-surface use: a client discovers one
+    // resource from the 401 it received and authorizes against that one.
+    const audienceRefusal = connectorAudienceRefusal(
+      authHeader, (surface) => surface === activeSurface, resourceMetadataUrl, url.pathname,
+    );
+    if (audienceRefusal) return audienceRefusal;
 
     // Parse the JSON-RPC body. A malformed body used to crash the
     // worker (uncaught exception → CF error 1101 HTML page) which is
@@ -17404,12 +18175,12 @@ async function handleMCPRequest(request: Request, env: Env, ctx: ExecutionContex
         await recordClientSession(env, authHeader, discClientInfo, discSurface);
         const discSurfaceTools = advertisedNamesForSurface(discSurface);
         const discHelpPush = discSurfaceTools.has('advisor')
-          ? '> **Reference surfaces:** `catalog` lists which tools exist, `docs({ topic })` returns one static surface contract, and `advisor({ question })` can inspect an authorized live project.\n\n'
+          ? '> **Reference surfaces:** `catalog` lists which tools exist, `docs({ topic })` returns one static surface contract, and `advisor({ question })` answers platform questions from public contracts and the facts you supply, without reading your projects.\n\n'
           : '> **Reference surfaces:** `catalog` lists which tools exist and `docs({ topic })` returns one static surface contract.\n\n';
         const discCallerHint = discSurface === 'connector'
-          ? 'This connector creates projects, reads source, publishes source changes, and verifies live apps. Database schemas are declared in deployed source; table ownership is managed with db_scope_set.\n\n'
+          ? 'This connector creates projects, reads source, publishes source changes, and verifies live apps. Database schemas are declared in deployed source; table ownership is managed with db_scope_set. In environments with a shell, the same operations are available through the somewhere CLI; auth_cli_pair links it to this account.\n\n'
           : discCaller === 'cli'
-          ? "> Shell-capable client detected: use the `somewhere` CLI as the primary platform surface. Use first-class commands for routine work and `somewhere call <tool> '<json>'` for the complete tool catalog. MCP remains appropriate when its in-context delivery is useful.\n\n"
+          ? "> Shell-capable client detected: the `somewhere` CLI is the primary platform surface, distributed as the scoped package `@somewhere-tech/cli` (`npm i -g @somewhere-tech/cli`). First-class commands cover routine work and `somewhere call <tool> '<json>'` covers the complete tool catalog. The MCP tools return the same results in context.\n\n"
           : discCaller === 'connector'
             ? '> Shell-less client detected: MCP tools (`project_create` / `project_deploy` / `db_query` / `fs_write`) are the executable path; CLI commands cannot run here.\n\n'
             : '';
@@ -17454,12 +18225,12 @@ async function handleMCPRequest(request: Request, env: Env, ctx: ExecutionContex
         // the initialize field. `docs` is the primary name; the older
         const initSurfaceTools = advertisedNamesForSurface(initSurface);
         const helpPush = initSurfaceTools.has('advisor')
-          ? '> **Reference surfaces:** `catalog` lists which tools exist, `docs({ topic })` returns one static surface contract, and `advisor({ question })` can inspect an authorized live project.\n\n'
+          ? '> **Reference surfaces:** `catalog` lists which tools exist, `docs({ topic })` returns one static surface contract, and `advisor({ question })` answers platform questions from public contracts and the facts you supply, without reading your projects.\n\n'
           : '> **Reference surfaces:** `catalog` lists which tools exist and `docs({ topic })` returns one static surface contract.\n\n';
         const callerHint = initSurface === 'connector'
-          ? 'This connector creates projects, reads source, publishes source changes, and verifies live apps. Database schemas are declared in deployed source; table ownership is managed with db_scope_set.\n\n'
+          ? 'This connector creates projects, reads source, publishes source changes, and verifies live apps. Database schemas are declared in deployed source; table ownership is managed with db_scope_set. In environments with a shell, the same operations are available through the somewhere CLI; auth_cli_pair links it to this account.\n\n'
           : initCaller === 'cli'
-          ? "> Shell-capable client detected: use the `somewhere` CLI as the primary platform surface. Use first-class commands for routine work and `somewhere call <tool> '<json>'` for the complete tool catalog. MCP remains appropriate when its in-context delivery is useful.\n\n"
+          ? "> Shell-capable client detected: the `somewhere` CLI is the primary platform surface, distributed as the scoped package `@somewhere-tech/cli` (`npm i -g @somewhere-tech/cli`). First-class commands cover routine work and `somewhere call <tool> '<json>'` covers the complete tool catalog. The MCP tools return the same results in context.\n\n"
           : initCaller === 'connector'
             ? '> Shell-less client detected: MCP tools (`project_create` / `project_deploy` / `db_query` / `fs_write`) are the executable path; CLI commands cannot run here.\n\n'
             : '';
@@ -17471,7 +18242,7 @@ async function handleMCPRequest(request: Request, env: Env, ctx: ExecutionContex
           capabilities: { tools: {} },
           serverInfo: {
             name: 'somewhere-tech',
-            version: '1.0.0',
+            version: MCP_SERVER_VERSION,
           },
           // These lines are assembled from the active surface above. Do not
           // pass them through generic prose filtering: code paths such as
@@ -17487,10 +18258,11 @@ async function handleMCPRequest(request: Request, env: Env, ctx: ExecutionContex
         // Authentication decides whether admin tools can enter the candidate
         // registry. The active surface + group scope below then decides the
         // exact tools/list advertisement from that same registry.
+        const verifiedAdmin = await verifyMcpAdminCaller(env, authHeader) === 'valid';
         let visible: MCPTool[];
         if (!isAuthed) {
           visible = TOOL_DEFINITIONS.filter((t) => toolVisibility(t.name) === 'public');
-        } else if (isAdminCaller(env, authHeader)) {
+        } else if (verifiedAdmin) {
           visible = TOOL_DEFINITIONS;
         } else {
           visible = TOOL_DEFINITIONS.filter((t) => toolVisibility(t.name) !== 'admin');
@@ -17516,7 +18288,7 @@ async function handleMCPRequest(request: Request, env: Env, ctx: ExecutionContex
         const surfaceNames = listedNamesForSurface(
           activeSurface,
           groupKeys,
-          isAdminCaller(env, authHeader),
+          verifiedAdmin,
         );
         visible = visible.filter((tool) => surfaceNames.has(tool.name));
         // Decorate with MCP spec annotations (title / readOnlyHint /
@@ -17756,7 +18528,7 @@ async function handleMCPRequest(request: Request, env: Env, ctx: ExecutionContex
         // their curated set, but tools/call resolves from the FULL registry
         // above — so without this a connector/chatgpt caller could invoke a
         // deliberately-hidden destructive tool (project_delete, db_restore,
-        // payments_refund, auth_impersonate, ...) within their own account.
+        // payments_refund, ...) within their own account.
         // Enforce the SAME filter at call that tools/list applies, so the
         // curation is real containment, not just visibility.
         const adminToolAllowed = toolVisibility(toolName) === 'admin' && isAdminCaller(env, authHeader)
@@ -17773,6 +18545,28 @@ async function handleMCPRequest(request: Request, env: Env, ctx: ExecutionContex
             }],
             isError: true,
           });
+        }
+
+        // The allowlist selects eligible operators; current stored authority
+        // decides whether their credential can use the privileged bridge now.
+        if (adminToolAllowed) {
+          const verdict = await verifyMcpAdminCaller(env, authHeader);
+          if (verdict === 'rejected') {
+            return upstreamAuthRejectedResponse({ id, kind: 'api_key', code: 'INVALID_API_KEY', resourceMetadataUrl });
+          }
+          if (verdict !== 'valid') {
+            return respondWithToolResult({
+              content: [{ type: 'text' as const, text: JSON.stringify({
+                ok: false,
+                error: verdict === 'unavailable' ? 'AUTHORITY_UNAVAILABLE' : 'FORBIDDEN',
+                message: verdict === 'unavailable'
+                  ? 'Operator authority could not be checked. Nothing was run; try again shortly.'
+                  : 'This credential does not have current full account admin authority.',
+                retry: verdict === 'unavailable',
+              }) }],
+              isError: true,
+            });
+          }
         }
 
         // Fleet-wide source search is an administrative capability. Curated
@@ -17828,7 +18622,10 @@ async function handleMCPRequest(request: Request, env: Env, ctx: ExecutionContex
               isError: true,
             });
           }
-          const rl = await checkAdvisorRateLimit(env, request, authHeader);
+          // Controls on an existing Advisor run are not new inference requests, whether
+          // named by operation or by fixed-operation tool (advisor_status/_resume/_cancel).
+          const advisorOperation = toolName === 'advisor' ? String(toolArgs.operation) : toolName.replace(/^advisor_/, '');
+          const rl = policyToolName(toolName)==='advisor' && ['status','resume','cancel'].includes(advisorOperation) ? {allowed:true,retryAfterS:0} : await checkAdvisorRateLimit(env, request, authHeader);
           if (!rl.allowed) {
             return respondWithToolResult({
               content: [{
@@ -17878,7 +18675,7 @@ async function handleMCPRequest(request: Request, env: Env, ctx: ExecutionContex
           // handlers may catch/translate ordinary upstream failures, but a
           // caller-bearer rejection latched by any wrapped binding always wins.
           callerAuthBoundary.assertAccepted();
-          const resultWithNotices = isAuthed
+          const resultWithNotices = isAuthed && policyToolName(toolName) !== 'advisor'
             ? await maybeInjectProjectNoticeContext(
                 result,
                 toolName,

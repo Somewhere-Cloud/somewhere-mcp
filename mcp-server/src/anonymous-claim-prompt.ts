@@ -54,6 +54,6 @@ export function anonymousClaimPrompt(
     reason: 'anonymous_account_with_work',
     message: 'This work is stored but remains tied to this guest session. connector_link_email requires an email supplied by the user and sends a human-verification link; recovery on another device becomes available only after verification.',
     action: { tool: 'connector_link_email', requires: 'user_email' },
-    dashboard_url: 'https://somewhere.tech/auth?intent=signup&switch=1&claim=1',
+    dashboard_url: 'https://somewhere.cloud/auth?intent=signup&switch=1&claim=1',
   };
 }

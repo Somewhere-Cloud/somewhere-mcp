@@ -19,7 +19,7 @@ export const ACCOUNT_TOOL_SPECS = defineDomainToolSpecs([
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","connector","chatgpt"],
-    protocol: { surfaceAnnotations: { chatgpt: { openWorldHint: true }, connector: { destructiveHint: true } }, surfaceDescriptions: { connector: "Send an account recovery verification link to an email address supplied by the user. Account verification or merging occurs only after the recipient confirms the link; this call sends the email and records the pending request." }, oauthScopes: ['mcp'] },
+    protocol: { surfaceAnnotations: { chatgpt: { destructiveHint: true, openWorldHint: true }, connector: { destructiveHint: true } }, surfaceDescriptions: { connector: "Send an account recovery verification link to an email address supplied by the user. Account verification or merging occurs only after the recipient confirms the link; this call sends the email and records the pending request." }, oauthScopes: ['mcp'] },
     execute: (runtime, args) => runtime.callApi('POST', '/v1/oauth/connector/link-email', {
       email: args.email,
     }),

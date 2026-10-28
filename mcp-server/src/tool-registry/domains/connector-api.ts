@@ -51,7 +51,7 @@ export function connectorApiToolSpecs(validatePath: PathValidator) {
     {
       definition: {
         name: 'api_read',
-        description: 'Read Somewhere platform API endpoints in a batch of up to 10 independent GET/HEAD requests. Paths and response shapes follow the Somewhere REST API reference: https://somewhere.tech/docs.txt. Returns one result per request in input order. No write methods or request bodies are accepted.',
+        description: 'Read Somewhere platform API endpoints in a batch of up to 10 independent GET/HEAD requests. Paths and response shapes follow the Somewhere REST API reference: https://somewhere.cloud/docs.txt. Returns one result per request in input order. No write methods or request bodies are accepted.',
         inputSchema: { type: 'object', properties: { calls: { type: 'array', maxItems: 10, items: { type: 'object', properties: { method: { type: 'string', enum: ['GET', 'HEAD'] }, path: { type: 'string', description: 'Platform /v1/ path, optionally including query parameters.' } }, required: ['method', 'path'] } } }, required: ['calls'] },
       },
       annotations: { title: 'Read platform API data', readOnlyHint: true, idempotentHint: true },
@@ -62,7 +62,7 @@ export function connectorApiToolSpecs(validatePath: PathValidator) {
     {
       definition: {
         name: 'api_write',
-        description: 'Create, update, or delete platform data through up to 10 independent POST/PUT/PATCH/DELETE requests. Requests are not a transaction; some may succeed when others fail. Paths and request bodies follow the Somewhere REST API reference: https://somewhere.tech/docs.txt. AI media generation, financial transfers, credential creation, and domain purchases are unavailable.',
+        description: 'Create, update, or delete platform data through up to 10 independent POST/PUT/PATCH/DELETE requests. Requests are not a transaction; some may succeed when others fail. Paths and request bodies follow the Somewhere REST API reference: https://somewhere.cloud/docs.txt. AI media generation, financial transfers, credential creation, and domain purchases are unavailable.',
         inputSchema: { type: 'object', properties: { calls: { type: 'array', maxItems: 10, items: { type: 'object', properties: { method: { type: 'string', enum: ['POST', 'PUT', 'PATCH', 'DELETE'] }, path: { type: 'string', description: 'Platform /v1/ path, optionally including query parameters.' }, body: { type: 'object', additionalProperties: true } }, required: ['method', 'path'] } } }, required: ['calls'] },
       },
       annotations: { title: 'Change platform API data', readOnlyHint: false, destructiveHint: true, idempotentHint: false },

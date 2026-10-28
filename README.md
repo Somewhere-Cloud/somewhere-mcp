@@ -1,8 +1,8 @@
-# Somewhere MCP
+# Somewhere Cloud MCP
 
 **Build, deploy, and inspect apps from your AI assistant.**
 
-[Somewhere](https://somewhere.tech) provides the backend for AI-built apps: declared data, authentication, files, email, payments, and hosted functions. This repository contains the production MCP server source that connects an assistant to those services.
+[Somewhere Cloud](https://somewhere.cloud) provides the backend for AI-built apps: declared data, authentication, files, email, payments, and hosted functions. This repository contains the production MCP server source that connects an assistant to those services.
 
 An assistant can read the platform contract, deploy raw application source, inspect logs, verify the app in a browser, and manage project tasks through the same connection.
 
@@ -12,9 +12,9 @@ Use a hosted endpoint. You do not need to clone or deploy this repository to use
 
 | Client | Server URL |
 | --- | --- |
-| Claude connector | `https://mcp.somewhere.tech/mcp/connector` |
-| ChatGPT connector | `https://mcp.somewhere.tech/mcp/chatgpt` |
-| Cursor and other remote MCP clients | `https://mcp.somewhere.tech/mcp` |
+| Claude connector | `https://mcp.somewhere.cloud/mcp/connector` |
+| ChatGPT connector | `https://mcp.somewhere.cloud/mcp/chatgpt` |
+| Cursor and other remote MCP clients | `https://mcp.somewhere.cloud/mcp` |
 
 These are profiles of **one implementation**, with tool visibility configured for each surface. They share the same platform account and projects. Configuring a custom connector is separate from a client's directory listing or approval.
 
@@ -26,7 +26,7 @@ The Cursor Marketplace submission is being prepared. It is not listed or approve
 {
   "mcpServers": {
     "somewhere": {
-      "url": "https://mcp.somewhere.tech/mcp"
+      "url": "https://mcp.somewhere.cloud/mcp"
     }
   }
 }
@@ -46,7 +46,7 @@ Then ask your assistant:
 
 The `docs` tool supplies platform reference material; `catalog` lists the tools available on your connection. Use `advisor` for platform-specific questions. Tool calls remain subject to account permissions and the client's approval settings.
 
-Prefer a terminal workflow? The [Somewhere CLI](https://github.com/Somewhere-Tech/somewhere-cli) is another route to the same platform. App code can use the [TypeScript SDK](https://github.com/Somewhere-Tech/somewhere-sdk-js); agents should start with the current [build guide](https://somewhere.tech/start.txt).
+Prefer a terminal workflow? The [Somewhere CLI](https://github.com/somewhere-cloud/somewhere-cli) is another route to the same platform. App code can use the [TypeScript SDK](https://github.com/somewhere-cloud/somewhere-sdk-js); agents should start with the current [build guide](https://somewhere.cloud/docs/start.txt).
 
 ## Verify the source
 
@@ -65,7 +65,7 @@ Issues and pull requests are welcome. For a bug, include the MCP client/version,
 
 This repository is maintained through a reproducible export from the platform's canonical source. Maintainers integrate accepted changes there before publishing the next snapshot, so the public server and hosted implementation do not develop separately. The private platform history is not included in the export.
 
-The somewhere.tech backend is not included in this repository.
+The Somewhere Cloud backend is not included in this repository.
 
 The command-line client is [`@somewhere-tech/cli`](https://www.npmjs.com/package/@somewhere-tech/cli), and the optional JavaScript and TypeScript SDK is [`@somewhere-tech/sdk`](https://www.npmjs.com/package/@somewhere-tech/sdk).
 

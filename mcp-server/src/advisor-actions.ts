@@ -24,21 +24,39 @@ function matches(value: unknown, schema: JsonSchemaProperty, depth = 0): boolean
   return true;
 }
 export function quoteAdvisorShell(value: string): string { return "'" + value.replaceAll("'", "'\\''") + "'"; }
+/** Inline code that a value's own backticks cannot close early. */
+function inlineCode(value: string): string {
+  const ticks = '`'.repeat(Math.max(0, ...[...value.matchAll(/`+/g)].map(run => run[0].length)) + 1);
+  const pad = ticks.length > 1 ? ' ' : '';
+  return ticks + pad + value + pad + ticks;
+}
+/** `described` is a non-executable step for a project-bound tool when no
+ * project is authorized: never a command, never a project ID. */
 export function renderAdvisorAction(action: AdvisorAction, options: {
   tools: readonly Pick<ToolDefinition, 'name' | 'inputSchema'>[]; projectId: string | null; caller: string; browserVerification: boolean;
-}): { text: string } | { reason: string } {
+}): { text: string } | { described: string } | { reason: string } {
   const definition = options.tools.find(tool => tool.name === action.tool);
   if (!definition) return { reason: 'tool is not advertised to this caller' };
   const args = { ...action.arguments };
-  if ('project_id' in definition.inputSchema.properties) {
-    if (!options.projectId || ('project_id' in args && args.project_id !== options.projectId)) return { reason: 'authorized project identity is missing or mismatched' };
-    args.project_id = options.projectId;
+  const projectBound = 'project_id' in definition.inputSchema.properties;
+  if (projectBound) {
+    // Without an authorized project any supplied ID, null included, is refused;
+    // with one, only that exact ID is accepted. A refused ID is never echoed.
+    if ('project_id' in args && (!options.projectId || args.project_id !== options.projectId)) return { reason: 'authorized project identity is missing or mismatched' };
+    if (options.projectId) args.project_id = options.projectId;
   }
+  const described = projectBound && !options.projectId;
   if (action.tool === 'auth_verify_magic_link') {
     if (options.browserVerification) return { reason: 'CLI redemption consumes the link needed by the browser recipe; use a separate fresh link for an API test' };
     // Model-generated arguments cannot establish where a token came from.
     // Explain the supported API without reproducing a credential in advice.
-    return { text: 'For an isolated API test, `auth_verify_magic_link` takes `project_id` and a fresh `token`. Supply the token privately when calling the tool; it is consumed once. Use a separate fresh link for browser verification.' };
+    const text = 'For an isolated API test, `auth_verify_magic_link` takes `project_id` and a fresh `token`. Supply the token privately when calling the tool; it is consumed once. Use a separate fresh link for browser verification.';
+    return described ? { described: text } : { text };
+  }
+  if (described) {
+    // The project is supplied later by the caller's own authorized tool call.
+    if (!matches({ ...args, project_id: 'project' }, definition.inputSchema)) return { reason: 'arguments do not match the advertised tool schema' };
+    return { described: Object.keys(args).length ? `\`${action.tool}\` with ${inlineCode(JSON.stringify(args))}` : `\`${action.tool}\`` };
   }
   if (!matches(args, definition.inputSchema)) return { reason: 'arguments do not match the advertised tool schema' };
   const command = `somewhere call ${action.tool} ${quoteAdvisorShell(JSON.stringify(args))}`;

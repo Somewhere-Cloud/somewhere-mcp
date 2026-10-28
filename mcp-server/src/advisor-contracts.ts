@@ -69,5 +69,5 @@ HMAC-SHA256(secret, timestamp_ms + '.' + rawBody)
 
 Here the separate timestamp is epoch **milliseconds**. Verify its freshness and the signature over the unchanged raw body.
 
-A successful synthetic \`payment_received\` delivery does not establish real Checkout fulfillment: ad-hoc Checkout does not emit that event to project outbound subscriptions. Custom fulfillment uses a separate, manually configured Stripe webhook destination and its independent \`Stripe-Signature\` contract. See \`somewhere docs payments\`; shared dev test-account destinations require platform support.`;
+For settled ad-hoc Checkout, use \`payment.completed\` on the project lifecycle webhook configured with \`auth_webhook_set\`, including shared-account test payments. It uses the timestamped signature above. Match the saved checkout session, amount, currency and test/live mode; apply order changes and a unique fulfillment record in one transaction. On every valid delivery, including duplicates, call \`sw.jobs.create\` for follow-up work with the same \`idempotency_key\` to create a missing job or reuse the existing one. Project outbound subscriptions do not receive \`payment_received\` from Checkout. A separate Stripe destination is optional for other Stripe-native events and uses its own \`Stripe-Signature\` contract. See \`somewhere docs payments\`.`;
 }

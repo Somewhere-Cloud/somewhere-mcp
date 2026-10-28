@@ -99,7 +99,7 @@ export function searchCatalogEntries({
         ...(category?.searchAliases ?? []),
       ];
       const aliasHaystack = categoryAliases.join(' ').toLowerCase();
-      let score = 0;
+      let score = q.includes(' ') && categoryAliases.includes(q) ? 12 : 0;
       for (const token of tokens) {
         if (name === token) score += 50;
         else if (name.includes(token)) score += 20;

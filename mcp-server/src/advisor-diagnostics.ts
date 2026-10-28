@@ -11,6 +11,7 @@ export interface AdvisorDiagnostics {
   prompt_chars: number;
   topics: string[];
   knowledge?: AdvisorKnowledgeSelection;
+  unknown_docs_topics?: string[];
   attempts: Array<{ duration_ms: number; status: number | null; outcome: string; request_id: string | null }>;
 }
 

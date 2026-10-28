@@ -2,6 +2,17 @@
 export const CONNECTOR_RUNTIME_RESTRICTION = 'restriction:directory-connector';
 export const CONNECTOR_OPERATION_UNAVAILABLE = 'CONNECTOR_OPERATION_UNAVAILABLE';
 
+/** True when a stored api_keys.capabilities value carries the connector restriction. */
+export function capabilitiesCarryConnectorRestriction(raw: string | null | undefined): boolean {
+  if (!raw) return false;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) && parsed.includes(CONNECTOR_RUNTIME_RESTRICTION);
+  } catch {
+    return false;
+  }
+}
+
 const MEDIA_PATHS = [
   '/v1/ai/generate-image', '/v1/ai/tts',
   '/v1/ai/remove-background',

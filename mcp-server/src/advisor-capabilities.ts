@@ -28,15 +28,69 @@ interface CapabilityDependency {
   evidence: string;
 }
 
+const PUBLIC_INTAKE = /\bpublic\b[^.?!]{0,80}\b(?:forms?|intake|submissions?|submit\w*)\b|\b(?:intake|contact|enquiry|inquiry) forms?\b|\banonymous\b[^.?!]{0,60}\b(?:forms?|submi\w*|intake)\b/i;
+
 const DEPENDENCIES: CapabilityDependency[] = [
+  {
+    id: 'server-rendered-pages',
+    requested: (question) => /\bSSR\b|server[- ]render|\bHTML\b|\bpages?\b.*\bfunction|\bcatch[- ]all\b|\bknowledge[- ]base\b/i.test(question),
+    sections: [{ topic: 'functions', heading: '## Server-rendered pages alongside the SPA' }],
+    evidence: '',
+  },
+  {
+    id: 'mixed-access-recipes',
+    requested: (question) => /provider.{0,30}booker|owner.{0,30}staff|unverified.{0,30}(?:group|member)/i.test(question),
+    sections: [
+      { topic: 'sw.db', heading: '## Provider-or-booker and owner-or-staff recipes' },
+      { topic: 'sw.groups', heading: '## Membership before email verification' },
+    ],
+    evidence: '',
+  },
   {
     id: 'managed-schema',
     requested: (question, topics) => topics.includes('sw.db')
-      && /\bschema\b|\bmanaged\b|\b(?:owner|shared|serverOnly)\s*\(|\barchitecture\b|\bfile shapes?\b|\bimplementation\b/i.test(question),
+      && /\bschema\b|\bmanaged\b|\badd(?:ing)? (?:an? |new )?columns?\b|\b(?:owner|shared|serverOnly|group|appRole|anyOf)\s*\(|\barchitecture\b|\bfile shapes?\b|\bimplementation\b/i.test(question),
     sections: [{ topic: 'sw.db', heading: '## Start with the schema file — db/schema.ts' }],
     // Source: db-schema-deploy/differ.ts managed-scope + retention guards;
     // extract-schema-ts.ts readTable grammar. Tests exercise both directions.
-    evidence: 'Managed schema capability constraints: A NEW table can use owner(), shared(), or serverOnly(). Changing the access scope or owner column of an EXISTING managed table is refused by production deploy, including an empty table. removedTable() retains the table and its scope; redeclaring it during retention must restore that same scope, so remove-and-recreate is not a scope-conversion workaround. A new differently named table is a separate table, not an in-place conversion; do not claim existing data or references migrate automatically. The schema file is a closed literal declaration grammar, not arbitrary TypeScript. Object-property trailing commas and trailing commas after nonempty table/helper/schema arguments are accepted; empty argument slots and extra arguments are refused.',
+    evidence: 'Managed schema capability constraints: A NEW table can use owner(), group(), appRole(), shared(), or serverOnly(); anyOf() combines exactly owner() with one member(), group() or appRole() branch; group/appRole branches grant only their explicitly listed operations. Owners retain their own rows; owner-plus-group inserts require membership in the named group. Live subscriptions over anyOf remain unsupported. allOf(gate, who) requires current membership (member() with operations, group() or appRole() with roles) AND owner() or anyOf(owner(), the same membership or an app role); leaving revokes access to every row, including rows the author created; explicit operations are required; live subscriptions, publicRead, links, intake, payment bindings and file collections are not supported on allOf tables. An EXISTING managed table can switch between owner(), shared() and serverOnly() only on a scope-only production deploy while the table is EMPTY and has no links, triggers, views, or raw SQL naming it; any other scope change is refused, and a table with rows fails when the change applies (SCHEMA_APPLY_FAILED, rolled back). Previews cannot make this switch. removedTable() retains the table and its scope; redeclaring it during retention must restore that same scope, so remove-and-recreate is not a scope-conversion workaround. A new differently named table is a separate table, not an in-place conversion; do not claim existing data or references migrate automatically. The schema file is a closed literal declaration grammar, not arbitrary TypeScript. Object-property trailing commas and trailing commas after nonempty table/helper/schema arguments are accepted; empty argument slots and extra arguments are refused.',
+  },
+  {
+    // A team/club workflow needs the group declaration, its role rules and
+    // the method table together; packing them first keeps them ahead of
+    // database and email detail in the bounded prompt.
+    id: 'group-data',
+    requested: (_question, topics) => topics.includes('sw.groups'),
+    sections: [
+      { topic: 'declared-data', heading: '## Data' },
+      { topic: 'sw.groups', heading: '### Declare a group table' },
+      { topic: 'sw.groups', heading: "### Read a group's rows" },
+      { topic: 'sw.groups', heading: '### Who may do what' },
+      { topic: 'sw.groups', heading: '## Methods' },
+      { topic: 'sw.auth', heading: '## Member contacts' },
+    ],
+    // Source: worker managed-groups roster pages carry user_id, role and
+    // created_at only (fixture-checked).
+    evidence: 'Group membership capability: sw.groups.members(request, groupId) pages contain user IDs and roles, not email addresses. A production function can authorize contact access and resolve member IDs with sw.auth.server.listUsers({ ids }); ordinary membership alone does not grant contact access.',
+  },
+  {
+    // Public intake: one validating server handler writes the row. Addressed
+    // to an owner it keeps owner() tables and names the looked-up user_id; a
+    // table the caller declared serverOnly() keeps that declaration and only
+    // the handler applies.
+    id: 'public-intake',
+    requested: (question) => PUBLIC_INTAKE.test(question),
+    sections: [{ topic: 'recipe-signed-in-app', heading: '## 4. Public form: save first, then notify' }],
+    evidence: '',
+  },
+  {
+    id: 'owner-intake',
+    requested: (question) => PUBLIC_INTAKE.test(question) && !/\bserverOnly\s*\(/.test(question),
+    sections: [
+      { topic: 'recipe-signed-in-app', heading: '## 2. db/schema.ts' },
+      { topic: 'recipe-signed-in-app', heading: '## 3. Owner pages (signed in)' },
+    ],
+    evidence: '',
   },
   {
     id: 'scheduled-invocation',

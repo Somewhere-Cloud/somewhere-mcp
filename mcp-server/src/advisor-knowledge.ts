@@ -26,7 +26,7 @@ export function advisorFallbackText(code: string, topics: string[], outcome?: st
         ? 'Advisor is degraded: the answer was cut short, so it has not been presented as complete.'
         : 'Advisor is unavailable: it did not return a complete answer.';
   const commands = topics.filter((topic) => !['cli', 'guarantees', 'getting-started'].includes(topic)).slice(0, 3);
-  return `${reason} Use ${commands.length ? commands.map((topic) => `\`somewhere docs ${topic}\``).join(', ') : '`somewhere docs getting-started`'} for the exact contracts, or read https://somewhere.tech/docs.txt. These references do not depend on the advisor. Repeating the same request now may hit the same failure.`;
+  return `${reason} Use ${commands.length ? commands.map((topic) => `\`somewhere docs ${topic}\``).join(', ') : '`somewhere docs getting-started`'} for the exact contracts, or read https://somewhere.cloud/docs.txt. These references do not depend on the advisor. Repeating the same request now may hit the same failure.`;
 }
 
 const STOP_WORDS = new Set('a an the and or to of in on for with is are as at by be this that it i my your how what exact current give only use using project platform somewhere have from can do does'.split(' '));
@@ -57,6 +57,13 @@ export function selectAdvisorKnowledge(
     'sw.db': /\b(?:database|sw\.db|serverOnly)\b/i,
     'sw.auth': /\b(?:oauth|signup|login|authentication|magic[ -]links?|verifyOtp|signInWithOtp|setSessionCookies)\b/i,
     'sw.fs': /\b(?:uploads?|files|sw\.fs)\b/i,
+    // Question vocabulary that never names these topics: the answer lives
+    // there, so a miss sends every model to the same wrong answer.
+    'sw.env': /\b(?:env(?:ironment)?[ -]var(?:iable)?s?|env vars?|sw\.env|somewhere env|ENV_VALUES?_TOO_LARGE)\b/i,
+    'migration-supabase': /\bsupabase\b/i,
+    'dev-environments': /\b(?:previews?|promot(?:e|ed|ing)|staging|(?:real|live|existing) users|already has users)\b/i,
+    'verify-before-deploy': /\bdeploy-check\b|\b(?:test|check|try)\b[^.?!]{0,40}\b(?:handlers?|functions?|endpoints?)\b[^.?!]{0,40}\bbefore (?:deploy|going live)/i,
+    cli: /\bdeploy-check\b/i,
   };
   const pages = Object.entries(topics).filter(([name]) => name !== 'api-surface');
   const weights = new Map(query.map((word) => [word,
@@ -89,13 +96,15 @@ export function selectAdvisorKnowledge(
   ]);
   // Recognized task components are required scope even if optional relevance
   // ranking has filled its six page slots with other named domains.
-  const requiredTopics = [...new Set([...ranked.map(page => page.name), ...workflowTopics])];
+  const projectOutboundWebhook = /\b(?:project[ -]+outbound|outbound[ -]+webhooks?|webhook[ -]+subscriptions?|webhook_deliveries_list|webhook_delivery_redrive)\b|\/v1\/webhooks\b/i.test(question);
+  const requiredTopics = [...new Set([...ranked.map(page => page.name), ...workflowTopics,
+    ...(projectOutboundWebhook ? ['projects'] : [])])];
   const dependencies = advisorCapabilityDependencies(question, requiredTopics, topics);
   for (const topic of workflowTopics) {
     if (!topics[topic]) dependencies.selection.omitted.push({ id: `topic:${topic}`, reason: 'unavailable' });
   }
   dependencies.selection.workflows = workflows.map(workflow => workflow.id);
-  const selected: Array<{ text: string; ids: string[] }> = [{ text: dependencies.text, ids: [...dependencies.selection.selected] }];
+  const selected: Array<{ text: string; ids: string[]; lead?: boolean }> = [{ text: dependencies.text, ids: [...dependencies.selection.selected] }];
   const dependencyTopics = [...requiredTopics];
   const visitedTopics = new Set<string>();
   for (const topic of dependencyTopics) {
@@ -103,6 +112,8 @@ export function selectAdvisorKnowledge(
     visitedTopics.add(topic);
     if (visitedTopics.size > 64) { dependencies.selection.omitted.push({ id: `topic:${topic}`, reason: 'budget' }); continue; }
     for (const reference of (options.dependencies ?? ADVISOR_TOPIC_DEPENDENCIES)[topic] ?? []) {
+      if (reference.topic === 'projects' && reference.heading === '## Outbound webhook subscriptions — the raw-body signature'
+        && !projectOutboundWebhook) continue;
       // A headed reference imports one contract, not every dependency of its
       // topic. Explicit roots and whole-topic references still expand normally.
       if (reference.heading === undefined && !visitedTopics.has(reference.topic) && !dependencyTopics.includes(reference.topic)) dependencyTopics.push(reference.topic);
@@ -118,22 +129,50 @@ export function selectAdvisorKnowledge(
       }
     }
   }
-  const namedMethods = [...new Set(question.match(/\bsw\.[A-Za-z]+\.[A-Za-z][A-Za-z0-9]*/g) ?? [])];
+  // The whole dotted name: `sw.db.server.aggregate` is the method, `sw.db.server` a namespace.
+  const namedMethods = [...new Set(question.match(/\bsw\.[A-Za-z]+(?:\.[A-Za-z][A-Za-z0-9]*)+/g) ?? [])];
   const visitedMethods = new Set<string>();
+  const methodDetails: typeof selected = [];
   for (const method of namedMethods) {
     if (visitedMethods.has(method)) continue;
     visitedMethods.add(method);
     if (visitedMethods.size > 64) { dependencies.selection.omitted.push({ id: `method:${method}`, reason: 'budget' }); continue; }
     const topic = method.split('.').slice(0, 2).join('.');
-    const matches = advisorSections(topics[topic] ?? '').filter(section => section.includes(method));
-    if (!matches.length) dependencies.selection.omitted.push({ id: `method:${method}`, reason: 'unavailable' });
-    for (const section of matches) {
+    // The section whose heading defines the method is its required contract.
+    // Sections that merely mention it are detail, packed after the ranked
+    // excerpts: `sw.db.server` alone is named in 13 database sections (36 KB),
+    // which once starved the sw.endpoint definition (pfb_4ca3ea268c1a).
+    const mentions = advisorSections(topics[topic] ?? '').filter(section =>
+      (section.match(/\bsw\.[A-Za-z]+(?:\.[A-Za-z][A-Za-z0-9]*)+/g) ?? []).some(name => name === method));
+    // Database server verbs share their ordinary verb's contract. Only use
+    // that heading when this section also documents the exact server method.
+    const contractMethod = method.replace(/^sw\.db\.server\./, 'sw.db.');
+    if (!mentions.length) dependencies.selection.omitted.push({ id: `method:${method}`, reason: 'unavailable' });
+    for (const section of mentions) {
       const id = `${topic}:${section.split('\n')[0]}`;
+      const headingMethods = section.split('\n')[0].match(/\bsw\.[A-Za-z]+(?:\.[A-Za-z][A-Za-z0-9]*)+/g) ?? [];
+      if (!headingMethods.some(name => name === method || name === contractMethod)) { methodDetails.push({ text: `## Topic: ${topic}\n${section}`, ids: [id] }); continue; }
       if (dependencies.sectionIds.has(id)) continue;
       dependencies.sectionIds.add(id);
       dependencies.selection.selected.push(id);
       selected.push({ text: `## Required reference: ${topic}\n${section}`, ids: [id] });
     }
+  }
+
+  // A namespace the question names on its own (`sw.endpoint handlers`) keeps its
+  // defining section, as a named method does: otherwise ordinary growth in any
+  // other selected topic can push that definition past the budget and the
+  // answer reads it as nonexistent (pfb_4ca3ea268c1a; tsk_d03d921f, when the
+  // groups methods table grew).
+  for (const namespace of new Set(question.match(/\bsw\.[A-Za-z]+\b(?!\.[A-Za-z])/g) ?? [])) {
+    const lead = advisorSections(topics[namespace] ?? '').find(section => section.length > 0);
+    if (!lead) continue;
+    const id = `${namespace}:${lead.split('\n')[0]}`;
+    if (dependencies.sectionIds.has(id)) continue;
+    dependencies.sectionIds.add(id);
+    dependencies.selection.selected.push(id);
+    // Packed first among required references: it is small, and it is what the question asks about.
+    selected.splice(1, 0, { text: `## Topic: ${namespace}\n${lead}`, ids: [id], lead: true });
   }
 
   dependencies.selection.required = [...dependencies.selection.selected, ...dependencies.selection.omitted.map(item => item.id)];
@@ -157,6 +196,9 @@ export function selectAdvisorKnowledge(
     })).filter((section) => {
       if (page.name !== 'cli' || !hasDomainFocus) return true;
       const heading = section.body.split('\n')[0];
+      // A command the question names keeps its own section (\`## deploy-check — …\`).
+      const command = /^##\s+([a-z][a-z-]*)\b/.exec(heading)?.[1];
+      if (command && (question.includes(`somewhere ${command}`) || (command.includes('-') && question.includes(command)))) return true;
       return section.order === 0 || section.body.includes('somewhere call')
         || focused.some((topic) => !navigationTopics.has(topic.name)
           && (aliases[topic.name]?.test(heading) || heading.toLowerCase().includes(topic.name.replace(/^sw\./, ''))));
@@ -178,7 +220,14 @@ export function selectAdvisorKnowledge(
       excerpts.push(section);
       remaining -= section.body.length;
     }
-    for (const section of excerpts.sort((a, b) => a.order - b.order)) selected.push({ text: `## Topic: ${page.name}\n${section.body}`, ids: [`${page.name}:${section.body.split('\n')[0]}`] });
+    for (const section of excerpts.sort((a, b) => a.order - b.order)) selected.push({ text: `## Topic: ${page.name}\n${section.body}`, ids: [`${page.name}:${section.body.split('\n')[0]}`], lead: section.order === 0 });
+  }
+  for (const block of methodDetails) {
+    if (dependencies.sectionIds.has(block.ids[0]) || dependencies.selection.selected.includes(block.ids[0])) continue;
+    dependencies.sectionIds.add(block.ids[0]);
+    dependencies.selection.omitted = dependencies.selection.omitted.filter(item => item.id !== block.ids[0]);
+    dependencies.selection.selected.push(block.ids[0]);
+    selected.push(block);
   }
   const domainWord = (word: string): string => word.toLowerCase().replace(/s$/, '');
   const requestedDomains = new Set([
@@ -191,11 +240,20 @@ export function selectAdvisorKnowledge(
   const companionDomains = new Set([...companions].map((name) => name.split('_')[0]));
   const toolRequested = (name: string): boolean => {
     if (companions.has(name) || query.includes(name)) return true;
+    // The platform has three distinct delivery contracts. A project-outbound
+    // webhook question must not be redirected to database/auth hooks or to the
+    // unrelated system-channel WebSocket subscription because their nouns overlap.
+    if (projectOutboundWebhook && (/^(?:auth|db)_webhook/.test(name) || /^events_subscribe_/.test(name))) return false;
     const parts = name.split('_');
+    const runtimeName = `sw.${name.replace('_', '.')}`;
+    // A focused answer may only advertise optional operations backed by the
+    // excerpts it actually carries. Shared verbs such as "subscribe" and
+    // "project" must not pull the system-channel WebSocket recipe into a
+    // project-outbound webhook answer (or produce similar cross-domain leaks).
+    if (hasDomainFocus && !parts.some((part) => focusedDomains.has(domainWord(part)))
+      && !selected.some(({ text }) => text.includes(name) || text.includes(runtimeName))) return false;
     if (companionDomains.has(parts[0])) {
       if (!parts.slice(1).some((part) => requestedDomains.has(domainWord(part)))) return false;
-      const runtimeName = `sw.${name.replace('_', '.')}`;
-      if (!selected.some(({ text }) => text.includes(name) || text.includes(runtimeName))) return false;
     }
     if (topicDomains.has(domainWord(parts[0])) && !parts.some((part) => focusedDomains.has(domainWord(part)))) return false;
     // The leading namespace identifies the operation. Secondary words only
@@ -237,7 +295,10 @@ export function selectAdvisorKnowledge(
   };
   const requiredIds = new Set(dependencies.selection.required);
   const requiredReferences = selected.filter(block => block.ids.some(id => requiredIds.has(id)));
-  const optionalReferences = selected.filter(block => !block.ids.some(id => requiredIds.has(id)));
+  // Every selected topic's defining section is packed before any topic's detail
+  // sections: a topic whose definition lost the budget reads as nonexistent.
+  const optionalReferences = selected.filter(block => !block.ids.some(id => requiredIds.has(id)))
+    .sort((a, b) => Number(Boolean(b.lead)) - Number(Boolean(a.lead)));
   // Reserve executable argument contracts before prose can consume their budget.
   const requiredToolBlocks: string[] = [];
   for (const tool of selectedTools.filter(tool => requiredToolNames.has(tool.name))) appendTool(tool, requiredToolBlocks);
@@ -268,10 +329,10 @@ export function advisorIntegrationContext(question: string): string {
 Project outbound /v1/webhooks and auth/database webhooks are DIFFERENT contracts.
 Project outbound X-Somewhere-Signature is lowercase hex HMAC-SHA256(secret, rawBody), with NO t= or v1= wrapper and NO timestamp prefix. Read req.text() once; verify the exact UTF-8 bytes before parsing. Body: {event, project_id, timestamp, source, data}; timestamp is ISO-8601, not epoch units. That timestamp field IS authenticated inside the raw JSON body; only an ADDITIONAL timestamp prefix is absent. Never say the body timestamp is excluded from the MAC. Headers: X-Somewhere-Event, X-Somewhere-Project, X-Somewhere-Event-Id, X-Somewhere-Delivery-Id, X-Somewhere-Attempt. Deduplicate on event/delivery ID; redrives preserve the original body/signature. A configured secret is required for a signed delivery.
 Auth/database webhooks instead use X-Somewhere-Signature: t=<epoch milliseconds>,v1=<hex HMAC-SHA256(secret, milliseconds + '.' + rawBody)>.
-An app-created ad-hoc Checkout does NOT emit payment_received, subscription_created, subscription_cancelled, or payment.completed to project outbound subscriptions. A successful synthetic test is NOT evidence that a real payment emits that event. Do not recommend registering those events for fulfillment.
+A settled ad-hoc one-time Checkout emits payment.completed to the project lifecycle webhook configured with auth_webhook_set, using the auth/database t=,v1= signature above. This includes shared-account test checkouts. It does not emit payment_received, subscription_created or subscription_cancelled to project outbound subscriptions. Do not confuse the two delivery systems.
 sw.payments.events() exposes summary fields, NOT Checkout session metadata or a reliable request-id fulfillment mapping. Do not invent event.metadata or event.payment_intent_id there.
-For custom fulfillment, configure a separate Stripe webhook destination to your own api/ handler and verify Stripe-Signature with that destination's signing secret, independently of project outbound signatures. This setup is manual and requires access to the connected account. Default dev Checkout may use a shared test account; the developer cannot configure their own destination there. Do not promise self-service custom fulfillment on that shared test path: ask platform support to arrange the destination or verify test-account setup first. The platform's built-in payment handling does not update your arbitrary requests table. Keep the signing secret in a server environment variable. Match the server-created Checkout session, amount/currency and paid status, then update idempotently; browser redirects are never payment proof.
-sw.payments.checkout(options) returns {session_id,url}; options include env ('dev' for test), mode ('payment'), line_items (name, amount, currency, quantity), success_url, cancel_url, and metadata. Amount is integer cents chosen on the server; do not guess a missing amount. For signed-in plan upgrades the current runtime signature is sw.payments.checkoutForUser({plan,...}); subject is derived from the signed-in request, not a positional userId.
+For custom order fulfillment, use the project lifecycle payment.completed event. Verify its timestamped signature and match payment.checkout_session_id, amount_total, currency and mode against the saved order: session_id, amount_total_cents and stripe_mode come from the checkout response; save the currency chosen by the server when creating checkout. Currency is not returned by this checkout response. Test and live events share this endpoint. Atomically record the unique checkout fulfillment together with the order/stock changes; on every valid delivery including duplicates, admit follow-up work with sw.jobs.create using the same idempotency_key so a missing job is created and an existing one is reused. This event does not itself update an arbitrary order table or grant an ad-hoc buyer a plan. A separate Stripe destination is optional for other native events such as refunds/disputes and uses Stripe-Signature with its own secret; it requires access to the connected account. Keep secrets server-side and use the payments docs for the exact handler. Do not use reserved somewhere_ metadata names; some identify platform bindings and suppress ad-hoc delivery.
+sw.payments.checkout(options) returns session_id, url, amount_total_cents, stripe_mode and other checkout details; options include env ('dev' for test), mode ('payment'), line_items (name, amount, currency, quantity), success_url, cancel_url, and metadata. Amount is integer cents chosen on the server; do not guess a missing amount. For signed-in plan upgrades the current runtime signature is sw.payments.checkoutForUser({plan,...}); subject is derived from the signed-in request, not a positional userId.
 Use crypto.getRandomValues(new Uint8Array(32)) for independent customer/admin URL tokens; persist hashes and do not expose admin tokens to public intake callers.
 If the requested table is serverOnly(), preserve that policy. Anonymous intake can go through a validating server handler; do not replace serverOnly() with shared() or require signup to work around it.
 `;

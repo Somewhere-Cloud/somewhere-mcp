@@ -15,15 +15,18 @@ export function advertisedToolNames(surface, toolSpecs) {
   return new Set(toolSpecs
     // A deprecated alias (spec.aliasOf) or hidden spec (spec.hidden) stays
     // CALLABLE but is not advertised — that is how a surface consolidates or
-    // hides a feature without breaking existing callers.
-    .filter((spec) => spec.visibility !== 'admin' && !spec.aliasOf && !spec.hidden && spec.surfaces.includes(surface))
+    // hides a feature without breaking existing callers. A fixed operation
+    // (spec.operationOf) is advertised everywhere it is listed except `full`,
+    // which advertises the original multi-operation tool instead.
+    .filter((spec) => spec.visibility !== 'admin' && !spec.aliasOf && !spec.hidden
+      && !(spec.operationOf && surface === 'full') && spec.surfaces.includes(surface))
     .map((spec) => spec.definition.name));
 }
 
 export function executableToolNames(surface, toolSpecs) {
   const names = advertisedToolNames(surface, toolSpecs);
   for (const spec of toolSpecs) {
-    if ((spec.aliasOf || spec.hidden) && spec.visibility !== 'admin' && spec.surfaces.includes(surface)) {
+    if ((spec.aliasOf || spec.hidden || spec.operationOf) && spec.visibility !== 'admin' && spec.surfaces.includes(surface)) {
       names.add(spec.definition.name);
     }
   }
@@ -86,7 +89,7 @@ export function constrainTextToSurface(text, surface, registeredToolNames, allow
   const allowed = new Set(allowedToolNames);
   let constrained = text;
   for (const name of toolReferences(text, knownNames).filter((toolName) => !allowed.has(toolName))) {
-    const annotation = `(not available on the ${surface} surface; use \`catalog\` for an executable path)`;
+    const annotation = `(not available on the ${surface} surface; \`catalog\` lists the executable tools)`;
     constrained = constrained.replace(toolReferencePattern(name, true), (match, offset, source) => {
       const suffix = source.slice(offset + match.length);
       return /^\s+\(not available on the [^)]+ surface;/.test(suffix)

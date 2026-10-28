@@ -9,5 +9,5 @@ const BULK_DOCS_ALIASES = new Set(['*', 'all', 'dump', 'everything', 'full']);
 export function bulkDocsGuidance(topic: string, topics: readonly string[]): string | null {
   const normalized = topic.trim().toLowerCase();
   if (!BULK_DOCS_ALIASES.has(normalized)) return null;
-  return `Bulk documentation is not returned in one tool result because clients may truncate it. Fetch one topic at a time with docs({ topic }). Available topics: ${topics.join(', ')}. For the complete streaming corpus outside a tool result, read https://somewhere.tech/docs.txt. The initialized-project agent contract is https://somewhere.tech/agent.txt.`;
+  return `Bulk documentation is not returned in one tool result because clients may truncate it. Fetch one topic at a time with docs({ topic }). Available topics: ${topics.join(', ')}. For the complete streaming corpus outside a tool result, read https://somewhere.cloud/docs.txt. The initialized-project agent contract is https://somewhere.cloud/agent.txt.`;
 }

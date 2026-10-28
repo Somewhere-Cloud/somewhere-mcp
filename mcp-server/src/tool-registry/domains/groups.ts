@@ -13,7 +13,7 @@ export const GROUP_TOOL_SPECS = defineDomainToolSpecs([
     ...common,
     definition: {
     name: 'group_create',
-    description: `Create, organize, groups — create a project group to organize related projects under one group with shared members and one shared design theme; the caller becomes the group owner. Group roles: owner (everything an editor can do, plus manage membership/invites and delete the group), editor (read the group, add/remove projects, write the shared design theme).
+    description: `Create, organize, groups — create a project group to organize related projects under one group with shared members and one shared design theme; the caller becomes the group owner. Owners and editors can manage membership, invites and the shared theme, and delete the group. Project ownership and billing stay with each project’s owner.
 
 Returns the new group: \`{ id, owner_id, name, description, created_at, updated_at, role: "owner", project_count: 0 }\`.
 
@@ -52,7 +52,7 @@ Returns the new group: \`{ id, owner_id, name, description, created_at, updated_
     ...common,
     definition: {
     name: 'group_get',
-    description: `Group detail, inspect group — get full detail for a group: the group fields plus \`projects: [{ id, name, subdomain, status }]\`, \`members: [{ user_id, role }]\`, and \`design_tokens\` (the shared theme object, \`{}\` until one is saved). 403 FORBIDDEN if you are not a member. Group roles: owner (everything an editor can do, plus manage membership/invites and delete the group), editor (read the group, add/remove projects, write the shared design theme).
+    description: `Group detail, inspect group — get full detail for a group: the group fields plus \`projects: [{ id, name, subdomain, status }]\`, \`members: [{ user_id, role }]\`, and \`design_tokens\` (the shared theme object, \`{}\` until one is saved). 403 FORBIDDEN if you are not a member. Owners and editors can manage membership, invites and the shared theme, and delete the group. Project ownership and billing stay with each project’s owner.
 
 **Example:**
 
@@ -74,7 +74,7 @@ Returns the new group: \`{ id, owner_id, name, description, created_at, updated_
     ...common,
     definition: {
     name: 'group_delete',
-    description: `Delete a group — OWNER-ONLY. Removes the group, its membership and theme; projects in the group are DETACHED, never deleted. Errors: GROUP_NOT_FOUND (404), FORBIDDEN (403, not owner). Group roles: owner (everything an editor can do, plus manage membership/invites and delete the group), editor (read the group, add/remove projects, write the shared design theme).
+    description: `Delete a group — available to any group member. Removes the group, its membership and theme; projects in the group are DETACHED, never deleted. Errors: FORBIDDEN (403, no group membership). Owners and editors can manage membership, invites and the shared theme, and delete the group. Project ownership and billing stay with each project’s owner.
 
 **Example:**
 
@@ -96,7 +96,7 @@ Returns the new group: \`{ id, owner_id, name, description, created_at, updated_
     ...common,
     definition: {
     name: 'group_add_project',
-    description: `Add project to group, organize project — put a project you OWN into a group; caller must also be a group owner or editor. A project belongs to AT MOST ONE group — if it's already in another, returns 409 GROUP_CONFLICT and you must group_remove_project from the old group first. Returns \`{ added: true, group_id, project_id }\`. Group roles: owner (everything an editor can do, plus manage membership/invites and delete the group), editor (read the group, add/remove projects, write the shared design theme).
+    description: `Add project to group, organize project — put a project you can edit into a group you belong to. A project belongs to AT MOST ONE group — if it's already in another, returns 409 GROUP_CONFLICT and you must group_remove_project from the old group first. Returns \`{ added: true, group_id, project_id }\`. Owners and editors can manage membership, invites and the shared theme, and delete the group. Project ownership and billing stay with each project’s owner.
 
 **Example:**
 
@@ -107,7 +107,7 @@ Returns the new group: \`{ id, owner_id, name, description, created_at, updated_
       type: 'object',
       properties: {
         group_id: { type: 'string', description: 'Group ID (UUID) from group_create / group_list.' },
-        project_id: { type: 'string', description: 'Project UUID. This endpoint does NOT resolve slugs/subdomains — get the UUID from project_list or project_get.' },
+        project_id: { type: 'string', description: 'Project UUID, slug or subdomain; the caller must have editor access.' },
       },
       required: ['group_id', 'project_id'],
     },
@@ -119,7 +119,7 @@ Returns the new group: \`{ id, owner_id, name, description, created_at, updated_
     ...common,
     definition: {
     name: 'group_remove_project',
-    description: `Remove project from group, detach project — pull a project out of a group. Allowed for a group owner/editor OR the project's own owner (an owner can always take their project back out). 404 NOT_IN_GROUP if the project isn't in that group. Returns \`{ removed: true, group_id, project_id }\`. Group roles: owner (everything an editor can do, plus manage membership/invites and delete the group), editor (read the group, add/remove projects, write the shared design theme).
+    description: `Remove project from group, detach project — pull a project out of a group. Allowed for any group member or anyone with editor access to the project. 404 NOT_IN_GROUP if the project isn't in that group. Returns \`{ removed: true, group_id, project_id }\`. Owners and editors can manage membership, invites and the shared theme, and delete the group. Project ownership and billing stay with each project’s owner.
 
 **Example:**
 
@@ -130,7 +130,7 @@ Returns the new group: \`{ id, owner_id, name, description, created_at, updated_
       type: 'object',
       properties: {
         group_id: { type: 'string', description: 'Group ID (UUID) from group_create / group_list.' },
-        project_id: { type: 'string', description: 'Project UUID. This endpoint does NOT resolve slugs/subdomains — get the UUID from project_list or project_get.' },
+        project_id: { type: 'string', description: 'Project UUID from project_list or project_get; detaching takes the UUID.' },
       },
       required: ['group_id', 'project_id'],
     },
@@ -142,9 +142,7 @@ Returns the new group: \`{ id, owner_id, name, description, created_at, updated_
     ...common,
     definition: {
     name: 'group_invite_create',
-    description: `Invite member to group, add teammate, invite to group — OWNER-ONLY: send a group membership invite by email. The platform emails the invite link automatically (expires in 7 days); the invitee needs a free somewhere.tech account with that email (verified) to accept, via group_invite_accept or the emailed link. Re-inviting the same email replaces the prior open invite. You cannot invite yourself. Group roles: owner (everything an editor can do, plus manage membership/invites and delete the group), editor (read the group, add/remove projects, write the shared design theme — but NOT membership).
-
-Returns \`{ invited: true, email, expires_at }\` (expires_at is ms epoch). Errors: VALIDATION_ERROR (bad email, bad role, self-invite), FORBIDDEN (caller is not the group owner).
+    description: `Invite member to group — sending NEW group invitations is unavailable: the call is refused with GONE (410) after the usual VALIDATION_ERROR / FORBIDDEN checks, and nothing is stored or emailed. Existing members and pending invitations are unchanged; group_invite_list, group_invite_revoke and group_invite_accept keep working.
 
 **Example:**
 
@@ -168,7 +166,7 @@ Returns \`{ invited: true, email, expires_at }\` (expires_at is ms epoch). Error
     ...common,
     definition: {
     name: 'group_invite_list',
-    description: `List pending group invites, view invites — OWNER-ONLY: list open invites for a group (not yet accepted, not expired). Returns \`{ invites: [{ email, role, invited_at, expires_at }] }\`.
+    description: `List pending group invites, view invites — Any group member can list open invites for a group (not yet accepted, not expired). Returns \`{ invites: [{ email, role, invited_at, expires_at }] }\`.
 
 **Example:**
 
@@ -213,7 +211,7 @@ Returns \`{ invited: true, email, expires_at }\` (expires_at is ms epoch). Error
     ...common,
     definition: {
     name: 'group_invite_revoke',
-    description: `Revoke group invite, cancel invite — OWNER-ONLY: revoke a PENDING invite by email (an accepted invite is membership, not an invite — see the members list in group_get). Returns \`{ revoked: true }\`. 404 NOT_FOUND if there's no pending invite for that email in this group.
+    description: `Revoke group invite, cancel invite — Any group member can revoke a PENDING invite by email (an accepted invite is membership, not an invite — the members list is in group_get). Returns \`{ revoked: true }\`. 404 NOT_FOUND if there's no pending invite for that email in this group.
 
 **Example:**
 

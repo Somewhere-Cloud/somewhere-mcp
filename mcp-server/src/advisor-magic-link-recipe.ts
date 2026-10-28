@@ -2,7 +2,7 @@ import type { AdvisorRenderedRecipe } from './advisor-recipe-types';
 
 export function magicLinkBrowserRecipe(): AdvisorRenderedRecipe {
   return {
-    explanation: 'The emailed link lands on /auth/magic. redirect_uri is the post-verification destination, not the landing page. Serve the browser source below on /auth/magic; it redeems once, queues cookies and navigates. Request a fresh link after any failed attempt. For two-user proof use separate browser contexts. CLI token redemption is an alternative API test; it consumes the link and cannot precede browser verification of the same link. No token is exposed in the API response.',
+    explanation: 'The emailed link lands on /auth/magic. redirect_uri is the post-verification destination, not the landing page. This manual example completes only non-MFA sign-in. It redeems once, queues cookies and navigates only after a session; an MFA challenge stops without cookies or navigation. Use the current SDK/starter code step for MFA. Request a fresh link after any failed attempt. For two-user proof use separate browser contexts. CLI token redemption is an alternative API test; it consumes the link and cannot precede browser verification of the same link. No session token is exposed in the API response. An MFA challenge stays in page memory; this manual UI does not complete it.',
     files: [{ path: 'api/auth/magic.ts', source: `export default async function (req, sw) {
   if (req.method !== 'POST') return new Response('method not allowed', { status: 405 });
   const body = await req.json().catch(() => null);
@@ -11,6 +11,7 @@ export function magicLinkBrowserRecipe(): AdvisorRenderedRecipe {
   }
   try {
     const session = await sw.auth.verifyOtp({ token: body.token });
+    if (session.mfa_required) return Response.json({ mfa_required: true, mfa_token: session.mfa_token }, { headers: { 'Cache-Control': 'no-store' } });
     sw.auth.setSessionCookies(session.token, session.refresh_token);
     const destination = new URL(session.redirect_uri ?? '/', req.url);
     // This example intentionally navigates only within the app.
@@ -32,7 +33,9 @@ export async function completeMagicLink() {
       headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token }),
     });
     if (!response.ok) return 'Request a new sign-in link.';
-    const { redirect } = await response.json();
+    const answer = await response.json();
+    if (answer.mfa_required) return 'Sign-in needs an authenticator or backup code. This page cannot complete that step.';
+    const { redirect } = answer;
     const destination = new URL(redirect, location.origin);
     location.assign(destination.origin === location.origin && destination.pathname !== '/auth/magic'
       ? destination.href : '/');

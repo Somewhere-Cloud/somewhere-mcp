@@ -60,12 +60,24 @@ function sourceToolSpecs(path, source) {
     : null;
 
   const visitSpecs = (node) => {
+    let array = null;
     if (ts.isCallExpression(node)
       && ts.isIdentifier(node.expression)
       && (node.expression.text === 'defineCanonicalToolSpecs' || node.expression.text === 'defineDomainToolSpecs')
       && node.arguments[0]
       && ts.isArrayLiteralExpression(unwrapExpression(node.arguments[0]))) {
-      for (const element of unwrapExpression(node.arguments[0]).elements) {
+      array = unwrapExpression(node.arguments[0]);
+    } else if (ts.isVariableDeclaration(node) && node.type && node.initializer) {
+      // Domains may declare a typed literal directly instead of using a factory.
+      const type = ts.isTypeOperatorNode(node.type) && node.type.operator === ts.SyntaxKind.ReadonlyKeyword
+        ? node.type.type : node.type;
+      const value = unwrapExpression(node.initializer);
+      if (ts.isArrayTypeNode(type) && ts.isTypeReferenceNode(type.elementType)
+        && ts.isIdentifier(type.elementType.typeName) && type.elementType.typeName.text === 'ToolSpec'
+        && ts.isArrayLiteralExpression(value)) array = value;
+    }
+    if (array) {
+      for (const element of array.elements) {
         if (!ts.isObjectLiteralExpression(element)) continue;
         const definition = resolvedProperty(element, 'definition');
         if (!definition || !ts.isObjectLiteralExpression(definition)) continue;
@@ -83,6 +95,8 @@ function sourceToolSpecs(path, source) {
         const aliasOf = stringValue(resolvedProperty(element, 'aliasOf'));
         // Hidden spec: callable but not advertised (dashboard/HIDDEN-FEATURES.md).
         const hidden = booleanValue(resolvedProperty(element, 'hidden'));
+        // One fixed operation of a multi-operation tool: advertised off `full`.
+        const operationOf = stringValue(resolvedProperty(element, 'operationOf'));
         const execute = resolvedProperty(element, 'execute');
         if (!name || !group || !surfaces || !visibility || core === null || paid === null || !annotations || !execute) {
           throw new Error(`Incomplete canonical ToolSpec in ${path}: ${name ?? '(unnamed)'}`);
@@ -90,10 +104,19 @@ function sourceToolSpecs(path, source) {
         const oauthScopes = protocol && ts.isObjectLiteralExpression(protocol)
           ? stringArray(resolvedProperty(protocol, 'oauthScopes')) ?? []
           : [];
-        const parsedAnnotations = ts.isObjectLiteralExpression(annotations)
+        const hintsOf = (object) => ts.isObjectLiteralExpression(object)
           ? Object.fromEntries(['readOnlyHint', 'destructiveHint', 'idempotentHint', 'openWorldHint']
-            .map((key) => [key, booleanValue(resolvedProperty(annotations, key))])
+            .map((key) => [key, booleanValue(resolvedProperty(object, key))])
             .filter(([, value]) => value !== null))
+          : {};
+        const parsedAnnotations = hintsOf(annotations);
+        const surfaceAnnotationsNode = protocol && ts.isObjectLiteralExpression(protocol)
+          ? resolvedProperty(protocol, 'surfaceAnnotations')
+          : null;
+        const surfaceAnnotations = surfaceAnnotationsNode && ts.isObjectLiteralExpression(surfaceAnnotationsNode)
+          ? Object.fromEntries(surfaceAnnotationsNode.properties
+            .filter((property) => ts.isPropertyAssignment(property) && propertyName(property.name))
+            .map((property) => [propertyName(property.name), hintsOf(unwrapExpression(property.initializer))]))
           : {};
         tools.push({
           name,
@@ -103,14 +126,17 @@ function sourceToolSpecs(path, source) {
           visibility,
           ...(aliasOf ? { aliasOf } : {}),
           ...(hidden ? { hidden } : {}),
+          ...(operationOf ? { operationOf } : {}),
           core,
           ...(coreRank === null ? {} : { coreRank }),
           paid,
           oauthScopes,
           annotations: parsedAnnotations,
+          surfaceAnnotations,
           hasAnnotations: ts.isObjectLiteralExpression(annotations),
           hasExecute: true,
           definitionSource: definition.getText(file),
+          protocolSource: protocol ? protocol.getText(file) : '',
           hasOutputSchema: outputSchema !== null,
           handlerSource: execute.getText(file),
           specSource: element.getText(file),

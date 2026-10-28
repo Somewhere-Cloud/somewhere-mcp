@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "somewhere": {
-      "url": "https://mcp.somewhere.tech/mcp"
+      "url": "https://mcp.somewhere.cloud/mcp"
     }
   }
 }
