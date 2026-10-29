@@ -33,7 +33,6 @@ export const ADVISOR_TOPIC_SUMMARIES: Readonly<Record<string,string>> = {
   "migration-supabase": "Move a Supabase app and its data.",
   "sw.auth": "Sign-in, sessions, OAuth, MFA and account settings.",
   "auth-client": "Browser sign-in with HttpOnly cookies.",
-  "auth-md": "AI agents register and sign in as your app's users.",
   "security-model": "Developer, project, end-user, and server authority boundaries.",
   "cors": "Your own origins already work; add a third-party origin.",
   "sw.fs": "Store, read, version, publish, sign, move, and upload files.",

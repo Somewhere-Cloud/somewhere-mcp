@@ -59,7 +59,7 @@ export function resolveProjectStarter(
   }
   const modes = mirror.catalog.ui.map((entry) => entry.id);
   if (!modes.includes(ui)) {
-    return { ok: false, message: `Unknown starter_ui ${ui}. Use one of: ${modes.join(', ')}.` };
+    return { ok: false, message: `Unknown starter_ui ${ui}. starter_ui accepts: ${modes.join(', ')}.` };
   }
   const requested = known.filter((id) => ids.includes(id));
   const selection: ProjectStarterSelection | undefined = mirror.selections[`${requested.join(',')}|${ui}`];
@@ -197,7 +197,7 @@ export function starterOutcome(prepared: { body: StarterDeployBody; report: Proj
       version: release.version,
       ...(release.releaseId ? { release_id: release.releaseId } : {}),
       url: release.url,
-      next: 'Edit the starter with project_patch (read files with project_export). AGENTS.md, README.md and the skills are returned here because deploys do not publish them.',
+      next: 'project_patch edits the starter and project_export reads its files. AGENTS.md, README.md and the skills are returned here because deploys do not publish them.',
     };
   }
   const payload = { tool: 'project_deploy' as const, args: { project_id: prepared.body.project_id, base_release_id: prepared.body.base_release_id, files: prepared.body.files, functions: prepared.body.functions } };

@@ -124,9 +124,6 @@ import {
   SECURITY_REVIEW_FOCUS_CHARS,
   SECURITY_REVIEW_DAILY_LOOKBACK_HOURS,
   SECURITY_REVIEW_HISTORY_MAX_LIMIT,
-  AUTH_MD_CLAIM_MINUTES,
-  AUTH_MD_PRE_CLAIM_SCOPES_INLINE,
-  AUTH_MD_POST_CLAIM_SCOPES_INLINE,
   PREFETCH_BUDGET_SECONDS,
   PREFETCH_MAX_KIB,
   BROWSER_RUN_MAX_SECONDS,
@@ -6514,9 +6511,7 @@ A password sign-up (\`sw.auth.signup\`, \`signupWithCookie\`, the REST route or
 - an **email verification code** (template \`email_verification\`).
 
 Two project settings change this. Set them with \`project_update\` or
-\`PATCH /v1/projects/:id\`; both are read back on the project. A third,
-\`auth_hosted_signup: true\`, lets the hosted sign-up page create accounts
-for the project without your backend; it is \`false\` by default:
+\`PATCH /v1/projects/:id\`; both are read back on the project:
 
 - \`auth_welcome_email: false\` stops the welcome email. Nothing else changes.
 - \`auth_signup_verification: "on_request"\` sends no code at sign-up. Your app
@@ -7529,26 +7524,6 @@ REST: GET /v1/auth/users/:id/sessions, DELETE /v1/auth/sessions/:id,
 DELETE /v1/auth/users/:id/sessions
 MCP: auth_list_sessions, auth_revoke_session, auth_revoke_all_sessions
 
-## Hosted auth pages — advanced manual-token compatibility
-
-This is not the browser default. It exists for apps intentionally implementing
-manual token mode:
-
-  https://auth.somewhere.cloud/login?project_id=...&redirect=https://yourapp.somewhere.site/
-
-Pages: \`/login\`, \`/signup\`, \`/forgot-password\`, \`/reset\`,
-\`/verify-email\`, \`/magic-link\`, \`/mfa\`.
-
-The hosted login and magic-link landing ask for the second factor inline. Their ticket stays in page memory. The hosted \`/signup\` form creates accounts only for a project that sets \`auth_hosted_signup: true\`; for any other project it answers \`403 HOSTED_SIGNUP_DISABLED\` and creates nothing, so create users through your app's authenticated backend route, as the starter does. Hosted sign-ups follow the same rules as \`sw.auth.signup\`: attempt limits, password checks, the project's CAPTCHA setting and the sign-up emails. Requesting a magic link, password recovery and email verification also still require that backend route; the hosted forms are not a complete replacement for the starter.
-
-On success the page redirects to \`redirect\` with
-\`#access_token=...&refresh_token=...\` in the URL hash. Your SPA reads
-\`location.hash\`, stores the tokens in localStorage, and replaces
-history. This deliberately puts credentials in page JavaScript. Browser apps
-should use the httpOnly cookie-session path in
-\`docs({ topic: 'auth-client' })\` instead. The pages POST directly to
-\`api.somewhere.cloud\` — no business logic lives on the auth subdomain.
-
 ## Lifecycle webhook (clean up your own tables on user delete)
 
 Deleting a user removes their platform account and sessions. Your app must
@@ -7908,8 +7883,8 @@ re-implemented something that already exists.
 ## Auth emails
 
 Password reset, email verification, sign-in link, invitation and welcome
-emails are platform email — they're sent from a platform-owned address (noreply@somewhere.tech)
-on every project's behalf. No setup required: every project gets working
+emails are platform email — they're sent from a platform-owned address (noreply@somewhere.cloud)
+on every project's behalf, unless the project has a verified sender domain. No setup required: every project gets working
 auth out of the box.
 
 Customize the subject + HTML in dashboard Settings → Email Templates
@@ -7922,219 +7897,6 @@ uses the same zero-setup sender but reaches only this project's users and its
 owner; to bring in someone new, use \`sw.auth.invite\` (Invitations above).
 Add a verified sender domain to email anyone else, to use your own From
 address, or for marketing mail. Auth emails always use the platform sender.
-`,
-
-  'auth-md': `# auth.md — letting AI agents register as end-users
-
-A REST protocol surface that lets an AI agent register itself as an
-end-user of your app, get a human to claim it, and hold its own access
-token — separate from the human's own login.
-
-**Off by default, per project.** Turn it on with:
-
-\`\`\`
-PATCH /v1/projects/:id
-{ "auth_md_enabled": true }
-\`\`\`
-
-Use the project update endpoint with editor or owner access. The CLI's
-\`somewhere api\` command and MCP's \`api\` tool can call it; MCP writes
-require \`confirm: true\`. There is no dashboard control for these fields.
-When disabled, the endpoints below return 404 \`AUTH_MD_DISABLED\`.
-
-## Decide what agents may do
-
-Registrations record \`auth_md_pre_claim_scopes\` before a human claims them
-and \`auth_md_post_claim_scopes\` afterwards. Their defaults are
-${AUTH_MD_PRE_CLAIM_SCOPES_INLINE} and ${AUTH_MD_POST_CLAIM_SCOPES_INLINE}.
-
-The platform enforces three of these scopes on what it does as the agent, read
-from the agent's current registration (narrowing them takes effect on its next
-call):
-
-- \`auth:me\` — the agent reads its own identity (\`GET /v1/auth/me\`, the only
-  platform route an agent token can call directly).
-- \`db:read\` and \`db:write\` — the agent's own rows through your app's generated
-  data client and \`sw.db\` acting as the signed-in user. Every statement needs the
-  scope its kind requires (reads need \`db:read\`; inserts, updates and deletes
-  need \`db:write\`), and a request is refused before any statement runs.
-- \`*\` grants those three only.
-
-Any other scope you configure is recorded for your app to check; the platform
-does not enforce it. Other platform operations performed as the agent (files,
-groups, payments, jobs, push, inbox, share links and claims) are refused with 403
-\`AGENT_OPERATION_NOT_PERMITTED\`. Owner tables keep the agent's rows separate
-from other users' rows either way.
-
-These scopes do not limit your own server functions or anything they do with
-your app's own access (for example \`sw.db.query\`, \`fetch\`, AI or email). An
-active agent, claimed or not, can call your functions as its own signed-in user.
-For work that requires a human claim or an agent permission, require a user
-with \`sw.auth.requireUser(req)\`. Check
-\`user.type === 'agent'\` before reading \`user.agent.claim_state\` and
-\`user.agent.scopes\`; human users have no \`user.agent\`. These fields also
-appear in \`GET /v1/auth/me\`.
-
-Omit \`scopes\` at registration or claim to receive the configured list. A
-request is narrowed to its overlap with that list; if nothing overlaps, it is
-refused with 400 \`INVALID_SCOPE\` and nothing is created or claimed. Send
-\`scopes\` once, as an array or a space-separated string. Read the returned
-\`scope\`, not the list you asked for.
-
-## Discovery
-
-- \`GET /v1/auth/auth.md?project_id=<id>\` — a machine-readable description of this
-  project's agent-auth surface, meant to be fetched by an agent
-  deciding how to authenticate.
-- \`GET /v1/auth/.well-known/oauth-protected-resource?project_id=<id>\` /
-  \`GET /v1/auth/.well-known/oauth-authorization-server?project_id=<id>\` — standard
-  OAuth discovery metadata scoped to this project.
-
-## Registration and claiming
-
-\`POST /v1/auth/agent/identity\` — an agent self-registers. Body:
-\`{ project_id, type?, scopes?, agent_platform?, agent_name? }\`.
-\`type\` is \`"anonymous"\` (default) or \`"service_auth"\` (starts in a
-pending-claim state); \`type: "identity_assertion"\` is not accepted and
-returns 501. Response includes:
-
-- \`identity_assertion\` — a short-lived signed JWT the agent holds.
-- \`claim_token\` / \`user_code\` — hand these to a human to approve the
-  registration.
-- \`verification_uri\` / \`verification_uri_complete\` — the claim endpoint
-  below, and the same URL with \`project_id\` and \`user_code\` filled in.
-  There is no hosted claim page; your app collects the code.
-
-\`POST /v1/auth/agent/identity/claim\` — called as a signed-in human
-app-user. Body: \`{ project_id, claim_token, user_code, scopes? }\`.
-Moves the registration from anonymous/pending into \`claimed\` and
-re-scopes it to \`auth_md_post_claim_scopes\` using the rule above.
-
-## Tokens
-
-\`POST /v1/auth/oauth2/token\` — exchange for an access token. Two grant
-types:
-
-- \`urn:ietf:params:oauth:grant-type:jwt-bearer\` with \`assertion\` — trade
-  the \`identity_assertion\` from registration for a token.
-- \`urn:somewhere:auth-md:grant-type:claim-token\` with \`claim_token\` —
-  trade a claimed registration's claim token for a token. Single-use:
-  the claim token is cleared once redeemed. Returns 428
-  \`AUTHORIZATION_PENDING\` if the human hasn't claimed it yet.
-
-\`POST /v1/auth/oauth2/revoke\` — revoke an agent's token and end its
-session (body: \`{ token }\`).
-
-## Walkthrough: register, claim, call, revoke
-
-Use your project ID or subdomain in place of \`my-app\`. Save returned tokens
-in local environment variables named below; keep them out of chat and logs.
-\`PERSON_ACCESS_TOKEN\` is the signed-in person's app token, and
-\`APP_URL\` is your app's public URL.
-
-**1. The agent registers.** No credentials are needed while auth.md is on.
-
-\`\`\`bash
-curl -sS https://api.somewhere.cloud/v1/auth/agent/identity \\
-  -H 'Content-Type: application/json' \\
-  -d '{"project_id":"my-app","agent_name":"Research helper"}'
-# 201 → { "identity_assertion", "registration_id", "agent_user_id",
-#        "claim_state": "anonymous", "claim_token", "user_code",
-#        "verification_uri", "verification_uri_complete", "scope", "expires_in" }
-\`\`\`
-
-The agent keeps \`claim_token\` and shows its person the \`user_code\` and
-\`claim_token\`. Claim and redeem within ${AUTH_MD_CLAIM_MINUTES} minutes of registration.
-After that window, register again, even if the token endpoint still answers
-\`428 AUTHORIZATION_PENDING\`. Only the agent redeems the claim token; the person's app uses it only in
-the claim request.
-
-**2. A signed-in person claims it.** The claim endpoint accepts only an
-app-user token in \`Authorization: Bearer\`; it ignores session cookies, and
-\`sw.auth\` has no claim method. A browser app on cookie sessions therefore
-cannot send this request. Send it from a client that signs in with tokens
-(the manual token mode in \`auth-client\`):
-
-\`\`\`bash
-curl -sS https://api.somewhere.cloud/v1/auth/agent/identity/claim \\
-  -H "Authorization: Bearer $PERSON_ACCESS_TOKEN" \\
-  -H 'Content-Type: application/json' \\
-  -d "{\\"project_id\\":\\"my-app\\",\\"claim_token\\":\\"$CLAIM_TOKEN\\",\\"user_code\\":\\"$USER_CODE\\"}"
-# 200 → { "ok": true, "data": { "identity_assertion", "claim_state": "claimed", "scope", "agent_user_id", … } }
-\`\`\`
-
-The person's client should discard the returned \`identity_assertion\`; it is
-also a credential. The agent redeems with its own \`claim_token\`.
-
-**3. The agent redeems its claim token.** Before the claim this answers 428
-\`AUTHORIZATION_PENDING\`; wait for the person to confirm their claim before
-redeeming. The claim token works once:
-a second redemption answers 400 \`INVALID_GRANT\`.
-
-\`\`\`bash
-curl -sS https://api.somewhere.cloud/v1/auth/oauth2/token \\
-  -H 'Content-Type: application/json' \\
-  -d "{\\"project_id\\":\\"my-app\\",\\"grant_type\\":\\"urn:somewhere:auth-md:grant-type:claim-token\\",\\"claim_token\\":\\"$CLAIM_TOKEN\\"}"
-# 200 → { "access_token", "token_type": "Bearer", "expires_in", "scope",
-#        "registration_id", "agent_user_id", "claim_state": "claimed" }
-\`\`\`
-
-There is no refresh token. When \`expires_in\` runs out, the agent registers
-and is claimed again.
-
-**4. The agent calls your app.** It sends \`Authorization: Bearer
-$AGENT_ACCESS_TOKEN\` to your function, which decides what an agent may do:
-
-\`\`\`ts
-// api/agent-check.ts
-export default async function agentCheck(
-  request: Request,
-  sw: SomewhereRuntimeContext,
-): Promise<Response> {
-  const user = await sw.auth.requireUser(request); // 401 without a valid token
-  if (user.type !== 'agent') return Response.json({ caller: 'person', id: user.id });
-
-  // Scope labels are metadata; this function decides what each one allows.
-  const agent = user.agent ?? {};
-  const scopes = Array.isArray(agent.scopes)
-    ? agent.scopes.filter((scope): scope is string => typeof scope === 'string')
-    : [];
-  if (agent.claim_state !== 'claimed' || !scopes.includes('db:write')) {
-    return Response.json({ error: 'A person must claim this agent before it can write.' }, { status: 403 });
-  }
-  return Response.json({ caller: 'agent', id: user.id, claimed_by: agent.created_by_user_id ?? null, scopes });
-}
-\`\`\`
-
-Save \`access_token\` from step 3 as \`AGENT_ACCESS_TOKEN\`. Deploy the
-handler with \`somewhere deploy\`, then call it:
-
-\`\`\`bash
-curl -sS "$APP_URL/api/agent-check" \\
-  -H "Authorization: Bearer $AGENT_ACCESS_TOKEN"
-# 200 with caller: "agent", the agent id and the person who claimed it
-\`\`\`
-
-**5. Revoke it.** Whoever holds the agent's access token can end the
-registration:
-
-\`\`\`bash
-curl -sS https://api.somewhere.cloud/v1/auth/oauth2/revoke \\
-  -H 'Content-Type: application/json' \\
-  -d "{\\"token\\":\\"$AGENT_ACCESS_TOKEN\\"}"
-# 200 → { "ok": true, "data": { "revoked": true } }
-\`\`\`
-
-After that, the agent's requests to your app answer 401 and it cannot get a new
-token for this registration.
-
-## Not available
-
-\`POST /v1/auth/agent/event/notify\` is not available and returns 501 —
-signed provider-event revocation is not part of the surface. Use
-\`oauth2/revoke\` for revoking a token.
-
-Related: \`sw.auth\`, \`security-model\`.
 `,
 
   'auth-client': `# Auth on the client — the correct session code
@@ -11829,8 +11591,7 @@ Cancellation prevents later steps and cannot undo work already running.
 
 Start with \`recipe-ai-agent\`; see \`recipe-escalation\` and \`recipe-multi-chat\`
 for model escalation and conversation UI. History and compaction use the
-\`sw.ai\` conversation options passed through each step. To let an outside AI
-agent sign in to your app as its own end user, see \`auth-md\`.
+\`sw.ai\` conversation options passed through each step.
 
 \`\`\`js
 const result = await sw.agent.run({
@@ -18252,7 +18013,7 @@ looks stale, it's almost always one of:
 ## 8. Auth emails not arriving
 
 The platform sends auth emails (signup confirmation, password reset)
-from \`noreply@somewhere.tech\` by default. That domain is not on your
+from \`noreply@somewhere.cloud\` by default. That domain is not on your
 project — it's the platform's. Some email providers flag it as
 suspicious because the sending domain doesn't match your app's domain.
 
@@ -18732,7 +18493,7 @@ your app's users: to stop one user spending the project's allowance, add
 
 Two common causes:
 
-**Sender not verified** — The platform sends from \`noreply@somewhere.tech\`
+**Sender not verified** — The platform sends from \`noreply@somewhere.cloud\`
 by default. Some inboxes flag this as suspicious. Add a verified
 sender domain in the project’s Domains tab, then auth emails come
 from your own domain.
@@ -19013,7 +18774,7 @@ instead of guessing what to call next:
   "error": "VERSION_CONFLICT",
   "message": "Another deploy landed since your last pull. Current version is 14, you sent expected_version 13. Re-fetch the project state and redeploy.",
   "data": { "current_version": 14, "expected_version": 13 },
-  "hint": "Try docs({ topic: 'deploy' }) for usage details. If you believe this error is wrong, call support_ticket({ message: '...' }) and you'll get a ticket_id you can check with support_ticket({ ticket_id }). Ask the advisor: somewhere advisor \\"<what you were doing> — <error code>\\" (or advisor({ question }) over MCP)."
+  "hint": "Usage details: docs({ topic: 'deploy' }). Platform bug reports: support_ticket({ message }) returns a ticket_id, and support_ticket({ ticket_id }) returns its response. Advisor: somewhere advisor \\"<what you were doing> — <error code>\\" (or advisor({ question }) over MCP) explains this error from its code."
 }
 \`\`\`
 

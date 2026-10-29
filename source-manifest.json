@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "source_repository": "somewhere-cloud/somewhere-tech",
-  "source_ref": "60a3b19fc4c1be6d3f96c7e97188379476579bc9",
-  "source_sha": "60a3b19fc4c1be6d3f96c7e97188379476579bc9",
+  "source_ref": "36cbd1862fb21fc38c0be0ed1ffcd07c3c2c3f9f",
+  "source_sha": "36cbd1862fb21fc38c0be0ed1ffcd07c3c2c3f9f",
   "files": {
     ".cursor-plugin/plugin.json": {
       "bytes": 465,
@@ -17,16 +17,16 @@
       "sha256": "c427f858b8237605799191a2fb595b1660d619b00df6870b447cada6bee943a6"
     },
     "LICENSE": {
-      "bytes": 1079,
-      "sha256": "e17fa72e61c80ed66dfaba562182aa658fd95f3201770b9b07c520c9e100a4d7"
+      "bytes": 1075,
+      "sha256": "6ac92a23d255cf79d9b2c70713e26d31f253ddfdbb2be40be5b657d9e5443dcc"
     },
     "mcp-server/scripts/registered-tool-source.mjs": {
       "bytes": 8185,
       "sha256": "56b5569b7bc050adaf03c69db4a1536fef042e968ecce30aaff475291c60121e"
     },
     "mcp-server/scripts/test-claude-directory.mjs": {
-      "bytes": 25233,
-      "sha256": "2c575794793c9138fd7d63422a41bab57ad745896136ee38d9a3fcd62ed686ed"
+      "bytes": 25284,
+      "sha256": "7d21f51ac532611ea0705e1455b15b4edfd13ed55be976ce9eece3dda5377b19"
     },
     "mcp-server/scripts/test-json-rpc-response-envelope.mjs": {
       "bytes": 4856,
@@ -113,8 +113,8 @@
       "sha256": "2fb023e366765ae32864ce0ea68c881046478d98e4d6dd74890649b4ae120626"
     },
     "mcp-server/src/advisor-topic-catalog.ts": {
-      "bytes": 6602,
-      "sha256": "f4efe09657a1d6c4f9a6890f68943bd64065035c7a0c4d42bf106a9db9827abf"
+      "bytes": 6534,
+      "sha256": "e727cd4c2b95d38d7c96b46754854100e3790b66f3f9bed75a77961033f7ee3a"
     },
     "mcp-server/src/advisor-workflows.ts": {
       "bytes": 2324,
@@ -157,8 +157,8 @@
       "sha256": "4dbf714c81fad499ecc7c69c03838df32f9ad3bf1bae6501198bcc2b57a8cf94"
     },
     "mcp-server/src/docs-summary-leads.ts": {
-      "bytes": 6351,
-      "sha256": "114897d932e90a174931e3a3a9828f23356e94339904dba2bef2f3371bfbb425"
+      "bytes": 6325,
+      "sha256": "196f7ed78e04e706ee443bcb138ebae0eb0e22447f1dd2fe26f279b76af6c93f"
     },
     "mcp-server/src/docs-topic-synonyms.ts": {
       "bytes": 1564,
@@ -169,12 +169,12 @@
       "sha256": "8e425a4b6dffb108dab1a585ed01ae9a59e70c0d5ee8cd5eed349aca11b392c0"
     },
     "mcp-server/src/file-upload.ts": {
-      "bytes": 17053,
-      "sha256": "3a3e5042635b048040bc273ad0f7decb59be70f974fb8f00b6a704b1e62102f2"
+      "bytes": 17106,
+      "sha256": "488286498483db63cc5db547e914232d0ffeeb247d3c3e33aff6f96368a90db5"
     },
     "mcp-server/src/index.ts": {
-      "bytes": 1009962,
-      "sha256": "f2d0f6b7051abd8522e6a42cec675093f72f51a666d309f382201de3feb1d124"
+      "bytes": 1010536,
+      "sha256": "7286806ace0b2a9444a46389450f71bdb81699c90eacb47da0485aa825e6e9f2"
     },
     "mcp-server/src/internal-api-url.ts": {
       "bytes": 3155,
@@ -185,12 +185,12 @@
       "sha256": "816fc9134351fbaaa06fc7075b86035213520a04a2dcb8d5d5d757e5746bc1fb"
     },
     "mcp-server/src/platform-help-derived.ts": {
-      "bytes": 562502,
-      "sha256": "42d6ded10313bbc16b5868e4f3b8aae2672ba2472ac6648fad0755e415d9df96"
+      "bytes": 556738,
+      "sha256": "b7ca3baac74e368231aec12fbac681fae0cc4c7efc77fa4c19cd531cb9fee6b8"
     },
     "mcp-server/src/platform-help.ts": {
-      "bytes": 1239713,
-      "sha256": "fa89775b14c686157a775914c622baed73ddc306e887051e2ffab685dd3274f0"
+      "bytes": 1228313,
+      "sha256": "f9a8be4d0237d3f5f40987ab7dbeae4ee5cc221440ab7e05e08f091059c8fef1"
     },
     "mcp-server/src/platform-urls.ts": {
       "bytes": 2395,
@@ -213,8 +213,8 @@
       "sha256": "a806841c779a4246246a59f47e4c41e115dd96b04f511f7d15e3f6a8f64706d0"
     },
     "mcp-server/src/project-starter.ts": {
-      "bytes": 12920,
-      "sha256": "9db77c6c9bcbe63fe59060ecd65727bd0bd3e5e4237c4ed905e3eebe82b4d30e"
+      "bytes": 12926,
+      "sha256": "f7e045746d90d5cb682f031f10fc5ce256b76ae067bdef80a81c781d9d1226b6"
     },
     "mcp-server/src/protocol-2026.ts": {
       "bytes": 16840,
@@ -333,8 +333,8 @@
       "sha256": "a9170ea1a839fd0ed08e450268df0d979627c88f9a8583e81aca47a5d01ef936"
     },
     "shared/repro-guidance.ts": {
-      "bytes": 15040,
-      "sha256": "e8e62e575c9ce625956b5b7a671b0ec35ed9ef61d50770ae0596cfed625ed64d"
+      "bytes": 15144,
+      "sha256": "024953fe37511cee3f667c42ee5acf1708e921758f2c7d24cad7cb50787835c2"
     },
     "worker/src/generated/mcp-tool-names.ts": {
       "bytes": 83661,

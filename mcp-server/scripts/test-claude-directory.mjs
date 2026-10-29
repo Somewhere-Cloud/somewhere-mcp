@@ -23,7 +23,7 @@ const env = { SOMEWHERE_TECH_ADMIN_KEY: 'fixture-only', API_SERVICE: { async fet
     ok: false,
     error: 'UPSTREAM_ERROR',
     message: 'Fixture platform failure.',
-    hint: "Likely platform issue. Try docs({ topic: 'troubleshooting' }) for context, and if this still looks wrong call support_ticket({ message: '...' }).",
+    hint: "Likely a platform issue. Context: docs({ topic: 'troubleshooting' }). Platform bug reports: support_ticket({ message }) returns a ticket_id, and support_ticket({ ticket_id }) returns its response.",
     next_call: {
       tool: 'support_ticket',
       args_skeleton: { message: '...' },

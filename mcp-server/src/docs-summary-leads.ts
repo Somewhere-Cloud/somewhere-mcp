@@ -107,7 +107,6 @@ export const DOCS_TOPIC_KINDS: Readonly<Record<string, DocsTopicKind>> = Object.
   'sw.fs': 'reference',
   'file-tools': 'reference',
   'sw.auth': 'reference',
-  'auth-md': 'reference',
   'auth-client': 'reference',
   projects: 'reference',
   'project-groups': 'reference',

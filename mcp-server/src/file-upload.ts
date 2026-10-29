@@ -13,11 +13,11 @@ export const SINGLE_REQUEST_MAX_BYTES = 90 * 1024 * 1024;
 
 /** The part-upload steps behind multipart_url, in the words of the sw.fs docs. */
 export const MULTIPART_UPLOAD_GUIDANCE = Object.freeze({
-  when: "One request carries at most 100 MB. A bigger file (up to the plan's per-file limit) goes up in parts through multipart_url: start, send each part, then complete. Pass size_bytes to fs_upload and it starts the upload for you.",
-  start: 'POST multipart_url with JSON { size_bytes, content_type } → { upload_id, part_size, part_count, parts_url, complete_url, abort_url, expires_at }.',
-  parts: 'PUT each part n = 1..part_count to parts_url + "/" + n. Every part except the last is exactly part_size bytes (at most 90 MB).',
-  complete: 'POST complete_url → { path, size_bytes, content_type, version }.',
-  notes: "Starting uses up the URL. An upload not completed within 6 hours is discarded, parts included; DELETE abort_url discards it sooner. A file over the plan's limit is refused at start with PAYLOAD_TOO_LARGE.",
+  when: "One request carries at most 100 MB. A bigger file (up to the plan's per-file limit) goes up in parts through multipart_url: a start, one request per part, then a completion. fs_upload with size_bytes starts that upload itself.",
+  start: 'The start is a POST to multipart_url with JSON { size_bytes, content_type } → { upload_id, part_size, part_count, parts_url, complete_url, abort_url, expires_at }.',
+  parts: 'Each part n = 1..part_count is a PUT to parts_url + "/" + n. Every part except the last is exactly part_size bytes (at most 90 MB).',
+  complete: 'The completion is a POST to complete_url → { path, size_bytes, content_type, version }.',
+  notes: "Starting uses up the URL. An upload not completed within 6 hours is discarded, parts included; a DELETE to abort_url discards it sooner. A file over the plan's limit is refused at start with PAYLOAD_TOO_LARGE.",
 });
 
 const MIME_BY_EXTENSION: Readonly<Record<string, string>> = Object.freeze({

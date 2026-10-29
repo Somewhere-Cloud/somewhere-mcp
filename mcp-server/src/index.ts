@@ -1078,18 +1078,18 @@ function captureHelpResult(): ToolUpstreamResult {
         { action: 'fill', fields: { selector: '#email', value: 'a@b.co' }, note: 'replaces the value in one step (the page gets real input events; React controlled inputs see it); steps[].value.readback gives only the length and whether it matches, never the value' },
         { action: 'type', fields: { selector: '#search', value: 'pir' }, note: 'key by key (keydown/keyup per character, in order) — only when the page reacts to individual keys; slower than fill' },
         { action: 'upload', fields: { selector: '#avatar', file: 'data:image/png;base64,...', name: 'avatar.png (optional)' }, note: 'CLI accepts a local path; hosted calls send base64/data URL bytes' },
-        { action: 'upload', fields: { selector: '#video', fs_path: '/uploads/big.mp4', name: 'clip.mp4 (optional)', type: 'video/mp4 (optional)' }, note: 'a file already in project files, up to 50 MB per call, streamed into the page; send file OR fs_path, not both' },
+        { action: 'upload', fields: { selector: '#video', fs_path: '/uploads/big.mp4', name: 'clip.mp4 (optional)', type: 'video/mp4 (optional)' }, note: 'a file already in project files, up to 50 MB per call, streamed into the page; file and fs_path are mutually exclusive' },
         { action: 'press', fields: { key: 'Enter', selector: '#email (optional)' } },
         { action: 'select', fields: { selector: '#plan', value: 'pro' } },
         { action: 'hover', fields: { selector: '.menu' } },
         { action: 'wait_for', fields: { selector: '.dashboard' }, note: 'wait until an element appears' },
         { action: 'wait_for', fields: { selector: '#status', contains: 'Ready', timeout: 30000 }, note: 'BLOCK until the element TEXT contains the string; ERRORS at timeout (ms, default 15000, max 45000) — never a false-green' },
         { action: 'wait_for', fields: { settled: true, frame: 'preview', timeout: 30000, idle_ms: 600 }, note: 'block until the TARGET FRAME DOM stops mutating — THE signal for content streaming into an iframe (network_idle never fires on a long-lived fetch)' },
-        { action: 'wait_for', fields: { network_idle: true, idle_ms: 500 }, note: 'block until no in-flight requests; NORMAL pages only — a streaming/long-lived fetch never goes idle, use settled' },
+        { action: 'wait_for', fields: { network_idle: true, idle_ms: 500 }, note: 'block until no in-flight requests; NORMAL pages only — a streaming/long-lived fetch never goes idle, and settled covers that case' },
         { action: 'wait_for', fields: { text: 'All loaded' }, note: 'block until the text appears anywhere in the page/frame' },
         { action: 'wait_for', fields: { text_gone: 'Loading…' }, note: 'block until the text disappears' },
         { action: 'wait_for', fields: { url: '/dashboard' }, note: 'block until the page URL contains the substring' },
-        { action: 'wait_for', fields: { predicate: 'window.__ready === true' }, note: 'block until the JS expression returns truthy (reuses eval; add frame to scope it)' },
+        { action: 'wait_for', fields: { predicate: 'window.__ready === true' }, note: 'block until the JS expression returns truthy (reuses eval; frame scopes it)' },
         { action: 'wait', fields: { ms: 20000 }, note: 'fixed pause (max 45000), for a slow stream' },
         { action: 'eval', fields: { script: 'document.body.innerText' }, note: 'run JS, value comes back in steps[].value as JSON' },
         { action: 'snapshot', fields: { frame: 'preview (optional)' }, note: 'structured page-as-text (a11y roles + names) in steps[].value — the cheap default read vs a screenshot' },
@@ -1316,7 +1316,7 @@ For admin/operator callers the same response also includes every registered plai
         const defaultSurfaceTools = listedNamesForSurface(surface, [], includeAdmin);
         const docsToolName = 'docs';
         const advisorStep = surfaceTools.has('advisor')
-          ? " For open-ended architecture help, call advisor({ question })."
+          ? " advisor({ question }) answers open-ended architecture questions."
           : '';
         const decorateCatalogTool = (tool: MCPTool) => {
           const constrained = constrainToolDefinitionToSurface(tool, surface);
@@ -1410,7 +1410,7 @@ For admin/operator callers the same response also includes every registered plai
                 ? `Every result is advertised by default on the ${surface} surface.`
                 : `Results outside the default ${surface} surface name the exact tool group to advertise via ?groups= or Mcp-Tool-Groups.`
               : 'No tool matched — try a capability word ("signup", "upload", "rollback") or call catalog() with no args for the full group index.'),
-            next_step: `For HOW to build with any of these surfaces, call ${docsToolName}({ topic }) — the tool list shows the verbs; ${docsToolName} is the manual.${advisorStep}`,
+            next_step: `${docsToolName}({ topic }) documents how each of these surfaces is built; the tool list shows the verbs and ${docsToolName} is the manual.${advisorStep}`,
           }, null, 2) }] };
         }
         // Lazy-load: `load` returns the full tool definitions for one or
@@ -1477,12 +1477,12 @@ For admin/operator callers the same response also includes every registered plai
         const catWithNext = {
           ...cat,
           ...(operatorRegistry ?? {}),
-          next_step: `Found your tools. For HOW to build with any surface, call ${docsToolName}({ topic }) — the tool list shows the verbs; ${docsToolName} is the manual.${advisorStep}`,
+          next_step: `${docsToolName}({ topic }) documents how each surface is built; the tool list shows the verbs and ${docsToolName} is the manual.${advisorStep}`,
         };
         if (emitMode === 'chatgpt') {
           const n = Object.keys(cat.categories).length;
           return {
-            content: [{ type: 'text', text: `✓ Tool catalog · ${n} categories · ${cat.total_tools} tools. For HOW to build with any surface, call ${docsToolName}({ topic }).` }],
+            content: [{ type: 'text', text: `✓ Tool catalog · ${n} categories · ${cat.total_tools} tools. ${docsToolName}({ topic }) documents how each surface is built.` }],
             structuredContent: catWithNext,
           };
         }
@@ -1694,9 +1694,9 @@ A durable start returns a run handle. Resuming that handle begins or recovers th
   {
     definition: {
     name: 'advisor_start',
-    description: `Ask how to build or diagnose something using the current public platform contracts. It takes the question and the facts for the Advisor to use. It cannot read your projects, account, files or earlier conversations, fetch URLs, or call tools, and its answer is advice, not executed actions.
+    description: `Answers how to build or diagnose something from the current public platform contracts. It takes the question and the facts for the Advisor to use. It cannot read your projects, account, files or earlier conversations, fetch URLs, or call tools, and its answer is advice, not executed actions.
 
-The question is recorded with your account. Depending on platform configuration the call either sends the question to the model provider and returns the advice, or saves a durable run and returns its run_id without starting inference; in that case call advisor_resume with the run_id.`,
+The question is recorded with your account. Depending on platform configuration the call either sends the question to the model provider and returns the advice, or saves a durable run and returns its run_id without starting inference; in that case advisor_resume with that run_id starts the inference.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -1741,7 +1741,7 @@ The question is recorded with your account. Depending on platform configuration 
   {
     definition: {
     name: 'advisor_resume',
-    description: 'Begin or continue the inference for a durable Advisor run returned by advisor_start, sending its saved question to the model provider. After a timeout, resume the same run_id rather than asking again; this never starts a replacement run.',
+    description: 'Begin or continue the inference for a durable Advisor run returned by advisor_start, sending its saved question to the model provider. After a timeout the same run_id continues the run; this never starts a replacement run, while asking again creates a new one.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1919,7 +1919,7 @@ Shared projects: you can deploy, edit files, run db migrations, send email, and 
               showing: projectsArr.length,
               total: total ?? undefined,
               more: true,
-              hint: 'More projects exist — pass offset to page, q to filter by name/subdomain, tag to filter by organization label, or fields:"full" for the complete record.',
+              hint: 'More projects exist: offset pages through them, q filters by name/subdomain, tag filters by organization label, and fields:"full" returns the complete record.',
             };
           }
           return {
@@ -2230,7 +2230,7 @@ New projects use declared data: tables and access rules live in \`db/schema.ts\`
     visibility: 'authenticated',
     paid: false,
     surfaces: ["full","connector","chatgpt"],
-    protocol: { surfaceAnnotations: { chatgpt: { openWorldHint: true }, connector: { destructiveHint: true } }, surfaceDescriptions: { connector: "Create a Somewhere project with a name and optional subdomain in the connected account. It starts with the same starter somewhere init writes (React + TypeScript, sign-in, styled views and design tokens), deployed as its first release; the response reports the deploy and returns the starter's AGENTS.md contract, README file map and skills index. starter: \"none\" creates an empty project. starter.status is deployed, preview, failed or unknown, with recovery steps for the last two. If the response is lost, find the project with project_get or project_list before creating again. Tables are defined in db/schema.ts and deployed as raw source." }, oauthScopes: ['mcp'] },
+    protocol: { surfaceAnnotations: { chatgpt: { openWorldHint: true }, connector: { destructiveHint: true } }, surfaceDescriptions: { connector: "Create a Somewhere project with a name and optional subdomain in the connected account. It starts with the same starter somewhere init writes (React + TypeScript, sign-in, styled views and design tokens), deployed as its first release; the response reports the deploy and returns the starter's AGENTS.md contract, README file map and skills index. starter: \"none\" creates an empty project. starter.status is deployed, preview, failed or unknown, with recovery steps for the last two. After a lost response the project can already exist: project_get and project_list return it by subdomain, and a repeated call with that subdomain returns SUBDOMAIN_TAKEN. Tables are defined in db/schema.ts and deployed as raw source." }, oauthScopes: ['mcp'] },
     execute: async (runtime, args) => {
       const { fetcher, env, authHeader, ctx, toolName } = runtime;
       let result: ToolUpstreamResult;
@@ -2269,7 +2269,7 @@ New projects use declared data: tables and access rules live in \`db/schema.ts\`
           const data = body.data;
           if (data && typeof data === 'object' && !Array.isArray(data)) {
             Object.assign(data, { schema_mode: 'managed', schema_path: 'db/schema.ts',
-              schema_guidance: "Declare tables and access rules in db/schema.ts and deploy raw source; no db_migrate call is needed. Pages use the generated somewhere:data client: docs({ topic: 'declared-data', section: 'declare-a-table-and-use-it' })." });
+              schema_guidance: "Tables and access rules are declared in db/schema.ts and deployed as raw source; no db_migrate call is needed. Pages use the generated somewhere:data client: docs({ topic: 'declared-data', section: 'declare-a-table-and-use-it' })." });
             const created = data as Record<string, unknown>;
             if (starterFeatures !== 'none' && typeof created.id === 'string') {
               const prepared = prepareProjectStarter({ projectId: created.id, appName: args.name.trim(), features: starterFeatures, ui: starterUi });
@@ -2579,7 +2579,7 @@ The default workflow has one environment: read production source, check, deploy 
         expected_version: { oneOf: [{ type: 'number' }, { type: 'string', enum: ['latest'] }], description: 'Optional extra check on the deploy counter, separate from the required base_release_id. A number returns 409 VERSION_CONFLICT when the counter differs; "latest" or omission skips only this extra check.' },
         base_version: { type: 'number', description: 'Optional stale-base guard containing the version from the preceding deploy or export response. A 409 STALE_BASE indicates a remote project change and requires reviewing project_diff_versions before a forced retry.' },
         base_release_id: { type: ['string', 'null'], description: 'Release id the deployed source was prepared from: the active_release_id returned with that project_export, or null when the project had no source. Required on every live deploy and on the first preview snapshot. A missing base returns 400 BASE_REQUIRED; a base that is no longer live returns 409 STALE_RELEASE_BASE with data.changed_files, and nothing changes.' },
-        force: { type: 'boolean', description: 'Optional bypass for a STALE_BASE refusal after remote changes have been reviewed. A first retry is expected to inspect project_diff_versions instead.' },
+        force: { type: 'boolean', description: 'Bypasses a STALE_BASE refusal and overwrites the remote changes it reported; project_diff_versions lists those changes.' },
         dry_run: { type: 'boolean', description: 'Optional non-writing diff of added, modified, and removed files, function changes, and version conflict. It exposes every deletion before a real deploy and returns { dry_run, static_files, functions, warnings, version_conflict }.' },
         scope: { type: 'string', enum: ['all', 'functions', 'static'], description: 'Optional partial-deploy guard. "all" (default) deploys static files and functions. "functions" leaves static files untouched; "static" leaves functions untouched. Omitted functions remain merge-preserved by default.' },
         preview: { type: 'boolean', description: 'Advanced `somewhere preview` flag requiring hosted preview access for signed-in accounts on every plan; otherwise CLOUD_DEV_NOT_ENABLED is returned before resource creation. False (default) deploys directly to production.' },
@@ -2740,7 +2740,7 @@ The default workflow has one environment: read production source, check, deploy 
             ctx,
             toolName,
             args,
-            'An exact preview starts from one complete snapshot. Pass preview:true, scope:"all", the complete files map, the complete binary_files map (use {} when there are none), the complete functions map (use {} when there are none), replace_functions:true, preview_session_id, preview_operation_id, expected_preview_id, and base_release_id for the first preview. Preview dry_run is unsupported. base_release_id must name the production release the snapshot was exported from. Inline the snapshot; file_refs and binary_file_refs are not accepted. Use project_patch with the exact current preview for later edits.',
+            'An exact preview starts from one complete snapshot. The first preview takes preview:true, scope:"all", the complete files map, the complete binary_files map ({} when there are none), the complete functions map ({} when there are none), replace_functions:true, preview_session_id, preview_operation_id, expected_preview_id, and base_release_id. Preview dry_run is unsupported. base_release_id must name the production release the snapshot was exported from. The snapshot is inline; file_refs and binary_file_refs are not accepted. Later edits go through project_patch with the exact current preview.',
           );
         }
         const deployBody: Record<string, unknown> = {
@@ -2824,7 +2824,7 @@ Path auto-routes: \`api/*\`, \`_lib/*\`, and root \`[id].ts\` paths go to functi
 
 **Delete:** \`delete_files\` is an array of paths. Works for static files and functions; missing paths are silently ignored. A rename or atomic replace combines one \`path\` + \`content\` write (or the one-entry \`files\` alias) with \`delete_files\` in the same call: the new file and removals publish as one patch transaction.
 
-**Conflict check (optional, recommended for shared projects):** pass \`base_version\` from your last deploy/export response. If another deployer landed changes since, returns 409 \`STALE_BASE\` with \`data.changed_files\`, \`data.last_change_source\`, and \`data.last_change_at\` instead of overwriting. On \`STALE_BASE\`, \`project_diff_versions\` shows the change before forcing; \`force:true\` overwrites the remote changes. The older \`expected_version\` strict CAS still works and returns \`VERSION_CONFLICT\` when the production version differs.
+**Conflict check (optional, recommended for shared projects):** pass \`base_version\` from your last deploy/export response. If another deployer landed changes since, returns 409 \`STALE_BASE\` with \`data.changed_files\`, \`data.last_change_source\`, and \`data.last_change_at\` instead of overwriting. On \`STALE_BASE\`, \`project_diff_versions\` shows the change, and \`force:true\` overwrites the remote changes. The older \`expected_version\` strict CAS still works and returns \`VERSION_CONFLICT\` when the production version differs.
 
 **Preview first (optional):** pass \`dry_run: true\` to get a per-file unified diff of what the patch WOULD change (\`data.diffs\`), plus added/modified/removed lists — nothing is written and the version doesn't change. The same call without \`dry_run\` applies it.
 
@@ -2857,7 +2857,7 @@ Patches reach production immediately at \`https://{subdomain}.somewhere.site\`. 
         expected_version: { type: 'number', description: 'Optional optimistic-concurrency version from the preceding deploy or patch response. A concurrent project change returns 409 VERSION_CONFLICT with `data.current_version` instead of overwriting.' },
         base_version: { type: 'number', description: 'Optional stale-base version from the preceding deploy or export response. A 409 STALE_BASE indicates a remote change and requires reviewing project_diff_versions before a forced retry.' },
         base_release_id: { type: 'string', description: 'Required for a project with a production release. It is the `active_release_id` from the same project read or export that supplied the edited source. A missing base fails closed; a stale base returns STALE_RELEASE_BASE without applying the patch.' },
-        force: { type: 'boolean', description: 'Optional bypass for a STALE_BASE refusal after remote changes have been reviewed. A first retry is expected to inspect project_diff_versions instead.' },
+        force: { type: 'boolean', description: 'Bypasses a STALE_BASE refusal and overwrites the remote changes it reported; project_diff_versions lists those changes.' },
         dry_run: { type: 'boolean', description: 'Non-writing preview that returns per-file unified diffs plus added, modified, and removed lists. The version stays unchanged; a subsequent call without dry_run applies the patch.' },
         preview: { type: 'boolean', description: "Advanced `somewhere preview` flag requiring hosted preview access for signed-in accounts on every plan; otherwise CLOUD_DEV_NOT_ENABLED is returned before resource creation. False (default) patches production." },
         preview_session_id: { type: 'string', description: 'Stable editing-session id for this preview lineage. Required with preview:true.' },
@@ -2887,7 +2887,7 @@ Patches reach production immediately at \`https://{subdomain}.somewhere.site\`. 
           : parseJsonArg(v, name);
         if (args.files !== undefined && [args.path, args.content, args.find, args.replace].some(value => value !== undefined)) {
           return badArgsToolResult(env, authHeader, ctx, toolName, args,
-            'Use either files for full-file updates or path with content/find+replace. These forms cannot be combined; no files were changed.');
+            'files (full-file updates) and path with content/find+replace are separate forms. They cannot be combined; no files were changed.');
         }
         let multiFiles: ReturnType<typeof splitPatchFiles> | null = null;
         if (args.files !== undefined && args.path === undefined && args.content === undefined && args.find === undefined) {
@@ -2910,7 +2910,7 @@ Patches reach production immediately at \`https://{subdomain}.somewhere.site\`. 
           } else {
             return badArgsToolResult(
               env, authHeader, ctx, toolName, args,
-              'project_patch received an empty files map. Pass at least one {"path": "content"} entry, or use delete_files to remove files.\nExample:\nproject_patch({ "project_id": "my-app", "base_release_id": "<from project_export>", "files": { "new.html": "<!doctype html><html></html>" }, "delete_files": ["old.html"] })',
+              'project_patch received an empty files map. A patch needs at least one {"path": "content"} entry, or delete_files to remove files.\nExample:\nproject_patch({ "project_id": "my-app", "base_release_id": "<from project_export>", "files": { "new.html": "<!doctype html><html></html>" }, "delete_files": ["old.html"] })',
             );
           }
         }
@@ -3168,7 +3168,7 @@ Returns \`{ response: { status, headers, body }, logs, errors, served, isolated_
 
 It takes the exact \`preview_session_id\` and \`preview_id\` returned by the preview. \`message\` is an optional one-line deploy note.
 
-**Stale-base guard (optional, recommended for shared projects):** pass \`base_live_version\` from the preview response. If production changed after that preview was created, promote returns 409 \`STALE_BASE\` with \`data.changed_files\`, \`data.last_change_source\`, and \`data.last_change_at\` instead of replacing the newer production version. On \`STALE_BASE\`, \`project_diff_versions\` shows the change before forcing; \`force:true\` overwrites the remote changes.
+**Stale-base guard (optional):** \`base_live_version\` from the preview response enables it. If production changed after that preview was created, promote returns 409 \`STALE_BASE\` with \`data.changed_files\`, \`data.last_change_source\`, and \`data.last_change_at\` instead of replacing the newer production version. On \`STALE_BASE\`, \`project_diff_versions\` shows the change, and \`force:true\` overwrites the remote changes.
 
 **Functions are kept by default, like deploy:** a function live in production but missing from the preview stays live, and the response lists it in \`preserved_functions\`. \`replace_functions:true\` removes those functions; the response lists them in \`removed_functions\`.
 
@@ -3450,7 +3450,7 @@ By DEFAULT returns metadata only per screenshot (version, viewport, captured_at,
               }
               return s;
             });
-            payload.note = 'Inline image bytes omitted to keep context lean. Pass include_data:true for base64 data URLs, or use the `browser` tool to see/inspect the live page.';
+            payload.note = 'Inline image bytes omitted to keep context lean. include_data:true returns base64 data URLs; the `browser` tool inspects the live page.';
           }
         }
         return result;
@@ -4716,7 +4716,7 @@ The database has a 30-second hard query ceiling. \`timeout_ms\` bounds how long 
         if (typeof args.sql !== 'string' || !args.sql.trim()) {
           return badArgsToolResult(
             env, authHeader, ctx, toolName, args,
-            'db_query requires a non-empty sql string.\nExample:\ndb_query({ "project_id": "my-app", "sql": "SELECT * FROM users WHERE id = ?", "params": ["usr_123"] })\nFor new managed projects, declare tables in db/schema.ts and deploy. Use db_migrate only for legacy SQL-mode schema changes.',
+            'db_query requires a non-empty sql string.\nExample:\ndb_query({ "project_id": "my-app", "sql": "SELECT * FROM users WHERE id = ?", "params": ["usr_123"] })\nNew managed projects declare tables in db/schema.ts and deploy them; db_migrate applies only to legacy SQL-mode schema changes.',
           );
         }
         if (params !== undefined && !Array.isArray(params)) {
@@ -6920,7 +6920,7 @@ The connector reference and upload URL are temporary transports, not the durable
                     expires_at: session.expires_at,
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/octet-stream' },
-                    next: 'The upload has started in parts. PUT each part n = 1..part_count to parts_url + "/" + n; every part except the last is exactly part_size bytes (at most 90 MB). Then POST complete_url; its response is the storage record. An upload not completed within 6 hours is discarded, parts included; DELETE abort_url discards it sooner.',
+                    next: 'The upload has started in parts. Each part n = 1..part_count is a PUT to parts_url + "/" + n; every part except the last is exactly part_size bytes (at most 90 MB). A POST to complete_url finishes it, and that response is the storage record. An upload not completed within 6 hours is discarded, parts included; a DELETE to abort_url discards it sooner.',
                   },
                 },
               };
@@ -6941,8 +6941,8 @@ The connector reference and upload URL are temporary transports, not the durable
                   method: 'PUT',
                   headers: { 'Content-Type': mint.content_type },
                   next: mint.multipart_url
-                    ? 'PUT the raw file bytes to upload_url. The PUT response is the storage record. One request carries at most 100 MB; a bigger file goes up in parts through multipart_url instead (see multipart).'
-                    : 'PUT the raw file bytes to upload_url. The PUT response is the storage record.',
+                    ? 'upload_url accepts the raw file bytes as one PUT, and that PUT response is the storage record. One request carries at most 100 MB; a bigger file goes up in parts through multipart_url (described in multipart).'
+                    : 'upload_url accepts the raw file bytes as one PUT, and that PUT response is the storage record.',
                   ...(mint.multipart_url ? { multipart: MULTIPART_UPLOAD_GUIDANCE } : {}),
                 },
               },
@@ -8880,7 +8880,7 @@ Write mode (with message): records a structured log line. Used by your own monit
   {
     definition: {
     name: 'errors',
-    description: `Why is my app broken, exceptions, stack traces, failures, recent errors, crash reports, debugging. One trace_id returns the complete ordered parent/child operation waterfall plus its correlated logs, errors, deploy failures, and journey events. No project lookup is required for that one-id path. Without a trace id, project_id returns the last 24h of failures from that project's functions. Each row carries \`kind\`: "exception" means nobody chose the outcome (an uncaught throw, or a 5xx) and "refusal" means a handler answered 4xx on purpose — a 401 from your own auth gate is a refusal, not a bug, so filter on \`kind\` before concluding something is broken.
+    description: `Why is my app broken, exceptions, stack traces, failures, recent errors, crash reports, debugging. One trace_id returns the complete ordered parent/child operation waterfall plus its correlated logs, errors, deploy failures, and journey events. No project lookup is required for that one-id path. Without a trace id, project_id returns the last 24h of failures from that project's functions. Each row carries \`kind\`: "exception" means nobody chose the outcome (an uncaught throw, or a 5xx) and "refusal" means a handler answered 4xx on purpose — a 401 from your own auth gate is a refusal, not a bug, and \`kind\` separates the two.
 
 **Example:**
 
@@ -10425,7 +10425,7 @@ the run while preserving console, network, and screenshot state.
         actions: {
           type: 'array',
           maxItems: 30,
-          description: 'Concise action sequence requiring project_id and a project-owned navigation origin. Each item has one action key: {click:selector}, {fill:selector,value}, {upload:selector,file:data-url-or-base64,name?} or {upload:selector,fs_path:"/stored/file",name?,type?} (a project file up to 50 MB per call), {select:selector,value}, {wait:selector|ms}, {expect:{selector,text?|value?|visible?|count?}}, {screenshot:label}, {eval:js}, or {goto:"/path"} (a path on the app; a continued session_id resumes on the page it left, so use goto to move). The CLI additionally resolves a local path in upload.file before calling the hosted API. Execution stops on the first failure, and every result includes ok plus an error reason when false.',
+          description: 'Concise action sequence requiring project_id and a project-owned navigation origin. Each item has one action key: {click:selector}, {fill:selector,value}, {upload:selector,file:data-url-or-base64,name?} or {upload:selector,fs_path:"/stored/file",name?,type?} (a project file up to 50 MB per call), {select:selector,value}, {wait:selector|ms}, {expect:{selector,text?|value?|visible?|count?}}, {screenshot:label}, {eval:js}, or {goto:"/path"} (a path on the app; a continued session_id resumes on the page it left, and goto navigates from there). The CLI additionally resolves a local path in upload.file before calling the hosted API. Execution stops on the first failure, and every result includes ok plus an error reason when false.',
           items: { type: 'object' },
         },
         steps: { type: 'array', description: 'Legacy ordered step objects requiring project_id and a project-owned navigation origin. Each step has an action plus its fields; `frame` targets an iframe. An omitted or empty array performs inspection without driving. Ignored when html is set.', items: { type: 'object' } },
@@ -10463,7 +10463,7 @@ the run while preserving console, network, and screenshot state.
         headers: { type: 'object', description: 'Flat object of extra request headers (e.g. Authorization) sent with page requests. Same origin scoping and size cap as local_storage.' },
         width: { type: 'number', description: 'Legacy flat alias for viewport width (superseded by `viewport: { width, height }`). With `html`, the snippet viewport width (default 1280).' },
         height: { type: 'number', description: 'Legacy flat alias for viewport height (superseded by `viewport: { width, height }`). With `html`, the snippet viewport height (default 800).' },
-        wait_for: { type: ['string', 'object'], description: 'A wait to satisfy BEFORE the capture. A CSS selector string, or ANY wait_for condition object: { "selector": "#status", "contains": "Ready" }, { "text": "All loaded" }, { "text_gone": "Loading…" }, { "settled": true }, { "network_idle": true }, { "url": "/dashboard" }, { "predicate": "window.__ready === true" } — with optional `timeout` / `idle_ms` / `frame`. Same condition engine as a wait_for step, so a rich wait now composes with `storage` in ONE call. On a `steps` run, sequence the wait as a step instead.' },
+        wait_for: { type: ['string', 'object'], description: 'A wait to satisfy BEFORE the capture. A CSS selector string, or ANY wait_for condition object: { "selector": "#status", "contains": "Ready" }, { "text": "All loaded" }, { "text_gone": "Loading…" }, { "settled": true }, { "network_idle": true }, { "url": "/dashboard" }, { "predicate": "window.__ready === true" } — with optional `timeout` / `idle_ms` / `frame`. Same condition engine as a wait_for step, so a rich wait composes with `storage` in one call. It applies to a run without steps; on a `steps` run a wait_for step waits at its position in the sequence.' },
       },
       required: [],
     },
@@ -11937,7 +11937,7 @@ A test response is \`{ mode: 'test', test_only: true, charges_enabled, checkout_
         if (hasQuote && hasLineItems) {
           return badArgsToolResult(
             env, authHeader, ctx, toolName, args,
-            'payments_checkout: a quote_id checkout must not also pass line_items — the stored quote supplies the line items and amount. Pass one or the other.',
+            'payments_checkout: a quote_id checkout takes no line_items — the stored quote supplies the line items and amount. A checkout uses one or the other.',
           );
         }
         if (metadata !== undefined && !isRecord(metadata)) {
@@ -13318,7 +13318,7 @@ Returns status "active" (live now) or "pending_verification" — the destination
           didWork = true;
         }
         if (!didWork) {
-          result = { status: 400, data: { ok: false, error: 'VALIDATION_ERROR', message: 'Provide at least one field to update or a comment to append.' } };
+          result = { status: 400, data: { ok: false, error: 'VALIDATION_ERROR', message: 'An update needs at least one field to change or a comment to append; this call had neither.' } };
         }
         if (result.status < 400 && uploadedAttachmentPaths.length > 0) {
           result = {
@@ -13335,7 +13335,7 @@ Returns status "active" (live now) or "pending_verification" — the destination
   {
     definition: {
     name: 'tasks_comment_add',
-    description: "Append a comment to a task without changing its fields. Each comment is a new entry; it is announced to the project's configured task webhook and notification email when those are set. Progress belongs in tasks_update status_note; a task closes through tasks_update with status 'done' and resolution_note.",
+    description: "Append a comment to a task without changing its fields. Each comment is a new entry; it is announced to the project's configured task webhook and notification email when those are set. Progress is recorded in tasks_update status_note, and a task closes through tasks_update with status 'done' and resolution_note.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -14546,6 +14546,13 @@ function withChatgptToolMetadata(t: MCPTool): MCPTool & {
   };
 }
 
+/** A surface's own description; ChatGPT, like the connector a shell-less
+ *  directory surface, falls back to the reviewed connector text. */
+function surfaceDescription(name: string, surface: ToolSurface): string | undefined {
+  const own = TOOL_SPEC_BY_NAME.get(name)?.protocol?.surfaceDescriptions;
+  return own?.[surface] ?? (surface === 'chatgpt' ? own?.connector : undefined);
+}
+
 function constrainToolDefinitionToSurface(t: MCPTool, surface: ToolSurface): MCPTool {
   const refused = new Set(SURFACE_REFUSED_INPUTS[surface]?.[t.name] ?? []);
   if (surface !== 'full' && t.name === 'project_grep') refused.add('scope');
@@ -14568,7 +14575,7 @@ function constrainToolDefinitionToSurface(t: MCPTool, surface: ToolSurface): MCP
     : t._meta;
   return {
     ...t,
-    description: constrainCanonicalText(TOOL_SPEC_BY_NAME.get(t.name)?.protocol?.surfaceDescriptions?.[surface] ?? t.description, surface),
+    description: constrainCanonicalText(surfaceDescription(t.name, surface) ?? t.description, surface),
     inputSchema,
     ...(meta === undefined ? {} : { _meta: meta }),
   };
@@ -15675,7 +15682,7 @@ function resolveDefaultFrom(projects: ProjectListItem[], owner: 'account' | 'ses
     throw new ProjectResolutionError(
       'NO_PROJECTS',
       owner === 'session'
-        ? 'This CLI session has no project in its scope. Run `somewhere login` and choose the project to work on.'
+        ? 'This CLI session has no project in its scope; `somewhere login` chooses the project a session works on.'
         : 'No projects found on this account. Create one first using the create_project tool or POST /v1/projects.',
       [],
     );
@@ -15914,7 +15921,7 @@ function buildStaticSystemPrompt(surface: ToolSurface): string {
   return system;
 }
 
-const ADVISOR_PROJECT_CONTEXT_MESSAGE = 'Advisor cannot read projects. Omit project_id and context.project_ref; send the needed facts explicitly in context.';
+const ADVISOR_PROJECT_CONTEXT_MESSAGE = 'Advisor cannot read projects, so project_id and context.project_ref are not accepted; it answers from the facts given in context.';
 
 function advisorProjectInputError(input: { project_id?: unknown; context?: unknown }): string | null {
   const context = input.context && typeof input.context === 'object' && !Array.isArray(input.context)
@@ -16330,21 +16337,21 @@ async function handlePublicAdvisor(
     return jsonResponse({
       ok: false,
       error: 'ADVISOR_GATE_UNAVAILABLE',
-      message: 'The advisor is temporarily unavailable. Try again shortly.',
+      message: 'The advisor is temporarily unavailable; nothing was recorded for this question.',
     }, 503);
   }
   if (!access) {
     return jsonResponse({
       ok: false,
       error: 'UNAUTHORIZED',
-      message: 'The supplied session is invalid. Run `somewhere login`, or omit it to ask anonymously.',
+      message: 'The supplied session is invalid. A question without a session is asked anonymously.',
     }, 401);
   }
   if (access.retryAfterS > 0) {
     return jsonResponse({
       ok: false,
       error: 'RATE_LIMITED',
-      message: `Advisor rate limit reached. Try again in ${access.retryAfterS}s.`,
+      message: `Advisor rate limit reached; it resets in ${access.retryAfterS}s.`,
       retry_after_seconds: access.retryAfterS,
     }, 429);
   }
@@ -16391,7 +16398,7 @@ async function handlePublicAdvisor(
     return jsonResponse({
       ok: false,
       error: 'ADVISOR_UNAVAILABLE',
-      message: 'The advisor could not answer right now. Try again shortly.',
+      message: 'The advisor could not answer this question; it is temporarily unavailable.',
     }, 503);
   }
 }
@@ -16904,7 +16911,7 @@ function constrainResponseGuidance(
             : {},
           one_line_why: typeof candidate.one_line_why === 'string'
             ? candidate.one_line_why
-            : 'Use the surface-supported corrective call.',
+            : 'The surface-supported corrective call is listed.',
         }, attemptedTool, attemptedArgs, payload, surface);
       }
     }
@@ -17104,7 +17111,7 @@ function deterministicBadArgsNextCall(attemptedTool: string, args: Record<string
       return {
         tool: 'tasks_get',
         args_skeleton: { project_id, task_id: typeof args.task_id === 'string' ? args.task_id : 'tsk_...' },
-        one_line_why: 'Use tasks_get for one task; use tasks_list without task_id for a queue.',
+        one_line_why: 'tasks_get reads one task; tasks_list without task_id reads a queue.',
       };
     case 'db_query':
       return {
@@ -17575,14 +17582,14 @@ async function executeTool(
       const missProjectId = projectIdFromToolArgs(args);
       const errorCode = canonicalErrorCode(enriched);
       const managedSchemaRefusal = errorCode === 'SCHEMA_LOCKED'
-        && out.message === 'Schema changes for this managed project must come from db/schema.ts. Edit the declaration and deploy. No SQL was applied.';
+        && out.message === 'Schema changes for this managed project must come from db/schema.ts; a deploy applies the declaration. No SQL was applied.';
       const confirmationCode = confirmationCodeFromError(enriched);
       // A rejected cursor is restarted with the same read arguments, not
       // redirected to a different tool (pfb_5d67f674e540).
       const { cursor: rejectedCursor, ...restartArgs } = args;
       const deterministicNextCall = managedSchemaRefusal
         ? { tool: 'docs', args_skeleton: { topic: 'declared-data', section: 'declare-a-table-and-use-it' },
-            one_line_why: 'Define tables and access rules in db/schema.ts, then deploy raw source. Retrying db_migrate cannot change this managed project.' }
+            one_line_why: 'Tables and access rules are defined in db/schema.ts and applied by deploying raw source. Retrying db_migrate cannot change this managed project.' }
         : errorCode === 'INVALID_CURSOR' && typeof rejectedCursor === 'string'
         ? { tool: toolName, args_skeleton: restartArgs,
             one_line_why: 'Repeat the same arguments without cursor to restart; on later pages pass page.next_cursor exactly as returned.' }
@@ -18443,7 +18450,7 @@ async function handleMCPRequest(request: Request, env: Env, ctx: ExecutionContex
             );
             message = nextCall.tool === det.next_call.tool
               ? det.text
-              : `Unknown tool "${sanitizeAgentText(toolName, 120)}". Use ${formatNextCall(nextCall)}.`;
+              : `Unknown tool "${sanitizeAgentText(toolName, 120)}". The matching call is ${formatNextCall(nextCall)}.`;
             // Have a deterministic answer — log without a model call.
             const projectId = projectIdFromToolArgs(toolArgs);
             ctx.waitUntil(
@@ -18460,7 +18467,7 @@ async function handleMCPRequest(request: Request, env: Env, ctx: ExecutionContex
             // never waits on the model or logging path.
             nextCall = catalogNextCall(toolName);
             nextCallSource = 'deterministic';
-            message = `Unknown tool "${sanitizeAgentText(toolName, 120)}". Use ${formatNextCall(nextCall)}.`;
+            message = `Unknown tool "${sanitizeAgentText(toolName, 120)}". The matching call is ${formatNextCall(nextCall)}.`;
             const projectId2 = projectIdFromToolArgs(toolArgs);
             queueMissReport(env, authHeader, ctx, {
               miss_type: 'unknown_tool', tool_attempted: toolName, arg_keys: argKeys,
@@ -18496,7 +18503,7 @@ async function handleMCPRequest(request: Request, env: Env, ctx: ExecutionContex
               text: JSON.stringify({
                 ok: false,
                 error: 'UNAUTHORIZED',
-                message: `Tool "${requestedToolName}" requires authentication. Sign in via the OAuth flow or set an smt_ API key.`,
+                message: `Tool "${requestedToolName}" requires authentication: an OAuth sign-in or an smt_ API key.`,
               }, null, 2),
             }],
             isError: true,
@@ -18633,7 +18640,7 @@ async function handleMCPRequest(request: Request, env: Env, ctx: ExecutionContex
                 text: JSON.stringify({
                   ok: false,
                   error: 'RATE_LIMITED',
-                  message: `Rate limit reached for "${requestedToolName}". Try again in ${rl.retryAfterS}s.`,
+                  message: `Rate limit reached for "${requestedToolName}"; it resets in ${rl.retryAfterS}s.`,
                 }, null, 2),
               }],
               isError: true,
