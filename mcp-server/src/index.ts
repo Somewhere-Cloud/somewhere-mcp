@@ -172,7 +172,6 @@ interface Env {
 }
 
 const MCP_INITIALIZE_INSTRUCTION_LINES = [
-  'Somewhere is in public beta.',
   'somewhere.cloud MCP exposes platform primitives; `docs({ topic })` provides the exact auth, database, payments, files, and runtime contracts.',
   'Functions are `export default async function (req, sw)`; `sw.*` are runtime bindings, not HTTP calls.',
   'Runtime functions access database, auth, files, email, AI, and payments through `sw.*`; developer keys authorize management surfaces and are not function-runtime HTTP credentials.',

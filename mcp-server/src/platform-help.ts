@@ -15594,9 +15594,9 @@ behavior it was built against until you choose to adopt newer behavior, subject
 to safety protections. This is our direction, not a feature available today or
 a promised launch date.
 
-### During the beta
+### Compatibility notice periods
 
-Compatibility notice periods apply now, including during beta: at least 7 days
+Compatibility notice periods are at least 7 days
 for active Free owners and 30 days for paid apps. Free apps are never paused for
 idleness; we pause one only if a platform change would break it and its owner
 has had no login or deploy for 30 days, with notice and a prepared fix, while
@@ -17232,8 +17232,6 @@ with \`<Gate billing={billing} feature="export">\` — no webhook code. See \`do
 
   'handled-for-you': `# Handled for you — the foundation behind your app
 
-Somewhere is in public beta.
-
 Somewhere combines hosting, functions, identity, data, files, and application services in one project. Your agent can use the project's verified user across those services and declare access rules alongside the source. It does not need to assemble a separate account system, file-permission layer, email sender, and deployment pipeline for each app.
 
 This is a reference to the work the platform handles today, with links to the implementation contracts. **Automatic** means no additional protection to implement when using the named platform path. **Declare or configure** means you describe your app's intent; the platform enforces or runs it. **Available service** means your app calls it when needed. Availability and allowances vary by plan; [limits](https://somewhere.cloud/docs/limits.txt) and [pricing](https://somewhere.cloud/docs/pricing.txt) are the current reference.
@@ -17479,8 +17477,6 @@ Both tools in detail: \`deploy-intelligence\`.
   'getting-started': `# Start an app
 
 ## Start an app
-
-Somewhere is in public beta.
 
 Build a React app with sign-in, server functions and its own SQL database in
 one project. Somewhere compiles and hosts the source, manages sessions, and
