@@ -22,7 +22,6 @@ import {
   WORKERS_AI_REASONING_MODELS_INLINE,
   WORKERS_AI_REASONING_MODELS_SLASH,
   TEMP_ACCOUNT_KEY_SCOPES_INLINE,
-  TEMP_ACCOUNT_TTL_HOURS,
   TEMP_RUNTIME_CAPABILITIES_INLINE,
   ENV_PROPAGATION_SECONDS,
   ENV_VALUES_MAX_BYTES,
@@ -13730,27 +13729,25 @@ verified custom domain. No extra step to publish.
 ## Temporary deploys (\`somewhere deploy --temporary\`)
 
 \`--temporary\` is the no-account deploy path. The first temporary deploy
-solves proof-of-work once, creates a real Free-tier temporary account with an
+creates a real Free-tier temporary account with an
 email like \`temp-xxxx@temp.somewhere.tech\`, and caches that credential in
 \`~/.somewhere/config.json\`. Later deploys silently reuse the cached
-credential; they do not solve proof-of-work again unless the credential is
-missing or expired.
+credential unless it is missing or expired.
 
 The expiry is account-level and absolute: the account's
-\`temporary_expires_at\` is set when the temporary account is created
-(${TEMP_ACCOUNT_TTL_HOURS} hours today), and more deploys do **not** extend
-it. One temporary account can own many projects. If it is unclaimed, the
+\`temporary_expires_at\` is set when the temporary account is created. The
+deploy returns the expiry, and more deploys do **not** extend it. One temporary
+account can own many projects. If it is unclaimed, the
 cleanup job purges the account, every project it owns, project data/files, and
 deployed function bundles at that timestamp.
 
 The first deploy writes the normal local project link. Redeploying from the same
 directory reuses that project and therefore the same live URL; it also reprints
 the original claim URL and absolute expiry. Redeploying never resets the clock.
-Temporary projects are Free-tier projects, so served HTML carries the small
-"Built on Somewhere" badge while temporary; uploaded source is not modified.
+Temporary projects are Free-tier projects. Uploaded source is not modified.
 
-Default anonymous abuse limits come directly from the worker constants: 60
-proof-of-work challenges per IP per hour, 5 temporary accounts per IP per hour,
+Default anonymous abuse limits come directly from the worker constants:
+5 temporary accounts per IP per hour,
 and 60 direct outbound fetches per temporary project per minute. A global
 account-creation cap and emergency kill switch may also refuse new sessions.
 
@@ -15306,8 +15303,8 @@ if (!rl.allowed) return Response.json({ error: 'paused' }, { status: 429 })
   'pricing': `# Pricing
 
 Tiers: Free, Builder, Pro, Scale, Enterprise. Projects, deploys, and bandwidth are
-unlimited on every tier; custom domains are available on every tier (Free retains the
-"Built on Somewhere" badge). Current prices, limits, and AI allowances are served live at:
+unlimited on every tier; custom domains are available on every tier. Current prices,
+limits, and AI allowances are served live at:
 
   GET https://api.somewhere.cloud/v1/pricing   (public, cached)
 
@@ -15550,9 +15547,8 @@ upload size, uptime-check frequency). They differ along two axes:
   and shorten the minimum schedule interval; Builder and higher add recurring
   smoke checks. See /v1/pricing for the current
   numbers and capability flags.
-- **Service level.** Free shows a "Built on Somewhere" badge and uses its
-  included AI allowance and request limits. Builder removes the badge and adds
-  advisory debugging (copilot reads your deployed code + diagnoses bugs) plus a
+- **Service level.** Free uses its included AI allowance and request limits.
+  Builder adds advisory debugging (copilot reads your deployed code + diagnoses bugs) plus a
   daily LLM security review. Pro adds office hours and a stronger review.
   Scale adds per-deploy
   review + priority support. Enterprise adds custom limits, contracts, SLA, and
