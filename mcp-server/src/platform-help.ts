@@ -15302,9 +15302,10 @@ if (!rl.allowed) return Response.json({ error: 'paused' }, { status: 429 })
 
   'pricing': `# Pricing
 
-Tiers: Free, Builder, Pro, Scale, Enterprise. Projects, deploys, and bandwidth are
-unlimited on every tier; custom domains are available on every tier. Current prices,
-limits, and AI allowances are served live at:
+Tiers: Free, Builder, Pro, Scale, Enterprise. Projects and deploys are
+unlimited on every tier; custom domains are available on every tier. For bandwidth,
+fair use and what happens at a limit, read https://somewhere.cloud/pricing.txt
+or the live catalog:
 
   GET https://api.somewhere.cloud/v1/pricing   (public, cached)
 
@@ -15501,8 +15502,9 @@ somewhere.cloud charges you.)
 
 Pricing is DB-driven (the tier_plans table) and served live at
 /v1/pricing — always fetch that for the current numbers rather than
-hardcoding them. Every tier includes UNLIMITED projects, deploys, and
-bandwidth (zero egress fees). Custom domains are free on every tier.
+hardcoding them. Every tier includes unlimited projects and deploys. Custom
+domains are free on every tier. For bandwidth and limit behavior, read
+https://somewhere.cloud/pricing.txt.
 
 Payments: charges settle to your connected account, minus Stripe's standard
 processing fee and a 0.5% platform fee (each checkout response includes
@@ -23539,13 +23541,11 @@ Unlimited projects + deploys on every tier. See
 
 ## What we do NOT charge for
 
-- **Bandwidth**: zero egress fees. Vercel's Hobby tier caps you at
-  100 GB/mo bandwidth; Pro is $40/TB after the first TB.
+- **Bandwidth and fair use**: see https://somewhere.cloud/pricing.txt.
 - **Build minutes**: unmetered. Vercel Pro is 6000 min/mo.
 - **End users**: no per-user fees. Free includes 1,000 users per project;
   paid plans include unlimited users. Clerk's $25 Pro tier caps at 5K MAUs,
   then $0.02 each.
-- Bandwidth and storage carry no extra usage charges.
 - **An attached PostgreSQL database**: nothing, on any plan including Free.
   You attach a database in your own provider account and they bill you
   directly on their published pricing — we do not meter it, mark it up, or
@@ -23772,7 +23772,8 @@ Related: \`sw.db\`, \`security-model\`, \`sql-compatibility\`, \`postgres\`.
 ✓ **Payments built in.** Stripe Connect is wired for you — no separate
   Stripe/billing integration to stand up. Supabase doesn't offer this.
 ✓ **Predictable pricing.** Flat monthly tiers — current ladder at /v1/pricing.
-  No per-MAU jumps, no bandwidth overages, no project caps.
+  No per-MAU jumps or project caps. For bandwidth and fair use, see
+  https://somewhere.cloud/pricing.txt.
 
 ## When to use Supabase
 
@@ -23866,9 +23867,8 @@ business rules and the content it publishes.
   Claude / Cursor deploy, query, and configure end-to-end. Vercel CLI
   is the equivalent for the hosting half, but the backend half lives
   in 7 different dashboards.
-✓ **Predictable pricing on bandwidth and MAUs.** Vercel meters bandwidth
-  ($40/TB after 1 TB on Pro), function invocations, and Edge Middleware
-  invocations. We have zero egress fees and unlimited end-users.
+✓ **Predictable pricing on bandwidth and MAUs.** For bandwidth and fair use,
+  see https://somewhere.cloud/pricing.txt.
 ✓ **One bill for the whole stack.** A flat monthly tier (see /v1/pricing)
   covers everything. A typical Vercel + Supabase + Clerk + Resend stack runs
   ~$170/mo before usage.
@@ -23924,7 +23924,7 @@ and https://nextjs.org/docs/app/getting-started/metadata-and-og-images
 | Payments          | \`sw.payments\` (built-in)  | Stripe (you wire it) |
 | AI                | \`sw.ai\` (built-in)        | OpenAI SDK (you wire it) |
 | Background jobs   | \`sw.jobs\` / cron           | Vercel Cron / Inngest / QStash |
-| Bandwidth         | unlimited (no egress fees)| 1 TB free, $40/TB |
+| Bandwidth         | see https://somewhere.cloud/pricing.txt | 1 TB free, $40/TB |
 | MAU pricing       | none                       | depends on auth provider |
 | Pricing           | flat tiers — see /v1/pricing | $20 Pro + add-ons |
 
