@@ -15512,10 +15512,8 @@ catalog rates on every tier. Every plan includes a managed-AI allowance that
 renews each month on Free and each billing period on paid plans. Included/default calls never spend prepaid
 balance automatically; explicit paid-model selection on Free uses prepaid
 only, while eligible paid-plan calls use the allowance first and then prepaid.
-Published request and model limits still apply. Inbox is metered per inbound
-email (rate at /v1/pricing). Each project stores up to its plan's
-\`inbox_messages_stored\` (\`null\` = no cap); past that, the oldest messages
-are evicted. There is no time-based expiry.
+Published request and model limits still apply. For inbox limits and
+what happens when an inbox is full, see https://somewhere.cloud/docs/inbox.txt.
 
 ## Balance and included AI
 \`GET /v1/billing/balance\` keeps the prepaid balance fields at the top level
