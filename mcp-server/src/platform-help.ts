@@ -10028,8 +10028,7 @@ creation. Rows include forward_to + forward_status ("active" |
 
 ## inbox_delete_address({ id })
 Remove the address. New mail to it bounces. Its past messages are not
-deleted; they still count toward the project's message cap and can be evicted
-like any other.
+deleted and still count toward the project's message cap.
 
 ## inbox_list({ project_id, address_id?, unread?, include_spam?, q?, limit?, cursor? })
 Most recent messages first. limit defaults to 50, max 200. Pass
@@ -10335,8 +10334,9 @@ cron deliveries and does not apply here.
 Each plan sets how many addresses a project may have and how many messages it
 stores: \`inbox_addresses\` and \`inbox_messages_stored\` on that plan in
 \`GET /v1/pricing\` (\`null\` means no cap). Creating an address past the cap
-returns \`INBOX_LIMIT\`. Past the message cap, the oldest messages are evicted
-when new mail arrives. Both caps apply per project, not per address.
+returns \`INBOX_LIMIT\`. A full inbox refuses new messages and keeps stored mail.
+See https://somewhere.cloud/docs/inbox.txt for the current limits. Both caps
+apply per project.
 
 ## What NOT to do
 - Don't create inbox addresses on platform domains like somewhere.cloud
@@ -10344,9 +10344,8 @@ when new mail arrives. Both caps apply per project, not per address.
 - Don't skip webhook signature verification — the webhook URL is public.
 - Don't delete messages until you've fully processed them; deletion is
   irreversible.
-- Don't treat the inbox as an archive: once the project reaches its message
-  cap, the oldest messages are evicted. Process mail promptly or copy the raw
-  .eml to your own storage.
+- If a finite inbox is full, delete processed messages yourself to make room.
+  Save a copy of any message you need to keep before deleting it.
 `,
 
   'sw.ai': `# AI and search
